@@ -151,18 +151,11 @@ func (s *Service) StartDownload(ctx context.Context, req DownloadRequest) (*Down
 		go s.runGGUFURL(context.Background(), req, job)
 		return job, nil
 	case "ollama":
-		if s.deps.OllamaPuller == nil {
-			return nil, fmt.Errorf("ollama not configured; cannot pull")
-		}
-		job.State = DownloadRunning
-		job.Name = req.Name
-		s.registry.put(job)
-		go s.runOllamaPull(context.Background(), req, job)
-		return job, nil
+		return nil, fmt.Errorf("ollama downloads are retired; download a standalone GGUF from Hugging Face or import one locally")
 	case "local_import":
 		return s.startLocalImport(ctx, req, job)
 	default:
-		return nil, fmt.Errorf("unknown download kind %q (want hf | gguf_url | ollama | local_import)", req.Kind)
+		return nil, fmt.Errorf("unknown download kind %q (want hf | gguf_url | local_import)", req.Kind)
 	}
 }
 

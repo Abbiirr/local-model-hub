@@ -53,15 +53,20 @@ var _ gguf.CalibrationStore = (*CalibrationStore)(nil)
 // (ok=false): a broken calibration read must NEVER block a verdict — the estimator simply
 // falls through to parse/fallback (fail-safe, per the "always a verdict" spec §4). The read
 // is best-effort and bounded by a short context so a locked DB cannot stall the estimator.
-func (c *CalibrationStore) ObservedPeak(modelKey string) (mib int, ok bool) {
+func (c *CalibrationStore) ObservedPeak(modelKey string, contextLen int, kvType gguf.KVCacheType) (mib int, ok bool) {
 	if c == nil || c.db == nil || modelKey == "" {
 		return 0, false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	var v int
+	// Unknown request inputs are deliberately not calibrated: treating an old
+	// measurement as exact is less safe than using the conservative estimator.
+	if contextLen <= 0 || kvType == "" {
+		return 0, false
+	}
 	err := c.db.QueryRowContext(ctx,
-		`SELECT peak_vram_mib FROM observed_peaks WHERE model_key = ?`, modelKey).Scan(&v)
+		`SELECT peak_vram_mib FROM observed_peaks WHERE model_key = ? AND ctx = ? AND kv_type = ?`, modelKey, contextLen, string(kvType)).Scan(&v)
 	if err != nil {
 		// sql.ErrNoRows (no calibration yet) and any transient DB error both mean "no peak".
 		return 0, false

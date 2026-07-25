@@ -13,6 +13,14 @@ func newFakeClock() *fakeClock               { return &fakeClock{t: time.Unix(1_
 func (c *fakeClock) Now() time.Time          { return c.t }
 func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
 
+// enqErr enqueues and returns only the error (discards the assigned-copy Request), so the existing
+// error-shaped test call sites keep working after Enqueue gained a (Request, error) signature
+// (fix 3: Enqueue now returns the stored copy so admission can persist the assigned seq).
+func enqErr(q *Queue, r Request) error {
+	_, err := q.Enqueue(r)
+	return err
+}
+
 // drain pulls every request out of the queue in Next order, returning their ids. Uses an empty
 // NextInput (no residency, no cost) unless a custom input is supplied.
 func drainIDs(q *Queue, in NextInput) []string {
@@ -33,10 +41,10 @@ func TestQueue_StrictClassOrdering(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	must(q.Enqueue(Request{ID: "A", ModelID: "m", Class: ClassNormal}))
-	must(q.Enqueue(Request{ID: "B", ModelID: "m", Class: ClassInteractive}))
-	must(q.Enqueue(Request{ID: "C", ModelID: "m", Class: ClassNormal}))
-	must(q.Enqueue(Request{ID: "D", ModelID: "m", Class: ClassBackground}))
+	must(enqErr(q, Request{ID: "A", ModelID: "m", Class: ClassNormal}))
+	must(enqErr(q, Request{ID: "B", ModelID: "m", Class: ClassInteractive}))
+	must(enqErr(q, Request{ID: "C", ModelID: "m", Class: ClassNormal}))
+	must(enqErr(q, Request{ID: "D", ModelID: "m", Class: ClassBackground}))
 
 	got := drainIDs(q, NextInput{})
 	want := []string{"B", "A", "C", "D"} // interactive, then normal FIFO (A<C), then background
@@ -51,7 +59,7 @@ func TestQueue_StableFIFOWithinClass(t *testing.T) {
 	q := NewQueue(QueueConfig{}, newFakeClock())
 	const n = 50
 	for i := 0; i < n; i++ {
-		if err := q.Enqueue(Request{ID: fmt.Sprintf("r%02d", i), ModelID: "m", Class: ClassNormal}); err != nil {
+		if err := enqErr(q, Request{ID: fmt.Sprintf("r%02d", i), ModelID: "m", Class: ClassNormal}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -72,7 +80,7 @@ func TestQueue_NoStarvation(t *testing.T) {
 	clk := newFakeClock()
 	q := NewQueue(QueueConfig{}, clk)
 
-	if err := q.Enqueue(Request{ID: "X", ModelID: "mx", Class: ClassBackground}); err != nil {
+	if err := enqErr(q, Request{ID: "X", ModelID: "mx", Class: ClassBackground}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -86,7 +94,7 @@ func TestQueue_NoStarvation(t *testing.T) {
 	for step := 0; step < maxSteps; step++ {
 		// A continuous stream of higher-priority (interactive) arrivals.
 		seq++
-		if err := q.Enqueue(Request{ID: fmt.Sprintf("hi%02d", seq), ModelID: "mh", Class: ClassInteractive}); err != nil {
+		if err := enqErr(q, Request{ID: fmt.Sprintf("hi%02d", seq), ModelID: "mh", Class: ClassInteractive}); err != nil {
 			t.Fatal(err)
 		}
 		r, _, ok := q.Next(NextInput{})
@@ -114,7 +122,7 @@ func TestQueue_NoStarvation(t *testing.T) {
 func TestQueue_AgingPromotionMath(t *testing.T) {
 	clk := newFakeClock()
 	q := NewQueue(QueueConfig{}, clk)
-	_ = q.Enqueue(Request{ID: "bg", ModelID: "m", Class: ClassBackground})
+	_, _ = q.Enqueue(Request{ID: "bg", ModelID: "m", Class: ClassBackground})
 	r := q.items[0]
 
 	cases := []struct {
@@ -142,8 +150,8 @@ func TestQueue_AgingPromotionMath(t *testing.T) {
 func TestQueue_SizeCostTieBreak(t *testing.T) {
 	q := NewQueue(QueueConfig{}, newFakeClock())
 	// P arrives first (smaller seq) but is expensive; Q arrives second but is warm.
-	_ = q.Enqueue(Request{ID: "P", ModelID: "qwen-7b", Class: ClassNormal, Cost: CostHint{EstimateMiB: 6200}})
-	_ = q.Enqueue(Request{ID: "Q", ModelID: "llama-1b", Class: ClassNormal, Cost: CostHint{Warm: true}})
+	_, _ = q.Enqueue(Request{ID: "P", ModelID: "qwen-7b", Class: ClassNormal, Cost: CostHint{EstimateMiB: 6200}})
+	_, _ = q.Enqueue(Request{ID: "Q", ModelID: "llama-1b", Class: ClassNormal, Cost: CostHint{Warm: true}})
 
 	in := NextInput{FreeVRAMMiB: 3000, ResidentModels: map[string]bool{"llama-1b": true}}
 	r, _, _ := q.Next(in)
@@ -153,8 +161,8 @@ func TestQueue_SizeCostTieBreak(t *testing.T) {
 
 	// A cheap BACKGROUND request must still lose to any NORMAL request (no cross-class jump).
 	q2 := NewQueue(QueueConfig{}, newFakeClock())
-	_ = q2.Enqueue(Request{ID: "N", ModelID: "big", Class: ClassNormal, Cost: CostHint{EstimateMiB: 9000}})
-	_ = q2.Enqueue(Request{ID: "Bg", ModelID: "warm", Class: ClassBackground, Cost: CostHint{Warm: true}})
+	_, _ = q2.Enqueue(Request{ID: "N", ModelID: "big", Class: ClassNormal, Cost: CostHint{EstimateMiB: 9000}})
+	_, _ = q2.Enqueue(Request{ID: "Bg", ModelID: "warm", Class: ClassBackground, Cost: CostHint{Warm: true}})
 	r2, _, _ := q2.Next(NextInput{ResidentModels: map[string]bool{"warm": true}})
 	if r2.ID != "N" {
 		t.Fatalf("cheap background jumped a normal request: got %s, want N (no cross-class tie-break)", r2.ID)
@@ -166,9 +174,9 @@ func TestQueue_SizeCostTieBreak(t *testing.T) {
 func TestQueue_CoalesceRespectsHigherClass(t *testing.T) {
 	q := NewQueue(QueueConfig{}, newFakeClock())
 	for i := 1; i <= 5; i++ {
-		_ = q.Enqueue(Request{ID: fmt.Sprintf("R%d", i), ModelID: "gemma-2b", Class: ClassNormal})
+		_, _ = q.Enqueue(Request{ID: fmt.Sprintf("R%d", i), ModelID: "gemma-2b", Class: ClassNormal})
 	}
-	_ = q.Enqueue(Request{ID: "H", ModelID: "other", Class: ClassInteractive})
+	_, _ = q.Enqueue(Request{ID: "H", ModelID: "other", Class: ClassInteractive})
 
 	in := NextInput{ResidentModels: map[string]bool{"gemma-2b": true}}
 	// First pick MUST be H (interactive) — coalescing cannot defer a higher class.
@@ -191,9 +199,9 @@ func TestQueue_CoalesceBounded(t *testing.T) {
 	q := NewQueue(QueueConfig{CoalesceMax: 4}, newFakeClock())
 	// 6 requests for the resident model M, plus one for a different model S, all normal, S last.
 	for i := 1; i <= 6; i++ {
-		_ = q.Enqueue(Request{ID: fmt.Sprintf("M%d", i), ModelID: "resM", Class: ClassNormal})
+		_, _ = q.Enqueue(Request{ID: fmt.Sprintf("M%d", i), ModelID: "resM", Class: ClassNormal})
 	}
-	_ = q.Enqueue(Request{ID: "S", ModelID: "otherS", Class: ClassNormal})
+	_, _ = q.Enqueue(Request{ID: "S", ModelID: "otherS", Class: ClassNormal})
 
 	in := NextInput{ResidentModels: map[string]bool{"resM": true}}
 	got := drainIDs(q, in)
@@ -220,9 +228,9 @@ func TestQueue_CoalesceBounded(t *testing.T) {
 // TestQueue_PerClassCaps: enqueue past a class cap returns a *QueueFullError with a numeric reason.
 func TestQueue_PerClassCaps(t *testing.T) {
 	q := NewQueue(QueueConfig{Caps: ClassCaps{Interactive: 2, Normal: 2, Background: 2}}, newFakeClock())
-	_ = q.Enqueue(Request{ID: "i1", ModelID: "m", Class: ClassInteractive})
-	_ = q.Enqueue(Request{ID: "i2", ModelID: "m", Class: ClassInteractive})
-	err := q.Enqueue(Request{ID: "i3", ModelID: "m", Class: ClassInteractive})
+	_, _ = q.Enqueue(Request{ID: "i1", ModelID: "m", Class: ClassInteractive})
+	_, _ = q.Enqueue(Request{ID: "i2", ModelID: "m", Class: ClassInteractive})
+	err := enqErr(q, Request{ID: "i3", ModelID: "m", Class: ClassInteractive})
 	if err == nil {
 		t.Fatal("expected queue_full error at cap")
 	}
@@ -240,7 +248,7 @@ func TestQueue_PerClassCaps(t *testing.T) {
 		}
 	}
 	// A different class is unaffected.
-	if err := q.Enqueue(Request{ID: "n1", ModelID: "m", Class: ClassNormal}); err != nil {
+	if err := enqErr(q, Request{ID: "n1", ModelID: "m", Class: ClassNormal}); err != nil {
 		t.Fatalf("normal enqueue should succeed under its own cap: %v", err)
 	}
 }
@@ -252,7 +260,7 @@ func TestQueue_PerClassCaps(t *testing.T) {
 // access to it) — the tie-break uses only the caller-supplied resident-model set and free VRAM.
 func TestQueue_NeverSelectsInstanceEviction(t *testing.T) {
 	q := NewQueue(QueueConfig{}, newFakeClock())
-	_ = q.Enqueue(Request{ID: "a", ModelID: "m", Class: ClassNormal})
+	_, _ = q.Enqueue(Request{ID: "a", ModelID: "m", Class: ClassNormal})
 	// Even with a resident set that names a model, Next returns a REQUEST, and its ID is the
 	// request id — never an instance id chosen for eviction.
 	r, _, ok := q.Next(NextInput{ResidentModels: map[string]bool{"m": true}})
@@ -264,9 +272,9 @@ func TestQueue_NeverSelectsInstanceEviction(t *testing.T) {
 // TestQueue_RemoveAndDepth exercises Remove + DepthByClass.
 func TestQueue_RemoveAndDepth(t *testing.T) {
 	q := NewQueue(QueueConfig{}, newFakeClock())
-	_ = q.Enqueue(Request{ID: "a", ModelID: "m", Class: ClassInteractive})
-	_ = q.Enqueue(Request{ID: "b", ModelID: "m", Class: ClassNormal})
-	_ = q.Enqueue(Request{ID: "c", ModelID: "m", Class: ClassNormal})
+	_, _ = q.Enqueue(Request{ID: "a", ModelID: "m", Class: ClassInteractive})
+	_, _ = q.Enqueue(Request{ID: "b", ModelID: "m", Class: ClassNormal})
+	_, _ = q.Enqueue(Request{ID: "c", ModelID: "m", Class: ClassNormal})
 	i, n, bg := q.DepthByClass()
 	if i != 1 || n != 2 || bg != 0 {
 		t.Fatalf("depth = %d/%d/%d, want 1/2/0", i, n, bg)

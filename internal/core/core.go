@@ -15,6 +15,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/localhub/localhub/internal/compat"
@@ -181,6 +182,10 @@ type Service struct {
 	// durable artifacts are the manifest + models row; a restart loses job records (a killed
 	// download's .part is still resumable).
 	registry *downloadRegistry
+	// jobState holds the P6.2 async-job worker's wake signal + per-running-job cancel funcs. Lazily
+	// initialized (jobs() / jobStateOnce) so a Service with no jobs feature wired stays zero-cost.
+	jobState     *jobWorkerState
+	jobStateOnce sync.Once
 }
 
 // New constructs the service core from its dependencies.

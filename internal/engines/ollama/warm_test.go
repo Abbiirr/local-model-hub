@@ -138,7 +138,7 @@ func TestWarm_LoadsModel(t *testing.T) {
 	defer srv.Close()
 
 	c := New(srv.URL, "")
-	res, err := c.Warm(context.Background(), "llama3.2", "10m")
+	res, err := c.Warm(context.Background(), "llama3.2", "10m", nil)
 	if err != nil {
 		t.Fatalf("Warm: %v", err)
 	}
@@ -148,9 +148,38 @@ func TestWarm_LoadsModel(t *testing.T) {
 	// Warm sends a duration string keep_alive → JSON string.
 	f.mu.Lock()
 	ka := f.lastWarmBody["keep_alive"]
+	_, hasOpts := f.lastWarmBody["options"]
 	f.mu.Unlock()
 	if ka != "10m" {
 		t.Errorf("keep_alive sent: got %v want \"10m\"", ka)
+	}
+	// numGPU nil → NO options object (daemon dynamic default).
+	if hasOpts {
+		t.Errorf("expected no options object when numGPU is nil; got %v", f.lastWarmBody["options"])
+	}
+}
+
+// TestWarm_NumGPUForcesFullOffload asserts a non-nil numGPU is sent as options.num_gpu (the
+// full-GPU default path forces all layers onto the GPU). Regression guard for the
+// "never offload to CPU" directive.
+func TestWarm_NumGPUForcesFullOffload(t *testing.T) {
+	f := newFakeDaemon()
+	srv := f.server(t)
+	defer srv.Close()
+	c := New(srv.URL, "")
+
+	if _, err := c.Warm(context.Background(), "llama3.2", "10m", FullGPULayers()); err != nil {
+		t.Fatalf("Warm: %v", err)
+	}
+	f.mu.Lock()
+	opts, ok := f.lastWarmBody["options"].(map[string]any)
+	f.mu.Unlock()
+	if !ok {
+		t.Fatalf("expected an options object carrying num_gpu; got body %v", f.lastWarmBody)
+	}
+	n, ok := opts["num_gpu"].(float64)
+	if !ok || n != 999 {
+		t.Errorf("num_gpu: got %v (%T) want 999 (force all layers on GPU)", opts["num_gpu"], opts["num_gpu"])
 	}
 	// The model is now resident.
 	resident, ps, err := c.IsResident(context.Background(), "llama3.2")
@@ -169,7 +198,7 @@ func TestWarm_EmbeddingModelFallsBackToEmbed(t *testing.T) {
 	defer srv.Close()
 	c := New(srv.URL, "")
 
-	res, err := c.Warm(context.Background(), "nomic-embed:latest", "5m")
+	res, err := c.Warm(context.Background(), "nomic-embed:latest", "5m", nil)
 	if err != nil {
 		t.Fatalf("Warm embed model: %v", err)
 	}
@@ -193,7 +222,7 @@ func TestWarm_PinSendsNegativeOne(t *testing.T) {
 	srv := f.server(t)
 	defer srv.Close()
 	c := New(srv.URL, "")
-	if _, err := c.Warm(context.Background(), "llama3.2", "-1"); err != nil {
+	if _, err := c.Warm(context.Background(), "llama3.2", "-1", nil); err != nil {
 		t.Fatalf("Warm pin: %v", err)
 	}
 	f.mu.Lock()
@@ -212,7 +241,7 @@ func TestUnload_PollsUntilGone(t *testing.T) {
 	c := New(srv.URL, "")
 
 	// Warm first so the model is resident with a footprint.
-	if _, err := c.Warm(context.Background(), "mistral:latest", ""); err != nil {
+	if _, err := c.Warm(context.Background(), "mistral:latest", "", nil); err != nil {
 		t.Fatalf("Warm: %v", err)
 	}
 
@@ -291,7 +320,7 @@ func TestWarm_DaemonDown_TypedError(t *testing.T) {
 	c := New(url, "")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	_, err := c.Warm(ctx, "llama3.2", "")
+	_, err := c.Warm(ctx, "llama3.2", "", nil)
 	if err == nil {
 		t.Fatal("expected an error when the daemon is down")
 	}

@@ -122,9 +122,9 @@ type StartSpec struct {
 	// ExtraDockerArgs are docker-level args (mounts, env) inserted before the image (docker mode).
 	ExtraDockerArgs []string
 	VRAMEstMiB      int
-	Pinned      bool
-	Priority    int
-	TTLSeconds  int
+	Pinned          bool
+	Priority        int
+	TTLSeconds      int
 }
 
 // Start launches (or adopts) a vLLM instance and drives it to HEALTHY. Dispatches by mode.
@@ -344,8 +344,11 @@ func (r *Runner) stopDocker(ctx context.Context, inst instances.Instance) (StopR
 		})
 	}
 	freeBefore := 0
+	baselineVerified := r.vram == nil
 	if r.vram != nil {
-		freeBefore, _ = r.vram.FreeVRAMMiB(ctx)
+		var probeErr error
+		freeBefore, probeErr = r.vram.FreeVRAMMiB(ctx)
+		baselineVerified = probeErr == nil
 	}
 
 	// docker stop → docker rm -f (best-effort; rm -f is idempotent).
@@ -354,12 +357,25 @@ func (r *Runner) stopDocker(ctx context.Context, inst instances.Instance) (StopR
 
 	// Verify the container is gone via docker ps + poll the VRAM reclaim.
 	gone, freeAfter, freed, verified, timedOut := r.waitContainerGoneAndReclaim(ctx, inst.ID, freeBefore, footprint)
+	if !baselineVerified {
+		freeAfter, freed, verified = 0, 0, false
+	}
+	if !gone {
+		return StopResult{
+			Instance: inst, ContainerGone: false, FreeBeforeMiB: freeBefore, FreeAfterMiB: freeAfter,
+			FreedMiB: freed, FootprintMiB: footprint, Verified: false, TimedOut: timedOut,
+			Reason: "docker stop+rm could not confirm the container is gone; instance remains DRAINING so admission continues to account for its VRAM",
+		}, fmt.Errorf("stop vLLM container %s: could not confirm removal", inst.ID)
+	}
 
 	freedForRow := freed
 	if freedForRow < 0 {
 		freedForRow = 0
 	}
 	reason := r.stopReason(gone, freed, footprint, verified, timedOut)
+	if !baselineVerified {
+		reason = "stopped: container removed, but VRAM reclaim is UNVERIFIED because the baseline probe failed"
+	}
 	stopped, err := r.store.Transition(ctx, inst.ID, instances.TransitionParams{
 		To: instances.StateStopped, Reason: reason, VRAMFreedMiB: &freedForRow,
 	})

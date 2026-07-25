@@ -157,13 +157,18 @@ func (m *Manager) DrainQueue(ctx context.Context) (DrainResult, error) {
 			return res, fmt.Errorf("drain: start queued %s (%s): %w", req.QueueID, req.ModelID, err)
 		case requeued:
 			// Admission re-queued it (a fresh WAITING row was created). Mark the OLD row DONE to
-			// avoid a duplicate, and stop the pass: if the head could not be admitted, no lower
-			// candidate will fit either (they need at least as much room). Retry next tick.
-			_ = m.markQueueDone(ctx, req.QueueID, "re-queued by drain: still no room")
+			// avoid a duplicate. Continue scanning the entry snapshot: a lower-priority request can
+			// be smaller (or warm) and fit even when this candidate cannot. This is intentionally
+			// bounded by maxAttempts, so a repeatedly blocked request cannot spin the pass.
+			if err := m.markQueueDone(ctx, req.QueueID, "re-queued by drain: still no room"); err != nil {
+				return res, err
+			}
 			res.Requeued = append(res.Requeued, req.QueueID)
-			return res, nil
+			continue
 		case started:
-			_ = m.markQueueAdmitted(ctx, req.QueueID)
+			if err := m.markQueueAdmitted(ctx, req.QueueID); err != nil {
+				return res, err
+			}
 			res.Started = append(res.Started, req.QueueID)
 			// Continue: capacity may allow more of the queue to drain.
 		}
@@ -253,7 +258,7 @@ func (m *Manager) drainNextInput(ctx context.Context) NextInput {
 func (m *Manager) requeueForDrain(req DrainRequest) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_ = m.queue.Enqueue(Request{
+	_, _ = m.queue.Enqueue(Request{
 		ID:       req.QueueID,
 		ModelID:  req.ModelID,
 		Engine:   req.Engine,

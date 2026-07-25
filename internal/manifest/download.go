@@ -65,6 +65,16 @@ const tmpSuffix = ".part"
 // error the temp file is left in place (so a retry can resume it) UNLESS the error is a hash
 // mismatch, in which case the corrupt temp file is removed.
 func (f *FileFetcher) Fetch(ctx context.Context, url, dest, expectedSHA string, prog ProgressFunc, idx, count int) (FetchResult, error) {
+	return f.fetch(ctx, url, dest, expectedSHA, prog, idx, count, 0)
+}
+
+// FetchWithLimit is Fetch with a hard cumulative byte limit. It aborts before
+// writing a chunk that would exceed limitBytes.
+func (f *FileFetcher) FetchWithLimit(ctx context.Context, url, dest, expectedSHA string, prog ProgressFunc, idx, count int, limitBytes int64) (FetchResult, error) {
+	return f.fetch(ctx, url, dest, expectedSHA, prog, idx, count, limitBytes)
+}
+
+func (f *FileFetcher) fetch(ctx context.Context, url, dest, expectedSHA string, prog ProgressFunc, idx, count int, limitBytes int64) (FetchResult, error) {
 	tmp := dest + tmpSuffix
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return FetchResult{}, fmt.Errorf("create dir for %s: %w", dest, err)
@@ -133,9 +143,13 @@ func (f *FileFetcher) Fetch(ctx context.Context, url, dest, expectedSHA string, 
 		total = 0
 	}
 
-	written, err := streamCopy(ctx, out, resp.Body, h, offset, total, prog, fileName(dest), resumed, idx, count)
+	written, err := streamCopy(ctx, out, resp.Body, h, offset, total, prog, fileName(dest), resumed, idx, count, limitBytes)
 	closeErr := out.Close()
 	if err != nil {
+		if limitBytes > 0 && strings.Contains(err.Error(), "hard cap") {
+			_ = os.Remove(tmp)
+			return FetchResult{}, fmt.Errorf("%w; removed the partial file", err)
+		}
 		return FetchResult{}, err // temp left in place for resume
 	}
 	if closeErr != nil {
@@ -162,7 +176,7 @@ func (f *FileFetcher) Fetch(ctx context.Context, url, dest, expectedSHA string, 
 // streamCopy copies src→dst while updating hash h and reporting progress, honoring ctx
 // cancellation between chunks. startOffset is the bytes already present (for progress
 // accounting on resume). Returns the FINAL total size on disk.
-func streamCopy(ctx context.Context, dst io.Writer, src io.Reader, h hash.Hash, startOffset, total int64, prog ProgressFunc, name string, resumed bool, idx, count int) (int64, error) {
+func streamCopy(ctx context.Context, dst io.Writer, src io.Reader, h hash.Hash, startOffset, total int64, prog ProgressFunc, name string, resumed bool, idx, count int, limitBytes int64) (int64, error) {
 	buf := make([]byte, 1<<20) // 1 MiB chunks
 	done := startOffset
 	mw := io.MultiWriter(dst, h)
@@ -175,6 +189,9 @@ func streamCopy(ctx context.Context, dst io.Writer, src io.Reader, h hash.Hash, 
 		}
 		n, rerr := src.Read(buf)
 		if n > 0 {
+			if limitBytes > 0 && done+int64(n) > limitBytes {
+				return done, fmt.Errorf("download %s exceeds the %d byte hard cap; aborted before writing beyond the limit", name, limitBytes)
+			}
 			if _, werr := mw.Write(buf[:n]); werr != nil {
 				return done, fmt.Errorf("write %s: %w", name, werr)
 			}

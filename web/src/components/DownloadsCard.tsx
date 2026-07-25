@@ -13,12 +13,11 @@ function isCriticalWarning(w: string): boolean {
   return low.includes('pickle') || low.includes('trust_remote_code');
 }
 
-type Kind = 'hf' | 'gguf_url' | 'ollama' | 'local_import';
+type Kind = 'hf' | 'gguf_url' | 'local_import';
 
 const KIND_LABELS: Record<Kind, string> = {
   hf: 'HF repo',
   gguf_url: 'GGUF URL',
-  ollama: 'Ollama pull',
   local_import: 'Local import',
 };
 
@@ -32,7 +31,6 @@ export function DownloadsCard() {
   const [ref, setRef] = useState('');
   const [file, setFile] = useState('');
   const [url, setUrl] = useState('');
-  const [name, setName] = useState('');
   const [path, setPath] = useState('');
 
   const [job, setJob] = useState<DownloadJob | null>(null);
@@ -92,12 +90,6 @@ export function DownloadsCard() {
         return;
       }
       req.url = url.trim();
-    } else if (kind === 'ollama') {
-      if (!name.trim()) {
-        setError('Enter an Ollama model name (e.g. qwen2.5:0.5b).');
-        return;
-      }
-      req.name = name.trim();
     } else if (kind === 'local_import') {
       if (!path.trim()) {
         setError('Enter the absolute path of an existing model file.');
@@ -167,6 +159,7 @@ export function DownloadsCard() {
               <span className={styles.label}>HF repo</span>
               <input
                 className={styles.input}
+                name="dl-hf-repo"
                 placeholder="e.g. Qwen/Qwen2.5-0.5B-Instruct-GGUF"
                 value={repo}
                 onChange={(e) => setRepo(e.target.value)}
@@ -180,6 +173,7 @@ export function DownloadsCard() {
               </span>
               <input
                 className={styles.input}
+                name="dl-hf-ref"
                 placeholder="main"
                 value={ref}
                 onChange={(e) => setRef(e.target.value)}
@@ -192,6 +186,7 @@ export function DownloadsCard() {
               </span>
               <input
                 className={styles.input}
+                name="dl-hf-file"
                 placeholder="e.g. qwen2.5-0.5b-instruct-q4_k_m.gguf"
                 value={file}
                 onChange={(e) => setFile(e.target.value)}
@@ -205,21 +200,10 @@ export function DownloadsCard() {
             <span className={styles.label}>Direct .gguf URL</span>
             <input
               className={styles.input}
+              name="dl-gguf-url"
               placeholder="https://…/model.gguf"
               value={url}
               onChange={(e) => setUrl(e.target.value)}
-              spellCheck={false}
-            />
-          </label>
-        )}
-        {kind === 'ollama' && (
-          <label className={styles.field}>
-            <span className={styles.label}>Ollama model name</span>
-            <input
-              className={styles.input}
-              placeholder="qwen2.5:0.5b"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
               spellCheck={false}
             />
           </label>
@@ -229,6 +213,7 @@ export function DownloadsCard() {
             <span className={styles.label}>Absolute path (must be inside a model dir)</span>
             <input
               className={styles.input}
+              name="dl-local-path"
               placeholder="K:\\projects\\llm_models\\models\\model.gguf"
               value={path}
               onChange={(e) => setPath(e.target.value)}

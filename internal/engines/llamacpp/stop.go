@@ -59,7 +59,7 @@ func (r *Runner) Stop(ctx context.Context, instanceID string) (StopResult, error
 	}
 
 	// 2. Free VRAM before.
-	freeBefore, _ := r.vram.FreeVRAMMiB(ctx)
+	freeBefore, beforeErr := r.vram.FreeVRAMMiB(ctx)
 
 	// 3. Stop the process (graceful → hard via Job Object).
 	live, ok := r.live.get(instanceID)
@@ -72,6 +72,12 @@ func (r *Runner) Stop(ctx context.Context, instanceID string) (StopResult, error
 
 	// 4. Poll for the VRAM reclaim.
 	freeAfter, freed, verified, timedOut := r.waitReclaim(ctx, freeBefore, footprint)
+	if beforeErr != nil {
+		// A delta without a successfully measured baseline is not evidence of
+		// reclamation. In particular, never turn a transient probe failure into a
+		// fabricated large positive delta by treating the baseline as zero.
+		freeAfter, freed, verified, timedOut = 0, 0, false, true
+	}
 
 	// 5. Persist STOPPED with the measured delta.
 	freedForRow := freed
@@ -79,6 +85,9 @@ func (r *Runner) Stop(ctx context.Context, instanceID string) (StopResult, error
 		freedForRow = 0
 	}
 	reason := r.stopReason(freed, footprint, verified, timedOut)
+	if beforeErr != nil {
+		reason = "stopped: process was signalled, but VRAM reclaim is UNVERIFIED because the baseline probe failed: " + beforeErr.Error()
+	}
 	stopped, serr := r.store.Transition(ctx, instanceID, instances.TransitionParams{
 		To:           instances.StateStopped,
 		Reason:       reason,

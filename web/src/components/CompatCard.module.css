@@ -1,42 +1,50 @@
 .form {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  margin-bottom: 10px;
+  gap: var(--s3);
+  margin-bottom: var(--s3);
 }
 
 .field {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--s1);
 }
 
 .label {
-  font-size: 0.78rem;
+  font-size: 12px;
+  font-weight: 500;
   color: var(--text-dim);
 }
 
 .optional {
   color: var(--text-faint);
+  font-weight: 400;
 }
 
 .input {
   background: var(--bg-raised);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 8px 10px;
+  padding: 9px 11px;
   color: var(--text);
   font-family: var(--mono);
-  font-size: 0.82rem;
+  font-size: 12.5px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.input::placeholder {
+  color: var(--text-faint);
 }
 
 .input:focus {
   outline: none;
   border-color: var(--accent-dim);
+  box-shadow: 0 0 0 3px var(--accent-bg);
 }
 
 .result {
-  margin-top: 10px;
-  padding-top: 10px;
+  margin-top: var(--s3);
+  padding-top: var(--s3);
   border-top: 1px solid var(--border);
 }

@@ -70,7 +70,7 @@ describe('App (smoke)', () => {
 
     // Engines fetched.
     await waitFor(() =>
-      expect(screen.getByText('Ollama')).toBeInTheDocument(),
+      expect(screen.queryByText('Ollama')).not.toBeInTheDocument(),
     );
     expect(screen.getByText('llama.cpp')).toBeInTheDocument();
     expect(screen.getByText('vLLM')).toBeInTheDocument();

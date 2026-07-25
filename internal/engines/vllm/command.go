@@ -66,9 +66,14 @@ type LaunchParams struct {
 // DockerRunArgs builds the argv for `docker run` (excluding the leading "docker"). It is the
 // exact list the DockerClient.Run executes. Order is fixed and unit-tested string-exactly.
 //
-//	docker run -d --name localhub-vllm-<id> --runtime nvidia --gpus all --ipc=host \
+//	docker run -d --name localhub-vllm-<id> --gpus all --ipc=host \
 //	  -p 127.0.0.1:<hostPort>:8000 [extra-docker-args...] <image> --model <model> \
 //	  --gpu-memory-utilization <u> --max-model-len <n> --dtype <d> [extra...]
+//
+// GPU access uses only `--gpus all` (the modern nvidia-container-toolkit/CDI path). The legacy
+// `--runtime nvidia` flag is NOT emitted: hosts without the runtime registered in daemon.json
+// fail hard on it (`unknown or invalid runtime name`), while `--gpus` works on both setups.
+// Operators on legacy-only hosts can add `--runtime nvidia` via ExtraDockerArgs.
 func DockerRunArgs(p LaunchParams) []string {
 	image := p.Image
 	if image == "" {
@@ -77,7 +82,6 @@ func DockerRunArgs(p LaunchParams) []string {
 	args := []string{
 		"run", "-d",
 		"--name", ContainerName(p.InstanceID),
-		"--runtime", "nvidia",
 		"--gpus", "all",
 		"--ipc=host",
 		"-p", fmt.Sprintf("127.0.0.1:%d:%d", p.HostPort, containerVLLMPort),

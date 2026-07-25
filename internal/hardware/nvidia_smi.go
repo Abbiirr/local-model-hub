@@ -102,13 +102,20 @@ func execNvidiaSmi(ctx context.Context, binary string, timeout time.Duration) ([
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(cctx, binary,
-		"--query-gpu="+nvidiaSmiQueryFields,
-		"--format=csv,noheader,nounits",
-	)
-	hideWindow(cmd) // CREATE_NO_WINDOW on Windows so we don't flash a console (no-op elsewhere)
-
-	out, err := cmd.Output()
+	run := func(fields string) ([]byte, error) {
+		cmd := exec.CommandContext(cctx, binary,
+			"--query-gpu="+fields,
+			"--format=csv,noheader,nounits",
+		)
+		hideWindow(cmd)
+		return cmd.Output()
+	}
+	out, err := run(nvidiaSmiQueryFields)
+	if err != nil && cctx.Err() == nil {
+		// compute_cap is absent on older supported drivers. A missing optional
+		// capability must not make a healthy NVIDIA box look like it has no GPU.
+		out, err = run("name,memory.total,memory.free,memory.used,driver_version,utilization.gpu,temperature.gpu,power.draw")
+	}
 	if cctx.Err() == context.DeadlineExceeded {
 		return nil, fmt.Errorf("nvidia-smi timed out after %s", timeout)
 	}
@@ -153,6 +160,8 @@ func parseNvidiaSmiCSV(raw []byte) []GPU {
 			hasIdx = true
 		case 9:
 			hasIdx = false
+		case 8: // compatibility retry without the unsupported compute_cap field
+			hasIdx = false
 		default:
 			// Malformed line: wrong number of fields. Skip, don't abort the whole parse.
 			rowIdx++
@@ -176,10 +185,16 @@ func parseNvidiaSmiCSV(raw []byte) []GPU {
 		g.VRAMFreeMiB = atoiOr(cols[off+2], 0)
 		g.VRAMUsedMiB = atoiOr(cols[off+3], 0)
 		g.DriverVersion = cols[off+4]
-		g.ComputeCapability = strings.TrimSpace(cols[off+5])
-		g.UtilizationPct = atofOrNA(cols[off+6], -1)
-		g.TemperatureC = atofOrNA(cols[off+7], -1)
-		g.PowerDrawW = atofOrNA(cols[off+8], 0)
+		if len(cols) == 8 {
+			g.UtilizationPct = atofOrNA(cols[off+5], -1)
+			g.TemperatureC = atofOrNA(cols[off+6], -1)
+			g.PowerDrawW = atofOrNA(cols[off+7], 0)
+		} else {
+			g.ComputeCapability = strings.TrimSpace(cols[off+5])
+			g.UtilizationPct = atofOrNA(cols[off+6], -1)
+			g.TemperatureC = atofOrNA(cols[off+7], -1)
+			g.PowerDrawW = atofOrNA(cols[off+8], 0)
+		}
 
 		gpus = append(gpus, g)
 		rowIdx++

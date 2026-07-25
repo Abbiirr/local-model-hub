@@ -1,5 +1,11 @@
 # LocalHub Compass — Start-to-End Handoff
 
+> **SUPERSEDED 2026-07-08.** This was the original pre-build brief; the product has
+> since been built (Phases 0–6 + C1 closed, post-1.0 wave, cluster P7.1–P7.2). The
+> current complete handoff is **[BUILDER-HANDOFF.md](BUILDER-HANDOFF.md)**. Note this
+> document's "no multi-node" non-goal was amended by ADR-008 (LAN federation, not k8s).
+> Kept unchanged below for history.
+
 This is the concise control document. The full project package is in `localhub-compass-project-handoff.zip`.
 
 ## Validated direction

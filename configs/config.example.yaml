@@ -1,7 +1,7 @@
 # LocalHub Compass — example configuration.
 #
 # Every value here is also the built-in default (internal/config.Default), so the daemon
-# runs on the reference box (Windows 10, RTX 4060 Ti, Ollama on 127.0.0.1:11434) with NO
+# runs on the reference box (Windows 10, RTX 4060 Ti, llama.cpp + vLLM) with NO
 # config file at all. Copy this to configs/config.yaml and edit to override.
 #
 # Kept in sync with examples/config.example.yaml. Fields new to P1.1 (allow_nonlocal,
@@ -30,11 +30,8 @@ hardware:
   poll_interval_seconds: 1
 
 engines:
-  ollama:
-    enabled: true
-    base_url: "http://127.0.0.1:11434"
-    # How often the /api/ps -> instances mirror runs (P4.3), seconds. Default 10.
-    mirror_interval_seconds: 10
+  # Ollama is retired as a runtime. Re-import standalone GGUFs and run them
+  # through llama.cpp, which LocalHub can supervise.
   llamacpp:
     enabled: true
     binary_path: "llama-server"   # winget llama-server on PATH (primary candidate)
@@ -60,6 +57,7 @@ engines:
     attach_url: ""                # required when mode == "attach"
     port_range: [40201, 40300]
     default_gpu_memory_utilization: 0.90
+    extra_args: []                 # vLLM engine flags, e.g. ["--skip-mm-profiling"]
 
 compatibility:
   safety_factor: 0.92
@@ -73,6 +71,18 @@ residency:
   default_ttl_seconds: 900       # idle TTL for a spawned instance; expired-TTL is evicted first
   never_kill_active_by_default: true
   drain_timeout_seconds: 300     # user-stop of a busy instance drains up to this, then stops anyway
+  min_free_ram_mib: 2048         # RAM floor: don't start a new process/warm below this free system RAM
+                                 # (RAM binds before VRAM on a small-RAM box; global guard, ram_blocked
+                                 # reason surfaced like VRAM shortages; 0 disables). fix 4 / review finding 4.
+  max_gpu_temp_c: 87             # GPU-temp ceiling: don't start/warm a new model while the core temp is
+                                 # above this (gpu_hot reason; drain re-admits once it cools). RTX 4060 Ti's
+                                 # NVIDIA-spec max is 90C and it throttles ~83C, so 87 leaves headroom below
+                                 # the hard max. Admission-time guard only — a running model is never killed
+                                 # for crossing it. Valid: 0 (disabled) or 60..100.
+  max_gpu_util_pct: 0            # GPU-util ceiling: 0 = disabled (starting while the GPU is momentarily busy
+                                 # is often legitimate). Set e.g. 80 if the box doubles as a gaming/render
+                                 # machine and you want loads to wait for the GPU to be mostly free (gpu_busy
+                                 # reason; drain re-admits once it frees). Valid: 0..100.
   queue:                         # custom priority-queue tuning (docs/residency-priority-queue.md)
     age_promote_normal_seconds: 60       # normal → interactive-equivalent after this wait
     age_promote_background_seconds: 120  # background → normal-equivalent after this wait
@@ -80,6 +90,9 @@ residency:
     cap_interactive: 64          # per-class WAITING caps → queue_full rejection past the cap
     cap_normal: 256
     cap_background: 512
+
+jobs:
+  enabled: true                  # P6.2 async inference jobs worker (default true; mirrors residency.enabled)
 
 security:
   strict_model_artifact_mode: false
@@ -89,3 +102,16 @@ security:
 logging:
   level: "info"                # debug | info | warn | error
   format: "text"               # text | json
+
+cluster:                       # P7.1 LAN federation (ADR-008, docs/cluster-plan.md). OPT-IN.
+  role: "off"                  # off (default; byte-identical to single-box 1.0) | coordinator | node
+  # --- coordinator role: this box accepts node join/heartbeat and exposes /api/cluster/* ---
+  # --- node role: this box dials a coordinator and heartbeats; requires coordinator_url + cluster_token ---
+  coordinator_url: ""          # node mode: URL of the coordinator to join, e.g. http://box-a.tailnet.ts.net:39876
+  cluster_token: ""            # shared cluster bearer, DISTINCT from server.admin_token. Required for
+                               # role=node, and MANDATORY for any clustered role on a non-loopback bind.
+  node_name: ""                # human label the coordinator shows (defaults to the OS hostname)
+  advertise_url: ""            # node mode: how the coordinator reaches THIS node back (its non-loopback/
+                               # tailnet URL). Empty => derived from server.bind:port (fine for a loopback
+                               # dev rig; set explicitly for a real second box behind NAT/Tailscale).
+  heartbeat_interval_seconds: 10  # node join/heartbeat cadence; the unit ONLINE/STALE/UNREACHABLE derive from

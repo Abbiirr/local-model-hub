@@ -1,4 +1,5 @@
-/* Desktop: table. Mobile (<=640px): cards. Controlled by media query. */
+/* Desktop: clean table with aligned columns and light chrome.
+   Mobile (<=640px): cards. Controlled by media query. */
 
 .tableWrap {
   overflow-x: auto;
@@ -10,10 +11,11 @@
 }
 .table th {
   text-align: left;
-  padding: 8px 12px;
-  font-size: 11px;
+  padding: var(--s2) var(--s4);
+  font-size: 10.5px;
+  font-weight: 650;
   text-transform: uppercase;
-  letter-spacing: 0.03em;
+  letter-spacing: 0.06em;
   color: var(--text-faint);
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
@@ -22,15 +24,22 @@
   background: var(--bg-panel);
 }
 .table td {
-  padding: 9px 12px;
+  padding: var(--s3) var(--s4);
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
 }
-.table tr:last-child td {
+.table tbody tr:last-child td {
   border-bottom: none;
 }
-.table tr:hover td {
+.table tbody tr {
+  transition: background 0.12s;
+}
+.table tbody tr:hover td {
   background: var(--bg-hover);
+}
+/* Numeric columns align right for scannability. */
+.size {
+  text-align: right;
 }
 .modelName {
   font-weight: 600;
@@ -49,6 +58,7 @@
   font-family: var(--mono);
   color: var(--text-dim);
   white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 .quant {
   font-family: var(--mono);
@@ -60,25 +70,25 @@
 .cards {
   display: none;
   padding: var(--pad);
-  gap: 10px;
+  gap: var(--s3);
 }
 .card {
-  background: var(--bg-raised);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 10px 12px;
+  padding: var(--s3) 0;
+}
+.card + .card {
+  border-top: 1px solid var(--border);
 }
 .cardHead {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 6px;
+  gap: var(--s2);
+  margin-bottom: var(--s2);
 }
 .cardMeta {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px 12px;
+  gap: var(--s1) var(--s3);
   font-size: 12px;
   color: var(--text-dim);
 }
@@ -91,14 +101,46 @@
   font-family: var(--mono);
   font-size: 10.5px;
   color: var(--text-faint);
-  margin-top: 6px;
-  word-break: break-all;
+  margin-top: var(--s2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .count {
   font-size: 11px;
   color: var(--text-faint);
   font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Header actions cluster: the shared GPU/CPU mode tag + Rescan. */
+.headerActions {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  min-width: 0;
+}
+
+/* Shared placement mode — a quiet, click-to-toggle text tag (no boxy chrome). Mirrors the
+   Instances picker toggle; Run uses this setting. Off (full GPU) reads as the muted default. */
+.offloadTag {
+  background: transparent;
+  border: none;
+  padding: 2px 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-faint);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.15s;
+}
+.offloadTag:hover {
+  color: var(--text-dim);
+}
+.offloadTag[aria-pressed='true'] {
+  color: var(--accent);
 }
 
 /* Compatibility cell (table) + card section. */
@@ -108,17 +150,66 @@
 .compatCell {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--s2);
 }
 .compatRow {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--s2);
 }
 .cardCompat {
-  margin-top: 8px;
-  padding-top: 8px;
+  margin-top: var(--s2);
+  padding-top: var(--s2);
   border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+}
+
+/* "unchecked" hint — muted, no chrome; distinguishes an un-previewed model from a verdict. */
+.unchecked {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+/* Actions column (Run + Preview fit) — the primary product action lives here. */
+.actionTd {
+  min-width: 180px;
+}
+.actionCell {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+  align-items: flex-start;
+}
+.actionRow {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  flex-wrap: wrap;
+}
+
+/* Run — the ONE primary, accent-filled call to action on the row. Restrained: solid accent
+   fill, single hover treatment, matches the theme's one-accent rule. */
+.runBtn {
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  padding: 6px 16px;
+  color: #071019;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: filter 0.15s;
+}
+.runBtn:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.runBtn:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 
 @media (max-width: 640px) {

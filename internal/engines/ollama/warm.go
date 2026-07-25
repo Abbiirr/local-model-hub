@@ -88,11 +88,17 @@ type WarmResult struct {
 // It returns a WarmResult (with done_reason "load" for generative models; embed loads return an
 // empty done_reason but the caller confirms residency via /api/ps) or a *DaemonUnreachableError
 // if the daemon is down.
-func (c *Client) Warm(ctx context.Context, model, keepAlive string) (WarmResult, error) {
+// numGPU controls layer placement (Ollama api/types.go Runner.NumGPU, json "num_gpu"): the number
+// of model layers to offload to the GPU. nil => omit the option so the daemon uses its dynamic
+// default (-1 = auto-split as many layers as fit, rest on CPU). A large value (LocalHub sends
+// forceFullGPULayers) forces ALL layers onto the GPU (full offload, never CPU). Verified against
+// https://raw.githubusercontent.com/ollama/ollama/main/api/types.go (fetched 2026-07-07):
+// `NumGPU int json:"num_gpu,omitempty"` with a documented default of -1 = "set dynamically".
+func (c *Client) Warm(ctx context.Context, model, keepAlive string, numGPU *int) (WarmResult, error) {
 	if strings.TrimSpace(model) == "" {
 		return WarmResult{}, fmt.Errorf("ollama warm: model is required")
 	}
-	body := warmBody(model, keepAlive, false)
+	body := warmBody(model, keepAlive, false, numGPU)
 	var resp generateResponse
 	err := c.postJSON(ctx, "/api/generate", body, &resp)
 	if err == nil {
@@ -103,7 +109,7 @@ func (c *Client) Warm(ctx context.Context, model, keepAlive string) (WarmResult,
 	}
 	// Embedding models 400 on /api/generate: fall back to /api/embed (empty input warms it).
 	if isNotGenerateError(err) {
-		embedBody := embedWarmBody(model, keepAlive)
+		embedBody := embedWarmBody(model, keepAlive, numGPU)
 		var eresp struct {
 			Model string `json:"model"`
 		}
@@ -125,17 +131,42 @@ func isNotGenerateError(err error) bool {
 }
 
 // embedWarmBody builds the /api/embed load body: empty input + keep_alive (same keep_alive
-// encoding rules as warmBody).
-func embedWarmBody(model, keepAlive string) string {
+// encoding rules as warmBody) + an optional num_gpu option (nil => omitted).
+func embedWarmBody(model, keepAlive string, numGPU *int) string {
 	esc := func(s string) string { b, _ := json.Marshal(s); return string(b) }
+	opts := numGPUOptions(numGPU)
 	if strings.TrimSpace(keepAlive) == "" {
-		return fmt.Sprintf(`{"model":%s,"input":""}`, esc(model))
+		return fmt.Sprintf(`{"model":%s,"input":""%s}`, esc(model), opts)
 	}
 	if isNumeric(keepAlive) {
-		return fmt.Sprintf(`{"model":%s,"input":"","keep_alive":%s}`, esc(model), keepAlive)
+		return fmt.Sprintf(`{"model":%s,"input":"","keep_alive":%s%s}`, esc(model), keepAlive, opts)
 	}
-	return fmt.Sprintf(`{"model":%s,"input":"","keep_alive":%s}`, esc(model), esc(keepAlive))
+	return fmt.Sprintf(`{"model":%s,"input":"","keep_alive":%s%s}`, esc(model), esc(keepAlive), opts)
 }
+
+// numGPUOptions renders the trailing `,"options":{"num_gpu":N}` fragment for a warm body, or ""
+// when numGPU is nil (omit → daemon dynamic default -1). num_gpu is a LOAD-time runner option
+// (Ollama api/types.go Runner.NumGPU); it must be nested under "options" on /api/generate and
+// /api/embed. The fragment starts with a comma so it appends after the last existing field.
+func numGPUOptions(numGPU *int) string {
+	if numGPU == nil {
+		return ""
+	}
+	return fmt.Sprintf(`,"options":{"num_gpu":%d}`, *numGPU)
+}
+
+// forceFullGPULayers is the num_gpu value LocalHub sends to force ALL layers onto the GPU (full
+// offload, never CPU). Ollama offloads min(num_gpu, model_layer_count) layers, so any value >= the
+// largest local model's layer count forces full residency; 999 is the well-established idiom for
+// "all layers" (far above any real model's layer count). Used when allow_cpu_offload is false —
+// the hard default that makes an Ollama warm behave like llama.cpp's -ngl all.
+const forceFullGPULayers = 999
+
+// FullGPULayers returns a pointer to the num_gpu value that forces ALL layers onto the GPU (full
+// offload, never CPU). The core passes this as WarmSpec.NumGPU for the full-GPU default; it passes
+// nil for allow_cpu_offload=true (daemon dynamic -1 auto-split). Exported so the core does not
+// hardcode the sentinel.
+func FullGPULayers() *int { n := forceFullGPULayers; return &n }
 
 // UnloadResult reports the outcome of an Unload call — including whether the model actually left
 // /api/ps within the poll budget (the honest "did VRAM free" signal, not a bare 200).
@@ -197,7 +228,7 @@ func (c *Client) Unload(ctx context.Context, model string, cfg UnloadConfig) (Un
 	}
 
 	// Send the unload request.
-	body := warmBody(model, "0", true) // keep_alive:0 as a JSON number, not a string
+	body := warmBody(model, "0", true, nil) // keep_alive:0 as a JSON number; no num_gpu on unload
 	var resp generateResponse
 	if err := c.postJSON(ctx, "/api/generate", body, &resp); err != nil {
 		if isTransport(err) {
@@ -257,17 +288,19 @@ func (c *Client) IsResident(ctx context.Context, model string) (resident bool, p
 // warmBody builds the /api/generate request body. When keepAliveIsNumber is true, keepAlive is
 // emitted as a JSON number (used for keep_alive:0 unload and numeric-second warms). An empty
 // keepAlive omits the field entirely (daemon default). A "-1" pins the model (keep_alive:-1).
-func warmBody(model, keepAlive string, keepAliveIsNumber bool) string {
+// numGPU (nil => omitted) sets the load-time layer-offload count under "options".
+func warmBody(model, keepAlive string, keepAliveIsNumber bool, numGPU *int) string {
 	esc := func(s string) string { b, _ := json.Marshal(s); return string(b) }
+	opts := numGPUOptions(numGPU)
 	if strings.TrimSpace(keepAlive) == "" {
-		return fmt.Sprintf(`{"model":%s}`, esc(model))
+		return fmt.Sprintf(`{"model":%s%s}`, esc(model), opts)
 	}
 	if keepAliveIsNumber || isNumeric(keepAlive) {
 		// Numeric keep_alive (seconds, 0, or -1) → JSON number.
-		return fmt.Sprintf(`{"model":%s,"keep_alive":%s}`, esc(model), keepAlive)
+		return fmt.Sprintf(`{"model":%s,"keep_alive":%s%s}`, esc(model), keepAlive, opts)
 	}
 	// Duration string like "10m" → JSON string.
-	return fmt.Sprintf(`{"model":%s,"keep_alive":%s}`, esc(model), esc(keepAlive))
+	return fmt.Sprintf(`{"model":%s,"keep_alive":%s%s}`, esc(model), esc(keepAlive), opts)
 }
 
 // isNumeric reports whether s is an integer literal (optionally negative), so a keep_alive of

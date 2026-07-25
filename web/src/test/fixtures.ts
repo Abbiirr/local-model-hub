@@ -37,15 +37,6 @@ export const hardwareFixture: HardwareSnapshot = {
 
 export const enginesFixture: Engine[] = [
   {
-    name: 'ollama',
-    installed: true,
-    version: '0.21.2',
-    running: true,
-    base_url: 'http://127.0.0.1:11434',
-    reason: 'Ollama daemon reachable',
-    details: { running_models: 0, models: 5 },
-  },
-  {
     name: 'llamacpp',
     installed: true,
     version: '8833 (45cac7ca7)',
@@ -82,17 +73,6 @@ export const modelsFixture: ModelSummary[] = [
     quantization: 'tq3_4s',
     local_path: 'K:\\projects\\llm_models\\models\\Qwen3.6-27B-TQ3_4S.gguf',
     size_bytes: 14979000000,
-    presence: 'present',
-  },
-  {
-    id: 'ollama-llama3-1-8b',
-    display_name: 'llama3.1:8b',
-    source: 'ollama',
-    format: 'ollama',
-    quantization: 'Q4_K_M',
-    size_bytes: 4700000000,
-    sha256: 'sha256:abc123',
-    compat_status: 'runs',
     presence: 'present',
   },
 ];

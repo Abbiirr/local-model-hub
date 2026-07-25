@@ -4,17 +4,18 @@ package hardware
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
-// otherSystemProbe is the non-Windows fallback so the package COMPILES on every platform
-// (the reference box is Windows-first, but Linux support lands later behind the same
-// interfaces). It returns best-effort/zero values rather than syscalls: real Linux CPU/RAM/
-// disk probing (sysconf, /proc/meminfo, statfs) is a later task. UtilizationPct is -1 and
-// RAM/Disk are zero-valued; the GPU path (nvidia-smi) still works identically on Linux.
-//
-// This stub is intentionally minimal — it must compile and not panic, not be complete.
+// otherSystemProbe provides the portable non-Windows implementation. Linux uses the
+// kernel's procfs/statfs interfaces, keeping the control plane free of CUDA/NVML.
 type otherSystemProbe struct{}
 
 func newSystemProbe() SystemProbe { return otherSystemProbe{} }
@@ -26,12 +27,55 @@ func (otherSystemProbe) CPU(ctx context.Context) (CPU, error) {
 }
 
 func (otherSystemProbe) RAM(ctx context.Context) (RAM, error) {
-	// Real /proc/meminfo parsing is a later Linux task; return zero so callers don't crash.
-	return RAM{}, nil
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return RAM{}, err
+	}
+	var total, available uint64
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		v, e := strconv.ParseUint(f[1], 10, 64)
+		if e != nil {
+			continue
+		}
+		switch f[0] {
+		case "MemTotal:":
+			total = v
+		case "MemAvailable:":
+			available = v
+		}
+	}
+	if total == 0 {
+		return RAM{}, os.ErrInvalid
+	}
+	return RAM{TotalMiB: int(total / 1024), FreeMiB: int(available / 1024), UsedMiB: int((total - available) / 1024)}, nil
 }
 
 func (otherSystemProbe) Disks(ctx context.Context, paths []string) ([]Disk, error) {
-	return []Disk{}, nil
+	if len(paths) == 0 {
+		paths = []string{"."}
+	}
+	seen := map[string]bool{}
+	var out []Disk
+	for _, p := range paths {
+		abs, err := filepath.Abs(p)
+		if err != nil || seen[abs] {
+			continue
+		}
+		seen[abs] = true
+		var st unix.Statfs_t
+		if err := unix.Statfs(abs, &st); err != nil {
+			continue
+		}
+		b := uint64(st.Bsize)
+		total := float64(st.Blocks*b) / (1024 * 1024 * 1024)
+		free := float64(st.Bavail*b) / (1024 * 1024 * 1024)
+		out = append(out, Disk{Path: abs, TotalGiB: round2(total), FreeGiB: round2(free), UsedGiB: round2(total - free)})
+	}
+	return out, nil
 }
 
 // hideWindow is a no-op off Windows (no console-flash concern).

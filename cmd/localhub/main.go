@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/localhub/localhub/internal/api"
+	"github.com/localhub/localhub/internal/cluster"
 	"github.com/localhub/localhub/internal/compat"
 	"github.com/localhub/localhub/internal/compat/hfmeta"
 	"github.com/localhub/localhub/internal/config"
@@ -200,6 +201,11 @@ func run() error {
 	if cfg.Residency.Enabled {
 		inflight = residency.NewInFlightTracker()
 		residencyMgr = buildResidencyManager(cfg, database, instStore, hwProbe, inflight, logger)
+		if restored, err := residencyMgr.RestoreWaiting(context.Background()); err != nil {
+			return fmt.Errorf("restore durable residency queue: %w", err)
+		} else if restored > 0 {
+			logger.Info("restored durable residency queue", "waiting", restored)
+		}
 	}
 
 	svc := core.New(core.Deps{
@@ -239,7 +245,54 @@ func run() error {
 		InFlight:  inflight,
 	})
 
-	srv, err := api.New(svc, logger, cfg.Server.Bind, cfg.Server.Port)
+	adminToken := ""
+	if cfg.Server.AdminToken != nil {
+		adminToken = *cfg.Server.AdminToken
+	}
+
+	// Cluster role wiring (P7.1, ADR-008, docs/cluster-plan.md). role=off wires NOTHING — no
+	// identity minting, no registry, no goroutine — so the daemon is byte-identical to 1.0
+	// (cluster-plan §1.3). "coordinator" builds the DB-backed soft-state registry and passes it to
+	// the API so /api/cluster/* register; "node" builds the heartbeat client (started after the
+	// signal context exists, below). Both roles mint/persist this daemon's stable node UUID.
+	var clusterOpts []api.Option
+	var clusterClient *cluster.Client
+	if cfg.Cluster.Role != "off" {
+		nodeID, cerr := cluster.LoadOrCreateNodeID(context.Background(), database.DB)
+		if cerr != nil {
+			return fmt.Errorf("cluster identity: %w", cerr)
+		}
+		hbInterval := time.Duration(cfg.Cluster.HeartbeatIntervalSeconds) * time.Second
+		switch cfg.Cluster.Role {
+		case "coordinator":
+			reg := cluster.NewRegistry(database.DB, hbInterval)
+			clusterOpts = append(clusterOpts,
+				api.WithCluster("coordinator", cfg.Cluster.Token, nodeID, cfg.Cluster.NodeName, reg))
+			logger.Info("cluster coordinator role enabled",
+				"node_id", nodeID, "node_name", cfg.Cluster.NodeName, "heartbeat_interval", hbInterval.String())
+		case "node":
+			clusterClient = cluster.NewClient(cluster.ClientConfig{
+				CoordinatorURL: cfg.Cluster.CoordinatorURL,
+				Token:          cfg.Cluster.Token,
+				NodeID:         nodeID,
+				Name:           cfg.Cluster.NodeName,
+				BaseURL:        nodeBaseURL(cfg),
+				Version:        core.Version,
+				Interval:       hbInterval,
+				Logger:         logger,
+				// P7.2: report a compact hardware summary (free/total VRAM, GPU name, free RAM) on every
+				// heartbeat, read from THIS node's own probe. The coordinator stores it verbatim and shows
+				// it in aggregated views — it never parses it for a fit (ADR-008, one-core-per-node).
+				HWSummary: nodeHWSummary(hwProbe),
+			})
+			logger.Info("cluster node role enabled",
+				"node_id", nodeID, "node_name", cfg.Cluster.NodeName,
+				"coordinator", cfg.Cluster.CoordinatorURL, "base_url", nodeBaseURL(cfg),
+				"heartbeat_interval", hbInterval.String())
+		}
+	}
+
+	srv, err := api.New(svc, logger, cfg.Server.Bind, cfg.Server.Port, adminToken, clusterOpts...)
 	if err != nil {
 		return fmt.Errorf("start server: %w", err)
 	}
@@ -247,6 +300,13 @@ func run() error {
 	// Cancel the root context on SIGINT/SIGTERM for graceful shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// P7.1 node heartbeat loop (cluster-plan §2.4). Detached goroutine: the coordinator being
+	// down NEVER affects local serving (cluster-plan §1.3, §7) — the client logs+retries and never
+	// returns an error to the daemon. Started only in node role (nil otherwise).
+	if clusterClient != nil {
+		go clusterClient.Run(ctx)
+	}
 
 	// Reconcile instances on EVERY daemon startup (playbook rule; P4.1). Orphaned/dead child
 	// processes recorded by a prior run are re-attached (PID alive + healthy + identity) or
@@ -257,6 +317,13 @@ func run() error {
 	} else if n := len(rec.Reattached) + len(rec.Reaped) + len(rec.Stopped); n > 0 {
 		logger.Info("instance reconcile complete",
 			"reattached", rec.Reattached, "reaped", rec.Reaped, "stopped", rec.Stopped, "errors", rec.Errors)
+	}
+
+	// P6.2: fail any job left `running` by a crash/restart (design §2.6) BEFORE the worker starts,
+	// so the worker never sees a stale running row. Queued jobs are left for the worker to re-admit.
+	// A reconcile failure is non-fatal — log and continue.
+	if err := svc.ReconcileJobs(ctx); err != nil {
+		logger.Warn("reconcile jobs failed", "err", err)
 	}
 
 	// Ollama mirror (P4.3): one sync at startup (reconcile-time) so the dashboard reflects the
@@ -302,6 +369,13 @@ func run() error {
 			},
 			func(err error) { logger.Debug("residency drain error", "err", err) },
 		)
+	}
+
+	// P6.2 async-job worker (gated on cfg.Jobs.Enabled, default true; mirrors residency.enabled):
+	// drains queued jobs oldest/highest-priority-first, admits each through the SAME residency path
+	// as the proxy, relays non-streaming, and records the result. Returns when ctx is cancelled.
+	if cfg.Jobs.Enabled {
+		go svc.RunJobWorker(ctx)
 	}
 
 	// Initial inventory scan in the background (non-blocking, logged). GET /api/models is
@@ -388,6 +462,45 @@ func volumeOf(p string) string {
 		return p[:2]
 	}
 	return p
+}
+
+// nodeBaseURL returns the URL the coordinator uses to reach THIS node (cluster-plan §2.4). It
+// prefers the explicit cluster.advertise_url; when empty it derives http://<bind>:<port> from the
+// server config, which is correct for the loopback two-daemon dev rig. A real second box behind
+// NAT/Tailscale must set advertise_url explicitly (never guessed from the socket peer address).
+func nodeBaseURL(cfg config.Config) string {
+	if cfg.Cluster.AdvertiseURL != "" {
+		return cfg.Cluster.AdvertiseURL
+	}
+	return fmt.Sprintf("http://%s:%d", cfg.Server.Bind, cfg.Server.Port)
+}
+
+// nodeHWSummary returns the per-heartbeat hardware-summary closure the node client calls each beat
+// (P7.2, cluster-plan §2.4/§5b). It maps THIS node's own hardware snapshot into the compact
+// cluster.HWSummary shape (free/total VRAM per GPU + free/total RAM) and marshals it to the JSON string
+// reported in JoinRequest.HWSummary. A probe error yields "" (no summary this beat) — the summary is
+// advisory display data, never load-bearing, so the node still heartbeats and stays live. The mapping
+// lives HERE (the wiring layer, which imports hardware) so the cluster package stays hardware-free.
+func nodeHWSummary(probe hardware.Probe) func(context.Context) string {
+	return func(ctx context.Context) string {
+		snap, err := probe.Snapshot(ctx)
+		if err != nil {
+			return ""
+		}
+		hs := cluster.HWSummary{
+			RAMFreeMiB:  snap.RAM.FreeMiB,
+			RAMTotalMiB: snap.RAM.TotalMiB,
+			CapturedAt:  snap.CapturedAt.UTC().Format(time.RFC3339),
+		}
+		for _, g := range snap.GPUs {
+			hs.GPUs = append(hs.GPUs, cluster.HWGPU{
+				Name:         g.Name,
+				VRAMFreeMiB:  g.VRAMFreeMiB,
+				VRAMTotalMiB: g.VRAMTotalMiB,
+			})
+		}
+		return hs.JSON()
+	}
 }
 
 // healthTimeoutSeconds returns the configured llama.cpp health timeout (default 120s).
@@ -486,6 +599,8 @@ func buildResidencyManager(cfg config.Config, database *db.DB, instStore *instan
 		Queue:           residency.NewQueue(qcfg, clock),
 		QueueStore:      residency.NewQueueStore(database.DB),
 		Probe:           residencyVRAMProbe{probe: hwProbe},
+		RAMProbe:        residencyRAMProbe{probe: hwProbe},
+		GPUProbe:        residencyGPUProbe{probe: hwProbe},
 		Lister:          residency.StoreLister{Store: instStore},
 		Tracker:         inflight,
 		Clock:           clock,
@@ -493,6 +608,9 @@ func buildResidencyManager(cfg config.Config, database *db.DB, instStore *instan
 		RecentActiveTTL: durSecs(residency.DefaultRecentActiveTTLSecs),
 		DefaultTTLSecs:  rc.DefaultTTLSeconds,
 		VRAMBudgetMiB:   rc.VRAMBudgetMB,
+		MinFreeRAMMiB:   rc.MinFreeRAMMiB,
+		MaxGPUTempC:     rc.MaxGPUTempC,
+		MaxGPUUtilPct:   rc.MaxGPUUtilPct,
 		DrainInterval:   durSecs(rc.DrainIntervalSeconds),
 		Logger:          slogAdmissionLogger{log: logger},
 	})
@@ -549,6 +667,39 @@ func (p residencyVRAMProbe) FreeVRAMMiB(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("no GPU in snapshot")
 	}
 	return snap.GPUs[0].VRAMFreeMiB, nil
+}
+
+// residencyRAMProbe adapts the hardware probe into residency.FreeRAMProbe (free SYSTEM RAM in MiB)
+// for the RAM-floor admission guard (fix 4). Admission probes it FRESH at decision time (like the
+// VRAM re-read). Snapshot always yields a valid RAM struct even with no GPU present.
+type residencyRAMProbe struct{ probe hardware.Probe }
+
+func (p residencyRAMProbe) FreeRAMMiB(ctx context.Context) (int, error) {
+	snap, err := p.probe.Snapshot(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return snap.RAM.FreeMiB, nil
+}
+
+// residencyGPUProbe adapts the hardware probe into residency.GPUStateProbe (GPU 0 core temperature
+// in Celsius + utilization in percent) for the GPU thermal/utilization admission ceilings. One
+// Snapshot read serves both ceilings. The hardware layer reports -1 for an unavailable temp/util
+// field; we pass that through as a negative reading, which the residency guard treats as
+// not-triggering (fail-open on a probe gap rather than wedging admission). Values are float64 in the
+// snapshot; we round toward zero to int since the ceilings are whole degrees / whole percent.
+type residencyGPUProbe struct{ probe hardware.Probe }
+
+func (p residencyGPUProbe) GPUState(ctx context.Context) (tempC, utilPct int, err error) {
+	snap, err := p.probe.Snapshot(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	if len(snap.GPUs) == 0 {
+		// No GPU in the snapshot: report unavailable (negative) so the ceilings don't trigger.
+		return -1, -1, nil
+	}
+	return int(snap.GPUs[0].TemperatureC), int(snap.GPUs[0].UtilizationPct), nil
 }
 
 // ollamaFreeVRAMProbe adapts the hardware probe into the ollama.VRAMProbe seam (GPU 0 free VRAM in

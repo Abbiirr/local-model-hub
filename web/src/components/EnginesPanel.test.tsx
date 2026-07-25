@@ -9,10 +9,10 @@ describe('EnginesPanel', () => {
     render(
       <EnginesPanel engines={enginesFixture} loading={false} error={null} />,
     );
-    expect(screen.getByText('Ollama')).toBeInTheDocument();
-    expect(screen.getByText('0.21.2')).toBeInTheDocument();
+    expect(screen.queryByText('Ollama')).not.toBeInTheDocument();
+    expect(screen.getByText('8833 (45cac7ca7)')).toBeInTheDocument();
     // ollama + llamacpp reachable → two "reachable" badges
-    expect(screen.getAllByText('reachable').length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText('reachable')).toHaveLength(1);
   });
 
   it('shows the mandatory reason for an unreachable engine', () => {

@@ -3,12 +3,27 @@ package api
 import (
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strings"
 
 	"github.com/localhub/localhub/internal/core"
+	"github.com/localhub/localhub/internal/proxy"
 )
+
+// completionUpstreamPaths is the ALLOW-LIST of engine endpoints the completion relay may forward
+// to (P6.1 security fix; docs/security.md). A HEALTHY vLLM instance also exposes dangerous dev
+// endpoints (/sleep, /wake_up, /collective_rpc, /reset_prefix_cache); the ?path= query param must
+// NEVER be able to reach them. The relay resolves ?path= through this map and rejects anything
+// else, so both the per-instance relay AND the OpenAI proxy only ever hit completion endpoints.
+var completionUpstreamPaths = map[string]string{
+	"":                     "/v1/chat/completions", // default
+	"/v1/chat/completions": "/v1/chat/completions",
+	"/v1/completions":      "/v1/completions",
+	"/completion":          "/completion", // native llama.cpp completion endpoint (non-OpenAI shape)
+	"v1/chat/completions":  "/v1/chat/completions",
+	"v1/completions":       "/v1/completions",
+	"completion":           "/completion",
+}
 
 // This file hosts the Phase-4 instance transport (POST/GET/DELETE /api/instances). Handlers are
 // THIN: parse → one core call → marshal or a standard error envelope (PLAN.md decision 7).
@@ -44,16 +59,24 @@ func (s *Server) handleInstanceGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, inst)
 }
 
-// handleInstanceCreate serves POST /api/instances {model_id, engine?, ctx?, priority?, pin?}.
-// A Phase-4 safety-refused start (verdict not runs/degraded, or est > free-1500MiB) returns 409
-// Conflict with the numeric reason in the envelope — nothing is spawned (gate). A model with no
-// local file returns 400. A genuine spawn/health failure returns 502.
+// handleInstanceCreate serves POST /api/instances {model_id, engine?, ctx?, priority?, pin?,
+// kv_quant?, allow_cpu_offload?, speculative?}. A Phase-4 safety-refused start (verdict not
+// runs/degraded, or est > free-1500MiB) returns 409 Conflict with the numeric reason in the
+// envelope — nothing is spawned (gate). A model with no local file returns 400. An invalid
+// speculative value returns 400 with a reason listing the valid values. A genuine spawn/health
+// failure returns 502. allow_cpu_offload defaults false (full GPU, never offload to CPU); when
+// true it relaxes only the launch flags (llama.cpp -ngl auto / Ollama num_gpu dynamic), NOT
+// admission. speculative defaults "" (off); "ngram-cache" enables llama.cpp draft-free
+// self-speculative decoding (--spec-type ngram-cache) — flags only, ~zero extra VRAM.
 func (s *Server) handleInstanceCreate(w http.ResponseWriter, r *http.Request) {
+	if !requireJSONBody(w, r) { // CSRF guard: force a CORS preflight on cross-site attempts
+		return
+	}
 	var req core.StartInstanceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request",
 			"could not parse start-instance request",
-			"the request body must be JSON: {model_id, engine?, ctx?, batch?, priority?, pin?, kv_quant?}. "+err.Error())
+			"the request body must be JSON: {model_id, engine?, ctx?, batch?, priority?, pin?, kv_quant?, allow_cpu_offload?, speculative?}. "+err.Error())
 		return
 	}
 	inst, err := s.svc.StartInstance(r.Context(), req)
@@ -176,61 +199,33 @@ func (s *Server) handleInstanceCompletion(w http.ResponseWriter, r *http.Request
 	// upstream error, so the counter never leaks (the eviction gate depends on it being accurate).
 	defer handle.Done()
 
-	upstreamPath := r.URL.Query().Get("path")
-	if upstreamPath == "" {
-		upstreamPath = "/v1/chat/completions"
-	}
-	if !strings.HasPrefix(upstreamPath, "/") {
-		upstreamPath = "/" + upstreamPath
-	}
-	target := strings.TrimRight(handle.TargetBaseURL, "/") + upstreamPath
-
-	// Build the upstream request. Use the incoming request context so a client disconnect cancels
-	// the upstream stream (server-side abort; the instance is NOT killed — DrainQueue/eviction is
-	// separate). No timeout is imposed here: a long generation must be allowed to complete.
-	upReq, uerr := http.NewRequestWithContext(r.Context(), http.MethodPost, target, r.Body)
-	if uerr != nil {
-		writeError(w, http.StatusInternalServerError, "proxy_build_failed", "could not build upstream request", uerr.Error())
+	// Resolve ?path= through the completion allow-list (P6.1 security fix): a HEALTHY vLLM instance
+	// exposes dev endpoints (/sleep, /wake_up, /collective_rpc, ...) that must NEVER be forwarded.
+	// Only the intended completion endpoints are reachable; anything else is a 400.
+	rawPath := r.URL.Query().Get("path")
+	upstreamPath, ok := completionUpstreamPaths[strings.TrimSpace(rawPath)]
+	if !ok {
+		writeError(w, http.StatusBadRequest, "bad_request",
+			"unsupported completion path",
+			"the ?path= parameter must be one of /v1/chat/completions, /v1/completions, or /completion "+
+				"(engine dev endpoints like /sleep, /wake_up, /collective_rpc are never forwarded — docs/security.md); got "+rawPath)
 		return
 	}
-	upReq.Header.Set("Content-Type", "application/json")
-	if accept := r.Header.Get("Accept"); accept != "" {
-		upReq.Header.Set("Accept", accept)
-	}
 
-	client := &http.Client{Timeout: 0} // streaming; no overall timeout
-	resp, derr := client.Do(upReq)
-	if derr != nil {
-		writeError(w, http.StatusBadGateway, "upstream_unreachable", "could not reach the engine", derr.Error())
-		return
-	}
-	defer resp.Body.Close()
-
-	// Relay status + content-type, then stream the body with flushing so SSE chunks pass through
-	// unbuffered (byte passthrough — Phase 6 will build the OpenAI proxy on this).
-	if ct := resp.Header.Get("Content-Type"); ct != "" {
-		w.Header().Set("Content-Type", ct)
-	}
-	w.WriteHeader(resp.StatusCode)
-	flusher, _ := w.(http.Flusher)
-	buf := make([]byte, 32*1024)
-	for {
-		n, rerr := resp.Body.Read(buf)
-		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				return // client gone; defer decrements the counter
-			}
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}
-		if rerr != nil {
-			if rerr != io.EOF {
-				// Upstream broke mid-stream; nothing more to send. The count is released by defer.
-				return
-			}
+	// Relay through the shared byte-passthrough helper (internal/proxy) so the per-instance relay
+	// and the OpenAI proxy (P6.1) share ONE streaming implementation. It uses r.Context() so a
+	// client disconnect cancels the upstream generation (the instance is NOT killed; eviction is
+	// separate) and writes the upstream status + body byte-for-byte with flushing (SSE intact).
+	_, rerr := proxy.Relay(r.Context(), w, handle.TargetBaseURL, upstreamPath, r.Header.Get("Accept"), r.Body)
+	if rerr != nil {
+		// Relay returns an error ONLY before any bytes were written (build/unreachable), so it is
+		// safe to write an error envelope here.
+		var relErr *proxy.RelayError
+		if errors.As(rerr, &relErr) && relErr.Kind == proxy.RelayUpstreamUnreachable {
+			writeError(w, http.StatusBadGateway, "upstream_unreachable", "could not reach the engine", relErr.Error())
 			return
 		}
+		writeError(w, http.StatusInternalServerError, "proxy_build_failed", "could not build upstream request", rerr.Error())
 	}
 }
 
@@ -242,7 +237,8 @@ func classifyStartError(err error) (int, string) {
 	switch {
 	case strings.HasPrefix(msg, "REFUSED:") || strings.Contains(msg, "REFUSED:"):
 		return http.StatusConflict, "start_refused"
-	case strings.Contains(msg, "is required") || strings.Contains(msg, "has no local file") || strings.Contains(msg, "not supported in Phase 4"):
+	case strings.Contains(msg, "is required") || strings.Contains(msg, "has no local file") ||
+		strings.Contains(msg, "not supported in Phase 4") || strings.Contains(msg, "invalid speculative value"):
 		return http.StatusBadRequest, "bad_request"
 	case strings.Contains(msg, "not configured"):
 		return http.StatusServiceUnavailable, "not_configured"

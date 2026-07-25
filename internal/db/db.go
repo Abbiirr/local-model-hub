@@ -28,7 +28,7 @@ type DB struct {
 //   - synchronous=NORMAL    safe + fast pairing with WAL.
 //
 // Pragmas are passed via the modernc DSN so they apply to every pooled connection. We also
-// pin MaxOpenConns to keep WAL semantics predictable on a single-box daemon.
+// pin MaxOpenConns to 1 (below) to keep WAL semantics predictable on a single-box daemon.
 func Open(path string) (*DB, error) {
 	// modernc.org/sqlite accepts connection pragmas as "_pragma=" query params in the DSN.
 	dsn := fmt.Sprintf(
@@ -39,6 +39,13 @@ func Open(path string) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite %q: %w", path, err)
 	}
+	// Pin the pool to a SINGLE open connection. SQLite is a single-writer store even in WAL mode
+	// (WAL adds concurrent readers, not concurrent writers); with the pure-Go modernc driver a
+	// multi-connection pool can surface SQLITE_BUSY under concurrent writes. On this single-box,
+	// low-churn daemon (ADR-007) one connection makes write serialization deterministic and keeps
+	// WAL semantics predictable — which is exactly what the doc comment above promised but never
+	// enforced (full-project-review-2026-07-06 §db). busy_timeout(5000) remains the backstop.
+	sqldb.SetMaxOpenConns(1)
 	// Verify the connection and that WAL actually engaged (a memory db or a read-only
 	// filesystem would silently fall back).
 	if err := sqldb.Ping(); err != nil {

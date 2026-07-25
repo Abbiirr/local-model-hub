@@ -12,7 +12,7 @@ import (
 // `reason` (non-waivable — every verdict/status carries a human-readable why) and `details`
 // (backends, caps, running models, images) for the dashboard.
 type EngineStatusView struct {
-	Name      string         `json:"name"`      // ollama | llamacpp | vllm
+	Name      string         `json:"name"`      // llamacpp | vllm
 	Installed bool           `json:"installed"` // engines.EngineStatus.Detected
 	Version   string         `json:"version,omitempty"`
 	Running   bool           `json:"running"`  // engines.EngineStatus.Reachable
@@ -25,7 +25,6 @@ type EngineStatusView struct {
 // Detect runs under its own child context. HTTP probes (Ollama/vLLM attach) are quick;
 // binary and docker probes exec a subprocess and get more headroom.
 const (
-	ollamaDetectTimeout   = 3 * time.Second
 	llamacppDetectTimeout = 10 * time.Second
 	vllmDetectTimeout     = 8 * time.Second
 )
@@ -42,15 +41,6 @@ func (s *Service) Engines(ctx context.Context) []EngineStatusView {
 	reg := s.deps.Engines
 
 	// Ollama (single daemon → single status).
-	if reg.Ollama != nil {
-		cctx, cancel := context.WithTimeout(ctx, ollamaDetectTimeout)
-		st := reg.Ollama.Detect(cctx)
-		cancel()
-		out = append(out, engineStatusToView(st))
-	} else {
-		out = append(out, disabledEngineView(engines.KindOllama))
-	}
-
 	// llama.cpp (one status per candidate binary).
 	if reg.LlamaCPP != nil {
 		cctx, cancel := context.WithTimeout(ctx, llamacppDetectTimeout)

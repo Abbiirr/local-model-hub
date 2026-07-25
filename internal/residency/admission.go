@@ -99,6 +99,37 @@ type FreeVRAMProbe interface {
 	FreeVRAMMiB(ctx context.Context) (int, error)
 }
 
+// FreeRAMProbe is the live free-SYSTEM-RAM seam (fix 4: RAM headroom as an admission constraint).
+// On a 16 GB-RAM box RAM binds before VRAM (P5 load-storm evidence: four llama-server processes
+// drove free RAM to 0.24–0.54 GB while VRAM never OOMed). Admission probes it FRESH at decision
+// time (like the VRAM re-read) and refuses to start a NEW process/warm when free RAM is below the
+// configured floor. nil disables the check (RAM floor unset → VRAM-only admission, prior behavior).
+//
+// This is a GLOBAL GUARD, not a per-model RAM estimate and NOT RAM-based victim selection (out of
+// scope — VRAM eviction policy is unchanged). A RAM-blocked request queues through the same
+// blockOrReject path as a VRAM shortage; the drain loop re-admits it once RAM recovers (e.g. a
+// VRAM-eviction that stops a llama-server also frees that process's RAM).
+type FreeRAMProbe interface {
+	FreeRAMMiB(ctx context.Context) (int, error)
+}
+
+// GPUStateProbe is the live GPU thermal/utilization seam for the two GPU admission ceilings
+// (max_gpu_temp_c, max_gpu_util_pct). It returns the current GPU-0 core temperature (Celsius) and
+// utilization (percent, 0..100); a value < 0 means "unavailable" (the guard treats an unavailable
+// reading as not-triggering, since we can't prove the ceiling is exceeded — fail-open rather than
+// wedge admission on a probe gap). Admission reads it FRESH at each decision (like the VRAM re-read
+// and the RAM floor); it is a SINGLE combined snapshot seam so one probe read serves both ceilings
+// (the hardware Snapshot already carries both fields on the same GPU). nil disables both ceilings.
+//
+// Like the RAM floor these are GLOBAL admission guards, not per-model estimates and NOT eviction
+// victim selection: they only gate STARTING/WARMING a NEW model. A warm route (already-loaded model)
+// is exempt (no new load), eviction/stop paths are never affected (never-kill-active), and a blocked
+// request queues on the same queue/drain path as a VRAM/RAM shortage — the drain loop re-admits it
+// once the card cools / frees up.
+type GPUStateProbe interface {
+	GPUState(ctx context.Context) (tempC, utilPct int, err error)
+}
+
 // InstanceLister returns the current active (non-terminal) instances — the eviction candidate
 // set and the warm-hit check. Satisfied by a thin adapter over *instances.Store (List(ctx,true)).
 type InstanceLister interface {
@@ -154,6 +185,8 @@ type Manager struct {
 	queue     *Queue
 	qstore    *QueueStore
 	probe     FreeVRAMProbe
+	ramProbe  FreeRAMProbe
+	gpuProbe  GPUStateProbe
 	lister    InstanceLister
 	evictor   Evictor
 	estimator FootprintEstimator
@@ -164,6 +197,18 @@ type Manager struct {
 	recentActiveTTL time.Duration
 	defaultTTLSecs  int
 
+	// minFreeRAMMiB is the system-RAM floor (fix 4). Admission refuses to start a NEW process/warm
+	// when the FRESH free-RAM probe reads below this; 0 disables the check. Requires ramProbe != nil.
+	minFreeRAMMiB int
+
+	// maxGPUTempC / maxGPUUtilPct are the GPU thermal / utilization admission ceilings. When set
+	// (>0) admission reads the FRESH GPU state and refuses to start/warm a NEW model while the core
+	// temperature (resp. utilization) is above the ceiling, queueing with a numeric gpu_hot /
+	// gpu_busy reason; the drain loop re-admits once the card cools / frees. 0 disables each check.
+	// Both require gpuProbe != nil. Admission-time guards only — never kill a running model.
+	maxGPUTempC   int
+	maxGPUUtilPct int
+
 	// vramBudgetMiB is the optional ops/testing VRAM ceiling (config residency.vram_budget_mib;
 	// 0 = disabled). When > 0, admission's supply is min(probe_free, budget − our_footprints) so
 	// the daemon never fills more than the budget with our instances even if the card has more
@@ -172,6 +217,8 @@ type Manager struct {
 
 	// logger is the admission-observability seam (fix 2). nil = no logging.
 	logger AdmissionLogger
+	// reservations account for starts accepted but not yet visible to the lister.
+	reservations map[string]int
 
 	// drain holds the production queue-drain loop's bookkeeping (fix 1). See drain.go.
 	drain drainState
@@ -182,6 +229,8 @@ type ManagerConfig struct {
 	Queue           *Queue      // nil → a Queue with default config + the manager's clock
 	QueueStore      *QueueStore // nil → no durable mirror (queue lives in memory only)
 	Probe           FreeVRAMProbe
+	RAMProbe        FreeRAMProbe  // nil → RAM floor disabled (VRAM-only admission)
+	GPUProbe        GPUStateProbe // nil → GPU temp/util ceilings disabled
 	Lister          InstanceLister
 	Evictor         Evictor
 	Estimator       FootprintEstimator
@@ -190,6 +239,14 @@ type ManagerConfig struct {
 	SafetyMarginMiB int   // 0 → SafetyMarginMiB default
 	RecentActiveTTL time.Duration
 	DefaultTTLSecs  int
+	// MinFreeRAMMiB is the system-RAM floor (fix 4, config residency.min_free_ram_mib). 0 disables
+	// the check. Effective only when RAMProbe is also set.
+	MinFreeRAMMiB int
+	// MaxGPUTempC / MaxGPUUtilPct are the GPU thermal / utilization admission ceilings (config
+	// residency.max_gpu_temp_c / max_gpu_util_pct). 0 disables each check. Effective only when
+	// GPUProbe is also set.
+	MaxGPUTempC   int
+	MaxGPUUtilPct int
 	// VRAMBudgetMiB caps the VRAM admission may treat as available for OUR instances (0 =
 	// disabled → use real free VRAM). Purpose: ops VRAM reservation AND storm testing.
 	VRAMBudgetMiB int
@@ -223,8 +280,11 @@ func NewManager(cfg ManagerConfig) *Manager {
 	}
 	return &Manager{
 		queue:           q,
+		reservations:    make(map[string]int),
 		qstore:          cfg.QueueStore,
 		probe:           cfg.Probe,
+		ramProbe:        cfg.RAMProbe,
+		gpuProbe:        cfg.GPUProbe,
 		lister:          cfg.Lister,
 		evictor:         cfg.Evictor,
 		estimator:       cfg.Estimator,
@@ -233,6 +293,9 @@ func NewManager(cfg ManagerConfig) *Manager {
 		safetyMarginMiB: margin,
 		recentActiveTTL: recent,
 		defaultTTLSecs:  cfg.DefaultTTLSecs,
+		minFreeRAMMiB:   cfg.MinFreeRAMMiB,
+		maxGPUTempC:     cfg.MaxGPUTempC,
+		maxGPUUtilPct:   cfg.MaxGPUUtilPct,
 		vramBudgetMiB:   cfg.VRAMBudgetMiB,
 		logger:          cfg.Logger,
 		drain: drainState{
@@ -290,6 +353,70 @@ func (m *Manager) admitLocked(ctx context.Context, spec AdmitSpec) (AdmitResult,
 		}, nil
 	}
 
+	// --- (1b) RAM floor (fix 4) — a GLOBAL guard checked for EVERY new process/warm across all
+	// engines (llama.cpp spawn, Ollama warm, vLLM docker). RAM binds before VRAM on a small-RAM box
+	// (P5 evidence), so a start that would fit in VRAM can still be operationally unsafe under RAM
+	// pressure. Probe FRESH (like the VRAM re-read); when free system RAM is below the floor, QUEUE
+	// (or reject if capped) with a numeric ram_blocked reason. Eviction MAY free RAM (stopping a
+	// llama-server frees its process RAM), so the queue+drain path is correct — but we do NOT do
+	// RAM-based victim selection here (out of scope; VRAM eviction policy unchanged). A warm route
+	// above needs no new process, so it is exempt.
+	if m.minFreeRAMMiB > 0 && m.ramProbe != nil {
+		freeRAM, rerr := m.ramProbe.FreeRAMMiB(ctx)
+		if rerr != nil {
+			return AdmitResult{}, fmt.Errorf("residency admit: read free system RAM: %w", rerr)
+		}
+		if freeRAM < m.minFreeRAMMiB {
+			ramReason := fmt.Sprintf(
+				"ram_blocked: free system RAM %d MiB below floor %d MiB — refusing to start a new process/warm until RAM recovers (RAM binds before VRAM on this box; global guard, no RAM-based eviction)",
+				freeRAM, m.minFreeRAMMiB)
+			res := AdmitResult{}
+			res, err = m.enqueueOrReject(ctx, spec, res, ramReason)
+			if err == nil {
+				m.logDecision(spec, res, nil)
+			}
+			return res, err
+		}
+	}
+
+	// --- (1c) GPU thermal / utilization ceilings — GLOBAL guards checked for EVERY new start/warm
+	// across all engines, mirroring the RAM floor. Read the GPU state ONCE (single combined probe)
+	// and FRESH per decision. When the core temp is above max_gpu_temp_c, or utilization is above
+	// max_gpu_util_pct, QUEUE (or reject if capped) with a numeric gpu_hot / gpu_busy reason on the
+	// same queue/drain path — the drain loop re-admits once the card cools / frees. A warm route
+	// (handled above) is exempt (no new load); eviction/stop paths are never affected (never-kill-
+	// active). An unavailable reading (< 0) is treated as not-triggering (fail-open — we can't prove
+	// the ceiling is exceeded, and wedging admission on a probe gap would be worse). Temp is checked
+	// before util so a hot-AND-busy card reports the thermal reason first (the safety-critical one).
+	if (m.maxGPUTempC > 0 || m.maxGPUUtilPct > 0) && m.gpuProbe != nil {
+		tempC, utilPct, gerr := m.gpuProbe.GPUState(ctx)
+		if gerr != nil {
+			return AdmitResult{}, fmt.Errorf("residency admit: read GPU state: %w", gerr)
+		}
+		if m.maxGPUTempC > 0 && tempC > m.maxGPUTempC {
+			hotReason := fmt.Sprintf(
+				"gpu_hot: GPU temp %dC above ceiling %dC — deferring new load until it cools (drain re-checks); admission-time guard only, running models are never killed",
+				tempC, m.maxGPUTempC)
+			res := AdmitResult{}
+			res, err = m.enqueueOrReject(ctx, spec, res, hotReason)
+			if err == nil {
+				m.logDecision(spec, res, nil)
+			}
+			return res, err
+		}
+		if m.maxGPUUtilPct > 0 && utilPct > m.maxGPUUtilPct {
+			busyReason := fmt.Sprintf(
+				"gpu_busy: GPU utilization %d%% above ceiling %d%% — deferring new load until it frees (drain re-checks); admission-time guard only, running models are never killed",
+				utilPct, m.maxGPUUtilPct)
+			res := AdmitResult{}
+			res, err = m.enqueueOrReject(ctx, spec, res, busyReason)
+			if err == nil {
+				m.logDecision(spec, res, nil)
+			}
+			return res, err
+		}
+	}
+
 	// --- (2) footprint estimate (observed peak preferred; else estimator + additive margin) ---
 	footprint := spec.FootprintMiB
 	if footprint <= 0 {
@@ -310,6 +437,13 @@ func (m *Manager) admitLocked(ctx context.Context, spec AdmitSpec) (AdmitResult,
 		footprint = f
 	}
 	need := footprint + m.safetyMarginMiB
+	// A matching model is already between admission and process registration. Do not
+	// launch a duplicate process while the first start is still reserved.
+	if m.reservations[reservationKey(spec.ModelID, spec.Engine)] > 0 {
+		res := AdmitResult{FootprintMiB: footprint, NeedMiB: need}
+		return m.enqueueOrReject(ctx, spec, res,
+			"starting: an admitted instance of this model is still becoming visible; waiting instead of launching a duplicate")
+	}
 
 	// --- (3) read free VRAM — LIVE — and apply the optional VRAM budget (fix 5). ---
 	probeFree, err := m.probe.FreeVRAMMiB(ctx)
@@ -319,13 +453,17 @@ func (m *Manager) admitLocked(ctx context.Context, spec AdmitSpec) (AdmitResult,
 	// supply is what admission may actually treat as available: min(probe_free, budget − our
 	// resident footprints) when a budget is set, else the raw probe free. This is the anti-OOM
 	// term AND the storm-test reservation lever.
-	free := m.supplyMiB(probeFree, active)
+	free := m.supplyMiB(probeFree, active) - m.reservedMiBLocked()
+	if free < 0 {
+		free = 0
+	}
 
 	res := AdmitResult{FootprintMiB: footprint, NeedMiB: need, FreeBeforeMiB: free, FreeAfterMiB: free}
 
 	// --- (4) fits directly? → load_new ---
 	if free >= need {
 		res.Decision = DecisionLoadNew
+		m.reserveLocked(spec, footprint)
 		res.Reason = fmt.Sprintf("load_new: available %d MiB >= footprint %d + %d MiB margin (%d MiB) — loading directly, no eviction%s",
 			free, footprint, m.safetyMarginMiB, need, m.budgetNote(probeFree, free))
 		m.logDecision(spec, res, nil)
@@ -369,6 +507,15 @@ func (m *Manager) admitLocked(ctx context.Context, spec AdmitSpec) (AdmitResult,
 		if m.evictor == nil {
 			return AdmitResult{}, fmt.Errorf("residency admit: eviction required but no evictor configured")
 		}
+		// Never-kill-active TOCTOU guard: the victim was classified idle when PickVictims ran,
+		// but BeginInstanceRequest increments the in-flight counter WITHOUT taking m.mu, so a
+		// request may have routed warm to this instance since — a window that widens with every
+		// multi-second eviction executed earlier in this loop. Re-check the live counter
+		// immediately before the stop and SKIP a victim that became active; the final
+		// sufficiency gate below degrades to Queue if the remaining victims can't free enough.
+		if m.tracker != nil && m.tracker.ActiveCount(victim.Instance.ID) > 0 {
+			continue
+		}
 		expected := victim.ReclaimMiB
 		freed, everr := m.evictor.Evict(ctx, victim.Instance)
 		if everr != nil {
@@ -403,6 +550,7 @@ func (m *Manager) admitLocked(ctx context.Context, spec AdmitSpec) (AdmitResult,
 	// Final sufficiency check AFTER the last probe re-read — the load gate.
 	if free >= need {
 		res.Decision = DecisionEvictThenLoad
+		m.reserveLocked(spec, footprint)
 		res.Reason = fmt.Sprintf("evict_then_load: evicted %d idle instance(s) %v; free VRAM re-read after each eviction is now %d MiB >= footprint %d + %d margin (%d MiB) — loading%s",
 			len(res.Evicted), res.Evicted, free, footprint, m.safetyMarginMiB, need, m.budgetNote(probeFree, free))
 		m.logDecision(spec, res, evLogs)
@@ -429,6 +577,30 @@ func (m *Manager) admitLocked(ctx context.Context, spec AdmitSpec) (AdmitResult,
 // is min(probeFree, budget − sum(our resident footprints)): the budget bounds how much VRAM OUR
 // instances may occupy regardless of how much the card physically has free, so ops can reserve
 // headroom (and storm tests can force eviction/queue pressure with a tight budget). Never negative.
+func reservationKey(modelID, engine string) string { return engine + "\x00" + modelID }
+
+func (m *Manager) reserveLocked(spec AdmitSpec, footprint int) {
+	if footprint > 0 {
+		m.reservations[reservationKey(spec.ModelID, spec.Engine)] += footprint
+	}
+}
+
+func (m *Manager) reservedMiBLocked() int {
+	total := 0
+	for _, n := range m.reservations {
+		total += n
+	}
+	return total
+}
+
+// ReleaseReservation clears a pending-start reservation after the external engine start
+// succeeds or fails. It is idempotent.
+func (m *Manager) ReleaseReservation(modelID, engine string) {
+	m.mu.Lock()
+	delete(m.reservations, reservationKey(modelID, engine))
+	m.mu.Unlock()
+}
+
 func (m *Manager) supplyMiB(probeFree int, active []instances.Instance) int {
 	if m.vramBudgetMiB <= 0 {
 		return probeFree
@@ -489,11 +661,18 @@ func remaining(active []instances.Instance, evicted map[string]bool) []instances
 // (DecisionReject) when the class queue is at capacity. The reason always names the numbers:
 // needed, free, reclaimable, and the number of idle instances.
 func (m *Manager) blockOrReject(ctx context.Context, spec AdmitSpec, res AdmitResult, shortfallMiB, reclaimableMiB, idleCount int) (AdmitResult, error) {
-	_ = ctx
 	blockedReason := fmt.Sprintf(
 		"waiting for VRAM: need %d MiB (footprint %d + %d margin), free %d MiB, reclaimable %d MiB from %d idle instance(s) — %d MiB short",
 		res.NeedMiB, res.FootprintMiB, m.safetyMarginMiB, res.FreeAfterMiB, reclaimableMiB, idleCount, shortfallMiB)
+	return m.enqueueOrReject(ctx, spec, res, blockedReason)
+}
 
+// enqueueOrReject enqueues the request (DecisionQueue) with the supplied numeric blockedReason, or
+// rejects it (DecisionReject) when the class queue is at capacity. It is the shared mechanism for
+// BOTH the VRAM-shortage block (blockOrReject) and the RAM-floor block (fix 4) so a ram_blocked
+// request rides the same queue/drain/persistence path as a VRAM-blocked one — the blocked_reason is
+// surfaced identically in /api/queue, proxy 503s, and job reasons.
+func (m *Manager) enqueueOrReject(ctx context.Context, spec AdmitSpec, res AdmitResult, blockedReason string) (AdmitResult, error) {
 	// Build the queue request; the size/cost hint uses the footprint so the queue's tie-break
 	// agrees with what admission just decided. The FULL start context (ctx/batch/pin/priority) is
 	// carried so the drain loop can re-Admit + start this request later without the HTTP caller.
@@ -508,7 +687,8 @@ func (m *Manager) blockOrReject(ctx context.Context, spec AdmitSpec, res AdmitRe
 		Pin:      spec.Pin,
 		Priority: spec.Priority,
 	}
-	if err := m.queue.Enqueue(req); err != nil {
+	stored, err := m.queue.Enqueue(req)
+	if err != nil {
 		// Capped → reject (nothing enqueued). The QueueFullError carries its own numeric reason.
 		var qf *QueueFullError
 		if asQueueFull(err, &qf) {
@@ -519,10 +699,13 @@ func (m *Manager) blockOrReject(ctx context.Context, spec AdmitSpec, res AdmitRe
 		return res, fmt.Errorf("residency admit: enqueue: %w", err)
 	}
 
-	// Durable mirror: persist the WAITING row (best-effort; a DB error does not undo the
-	// in-memory enqueue — the queue still works, only the UI/restart mirror lags).
-	if err := m.qstore.InsertWaiting(ctx, req, blockedReason, res.FootprintMiB); err != nil {
-		_ = err // logged by the caller if it cares; the in-memory queue is authoritative
+	// Persist the WAITING row before reporting a queue acceptance. The durable queue is the restart
+	// contract, so returning 202 after a failed insert would be a lie: the request would disappear
+	// on daemon restart. Roll back the in-memory insertion and surface the persistence failure.
+	// Persist `stored`, not the seq=0 original, so restart ordering remains FIFO-deterministic.
+	if err := m.qstore.InsertWaiting(ctx, stored, blockedReason, res.FootprintMiB); err != nil {
+		m.queue.Remove(stored.ID)
+		return res, fmt.Errorf("residency admit: persist queued request %s: %w", stored.ID, err)
 	}
 
 	res.Decision = DecisionQueue
@@ -531,6 +714,39 @@ func (m *Manager) blockOrReject(ctx context.Context, spec AdmitSpec, res AdmitRe
 	// Position in score order (1-based) for the 202 response.
 	res.QueuePosition = m.queuePositionLocked(req.ID)
 	return res, nil
+}
+
+// RestoreWaiting re-seeds the in-memory ordering queue from durable WAITING rows after daemon
+// startup. It preserves each request's original sequence, enqueue time, footprint, and complete
+// start context so recovery neither loses work nor changes FIFO/aging semantics. It is intended
+// to run once before the service begins accepting admission requests.
+func (m *Manager) RestoreWaiting(ctx context.Context) (int, error) {
+	if m.qstore == nil {
+		return 0, nil
+	}
+	rows, err := m.qstore.ListWaiting(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("restore waiting queue rows: %w", err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, row := range rows {
+		err := m.queue.Restore(Request{
+			ID:       row.ID,
+			ModelID:  row.ModelID,
+			Engine:   row.Engine,
+			Class:    PriorityClass(row.PriorityClass),
+			Cost:     CostHint{EstimateMiB: row.FootprintMiB},
+			Ctx:      row.ReqCtx,
+			Batch:    row.ReqBatch,
+			Pin:      row.ReqPin,
+			Priority: row.Priority,
+		}, row.Seq, row.EnqueuedAt)
+		if err != nil {
+			return 0, fmt.Errorf("restore waiting queue row %s: %w", row.ID, err)
+		}
+	}
+	return len(rows), nil
 }
 
 // queuePositionLocked returns the 1-based score-order position of the request id in the queue
@@ -609,6 +825,20 @@ func (m *Manager) MarkAdmitted(ctx context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.qstore.SetStatus(ctx, id, QueueAdmitted, "")
+}
+
+// IsWaiting reports whether the given queue id is still a live WAITING request in the in-memory
+// queue (the authoritative ordering structure). It is the jobs worker's "the drain loop still owns
+// this" check (fix 1): a blocked job whose queue_id is still WAITING must NOT be re-admitted by the
+// worker (which would mint a duplicate WAITING row + duplicate durable mirror) — the drain loop
+// re-admits it when capacity frees, and the worker's next tick then finds the model warm.
+func (m *Manager) IsWaiting(id string) bool {
+	if id == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.queue.Has(id)
 }
 
 // warmInstance returns a HEALTHY instance already serving modelID on engine (or any engine when

@@ -4,59 +4,104 @@
   flex-direction: column;
 }
 
+.authShell { min-height: 100vh; display: grid; place-items: center; padding: var(--s4); }
+.authCard { width: min(100%, 380px); display: grid; gap: var(--s3); padding: var(--s5); border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); }
+.authCard h1, .authCard p { margin: 0; }
+.authCard input { width: 100%; }
+
 .main {
   flex: 1;
   width: 100%;
-  max-width: 1100px;
+  max-width: 1180px;
   margin: 0 auto;
-  padding: 16px;
-  padding-bottom: max(16px, env(safe-area-inset-bottom));
+  padding: var(--s5) var(--s4);
+  padding-bottom: max(var(--s5), env(safe-area-inset-bottom));
   display: grid;
-  gap: 16px;
-}
-
-/* Desktop: two columns — GPU + engines stacked on the left, inventory wide right.
-   Mobile: single column, order = GPU first (spec §mobile). */
-@media (min-width: 860px) {
-  .main {
-    grid-template-columns: 360px 1fr;
-    align-items: start;
-  }
-  .left {
-    display: grid;
-    gap: 16px;
-  }
-  .right {
-    display: grid;
-    gap: 16px;
-  }
+  gap: var(--s4);
 }
 
 .left,
-.right {
+.right,
+.wide {
   display: grid;
-  gap: 16px;
+  gap: var(--s4);
+  min-width: 0;
+  align-content: start;
+}
+
+/* Grid/flex items default to min-width:auto, which lets an unbreakable mono
+   string (engine binary paths, model file paths) prop the column track open
+   wider than the viewport on narrow screens — the downstream text-overflow
+   ellipsis rules can only clamp once every ancestor is allowed to shrink. */
+.main > *,
+.left > *,
+.right > * {
   min-width: 0;
 }
 
+/* ── Mobile (single column) ───────────────────────────────────────────────
+   Collapse the column wrappers so every panel is a direct grid item, then
+   order them to the spec §mobile sequence regardless of DOM/column grouping. */
+@media (max-width: 899px) {
+  .left,
+  .right {
+    display: contents;
+  }
+  .pGpu {
+    order: 1;
+  }
+  .pInstances {
+    order: 2;
+  }
+  .pQueue {
+    order: 3;
+  }
+  .pEngines {
+    order: 4;
+  }
+  .pCompat {
+    order: 5;
+  }
+  .pDownloads {
+    order: 6;
+  }
+  .wide {
+    order: 7;
+  }
+}
+
+/* ── Desktop: two balanced columns + full-width inventory ──────────────── */
+@media (min-width: 900px) {
+  .main {
+    grid-template-columns: 1fr 1fr;
+    align-items: start;
+    gap: var(--s4) var(--s5);
+  }
+  .connBanner {
+    grid-column: 1 / -1;
+  }
+  .wide {
+    grid-column: 1 / -1;
+  }
+}
+
 .connBanner {
-  padding: 10px 14px;
+  padding: var(--s3) var(--s4);
   border-radius: var(--radius-sm);
   background: var(--warn-bg);
-  border: 1px solid rgba(232, 177, 58, 0.3);
   color: var(--warn);
   font-size: 12.5px;
   line-height: 1.4;
 }
 .connBannerCrit {
   background: var(--crit-bg);
-  border-color: rgba(239, 95, 107, 0.3);
   color: var(--crit);
 }
 
 .footer {
-  padding: 16px;
+  padding: var(--s5) var(--s4) var(--s6);
   text-align: center;
   font-size: 11px;
+  letter-spacing: 0.02em;
   color: var(--text-faint);
 }

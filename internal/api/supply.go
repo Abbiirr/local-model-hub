@@ -23,6 +23,9 @@ import (
 // immediately. A caller/transport problem (bad body, guard refusal, unconfigured dep) is a
 // 4xx/5xx envelope; the job itself carries per-file progress and any failure reason.
 func (s *Server) handleDownloadCreate(w http.ResponseWriter, r *http.Request) {
+	if !requireJSONBody(w, r) { // CSRF guard: an attacker-chosen download URL must never ride a simple cross-site POST
+		return
+	}
 	var req core.DownloadRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request",

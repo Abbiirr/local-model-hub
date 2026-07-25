@@ -105,6 +105,9 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 // The verdict itself always carries a reason (even for wont_run/unknown); an error envelope is
 // returned only for a caller/transport problem (bad body, unconfigured engine, failed fetch).
 func (s *Server) handleCompatPreview(w http.ResponseWriter, r *http.Request) {
+	if !requireJSONBody(w, r) { // CSRF guard (triggers remote HF fetches — not free to forge)
+		return
+	}
 	var req core.CompatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request",

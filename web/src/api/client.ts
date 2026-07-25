@@ -14,6 +14,7 @@ import type {
   InstanceView,
   Manifest,
   ModelSummary,
+  QueuedResponse,
   QueueEntry,
   ReproduceBundle,
   RescanResult,
@@ -37,6 +38,18 @@ export class ApiError extends Error {
   }
 }
 
+const dashboardTokenKey = 'localhub.dashboard.admin-token';
+
+/** Session-only storage: never localStorage, a URL, or a cookie. */
+export function dashboardToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  return window.sessionStorage.getItem(dashboardTokenKey);
+}
+
+export function clearDashboardToken(): void {
+  if (typeof window !== 'undefined') window.sessionStorage.removeItem(dashboardTokenKey);
+}
+
 function isErrorBody(v: unknown): v is ApiErrorBody {
   return (
     typeof v === 'object' &&
@@ -47,13 +60,24 @@ function isErrorBody(v: unknown): v is ApiErrorBody {
   );
 }
 
+/**
+ * Type guard for the 202 queued-start shape returned by POST /api/instances when residency queues
+ * the start. Discriminates on `status === 'queued'` (an InstanceView never carries that field).
+ */
+export function isQueuedResponse(
+  v: InstanceView | QueuedResponse,
+): v is QueuedResponse {
+  return (v as QueuedResponse).status === 'queued';
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response;
   try {
-    res = await fetch(path, {
-      headers: { Accept: 'application/json' },
-      ...init,
-    });
+    const headers = new Headers(init?.headers);
+    headers.set('Accept', 'application/json');
+    const token = dashboardToken();
+    if (token) headers.set('Authorization', `Bearer ${token}`);
+    res = await fetch(path, { ...init, headers });
   } catch (e) {
     // Network / CORS / daemon-down. No envelope available — synthesize a reason.
     const detail = e instanceof Error ? e.message : String(e);
@@ -97,6 +121,23 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  dashboardAuthStatus: () => request<{ auth_required: boolean }>('/api/auth/dashboard'),
+  dashboardLogin: async (token: string) => {
+    if (typeof window !== 'undefined') window.sessionStorage.setItem(dashboardTokenKey, token);
+    try {
+      return await request<{ authenticated: boolean }>('/api/auth/dashboard', { method: 'POST' });
+    } catch (e) {
+      clearDashboardToken();
+      throw e;
+    }
+  },
+  dashboardLogout: async () => {
+    try {
+      await request<{ authenticated: boolean }>('/api/auth/dashboard', { method: 'DELETE' });
+    } finally {
+      clearDashboardToken();
+    }
+  },
   hardware: () => request<HardwareSnapshot>('/api/hardware'),
   engines: () => request<Engine[]>('/api/engines'),
   models: () => request<ModelSummary[]>('/api/models'),
@@ -143,15 +184,33 @@ export const api = {
   /** List running + recent instances. */
   instances: () => request<InstanceView[]>('/api/instances'),
   /**
-   * Start a model instance. A Phase-4 safety-refused start (verdict not runs/degraded, or
-   * estimate over the free-1500MiB budget) rejects with a 409 ApiError whose `reason` carries
-   * the numeric why — nothing is spawned.
+   * Start a model instance. Three outcomes:
+   *  - 200 → an {@link InstanceView} (spawned / already warm).
+   *  - 202 → a {@link QueuedResponse} ({status:'queued', queue_id, position, blocked_reason}) when
+   *    residency queued the start on VRAM. The UI surfaces the position + reason (NOT a bogus
+   *    InstanceView — the daemon spawned nothing yet).
+   *  - 409 → a safety-refused start (verdict not runs/degraded, or estimate over budget) rejects
+   *    with an ApiError whose `reason` carries the numeric why — nothing is spawned.
+   * Callers discriminate on the `status: 'queued'` field (present only on the 202 shape); use the
+   * {@link isQueuedResponse} guard.
+   *
+   * `options.allowCpuOffload` maps to the body's `allow_cpu_offload`. The default is full GPU
+   * (never split to CPU): we send the field ONLY when the caller opts in (true), keeping the wire
+   * clean for the default. The flag relaxes launch flags only — the admission VRAM verdict is
+   * unchanged (docs/api-spec.md §Instances).
    */
-  startInstance: (req: StartInstanceRequest) =>
-    request<InstanceView>('/api/instances', {
+  startInstance: (
+    req: StartInstanceRequest,
+    options?: { allowCpuOffload?: boolean },
+  ) =>
+    request<InstanceView | QueuedResponse>('/api/instances', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req),
+      body: JSON.stringify(
+        options?.allowCpuOffload
+          ? { ...req, allow_cpu_offload: true }
+          : req,
+      ),
     }),
   /** Stop an instance (drain → stop with VRAM-delta verification). */
   stopInstance: (id: string) =>

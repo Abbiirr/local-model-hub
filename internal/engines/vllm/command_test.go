@@ -15,7 +15,6 @@ func TestDockerRunArgs_StringExact(t *testing.T) {
 	want := []string{
 		"run", "-d",
 		"--name", "localhub-vllm-abc-123",
-		"--runtime", "nvidia",
 		"--gpus", "all",
 		"--ipc=host",
 		"-p", "127.0.0.1:40201:8000",
@@ -28,7 +27,7 @@ func TestDockerRunArgs_StringExact(t *testing.T) {
 	assertArgs(t, "docker run", got, want)
 	// The full command a human would run, for the audit trail.
 	full := "docker " + strings.Join(got, " ")
-	const wantFull = "docker run -d --name localhub-vllm-abc-123 --runtime nvidia --gpus all --ipc=host -p 127.0.0.1:40201:8000 vllm/vllm-openai:latest --model Qwen/Qwen3-0.6B --gpu-memory-utilization 0.9 --max-model-len 8192 --dtype auto"
+	const wantFull = "docker run -d --name localhub-vllm-abc-123 --gpus all --ipc=host -p 127.0.0.1:40201:8000 vllm/vllm-openai:latest --model Qwen/Qwen3-0.6B --gpu-memory-utilization 0.9 --max-model-len 8192 --dtype auto"
 	if full != wantFull {
 		t.Errorf("full command mismatch:\n got: %s\nwant: %s", full, wantFull)
 	}
@@ -61,7 +60,6 @@ func TestDockerRunArgs_ExtraDockerArgsBeforeImage(t *testing.T) {
 	want := []string{
 		"run", "-d",
 		"--name", "localhub-vllm-abc-123",
-		"--runtime", "nvidia",
 		"--gpus", "all",
 		"--ipc=host",
 		"-p", "127.0.0.1:40201:8000",

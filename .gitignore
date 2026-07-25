@@ -1,23 +1,47 @@
-# build artifacts
+# Build artifacts
 /localhub
 /localhub.exe
+/bin/
+*.test
+coverage.out
+coverage/
+
+# Downloaded model weights and engine runtimes (large, not source)
+/models/
+/tools/
+*.gguf
+*.safetensors
 *.db
 *.db-wal
 *.db-shm
 
-# frontend
-web/node_modules/
+# Frontend dependencies and caches
+**/node_modules/
+web/.vite/
 # web/dist is committed deliberately: go:embed requires it at build time
 
-# workflow scratch (regenerable)
-temp-research/context-summary.md
-.planflow/
+# Local configuration and secrets
+/.env
+/.env.*
+!/.env.example
+/configs/config.yaml
 
-# OS noise
+# Workflow and agent scratch (regenerable)
+temp-research/context-summary.md
+/.planflow/
+/.agents/
+/.claude/
+/.codex/
+
+# Logs, crash dumps, and transient files
+*.log
+*.stackdump
+*.tmp
+
+# Editor and OS noise
+.idea/
+.vscode/
+.DS_Store
 Thumbs.db
 Desktop.ini
-
-# logs
-*.log
-logs/
-.claude/
+/logs/

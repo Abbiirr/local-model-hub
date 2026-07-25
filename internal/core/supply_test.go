@@ -226,6 +226,14 @@ func TestLocalImport_ContainmentRefused(t *testing.T) {
 	}
 }
 
+func TestOllamaPullIsRetired(t *testing.T) {
+	svc := supplyService(t, t.TempDir())
+	_, err := svc.StartDownload(context.Background(), DownloadRequest{Kind: "ollama", Name: "mistral:latest"})
+	if err == nil || !strings.Contains(err.Error(), "ollama downloads are retired") {
+		t.Fatalf("StartDownload(ollama) error = %v, want clear retirement refusal", err)
+	}
+}
+
 // TestReproduce_DiscoveredModelUnknownProvenance proves the gate-#p33 distinction: a model
 // discovered on disk with NO manifest reports provenance "unknown (pre-existing local file)".
 func TestReproduce_DiscoveredModelUnknownProvenance(t *testing.T) {

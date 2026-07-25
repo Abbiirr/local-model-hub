@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { QueueEntry } from '../api/types';
 import { api, ApiError } from '../api/client';
-import { Panel, Badge, Reason, EmptyState, ErrorState, Skeleton, type Tone } from './ui';
+import {
+  Panel,
+  Badge,
+  ClampText,
+  ErrorState,
+  Skeleton,
+  type Tone,
+} from './ui';
+import styles from './QueueCard.module.css';
 
 // QueueCard is the Phase-5 residency queue surface (P5.1). It shows admission-queue entries with
 // their priority class, position, footprint, age, and the mandatory numeric blocked_reason, plus a
@@ -27,6 +35,7 @@ export function QueueCard(props: { queueInvalidation?: number }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [showHistory, setShowHistory] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -74,19 +83,41 @@ export function QueueCard(props: { queueInvalidation?: number }) {
       {error && <ErrorState>{error}</ErrorState>}
       {loading && !entries ? (
         <Skeleton>Loading queue…</Skeleton>
-      ) : waiting.length === 0 && recent.length === 0 ? (
-        <EmptyState>
-          Queue is empty. A start blocked on VRAM waits here with its blocked reason.
-        </EmptyState>
+      ) : waiting.length === 0 ? (
+        // No live waiting entries: collapse the panel to a single quiet line
+        // rather than a tall empty box. Any terminal entries stay reachable
+        // behind the History toggle below.
+        <>
+          <div className={styles.quiet}>Queue empty</div>
+          {recent.length > 0 && (
+            <div className={styles.history}>
+              <button
+                type="button"
+                className={styles.historyToggle}
+                onClick={() => setShowHistory((v) => !v)}
+                aria-expanded={showHistory}
+              >
+                {showHistory ? '▾' : '▸'} History ({recent.length})
+              </button>
+              {showHistory &&
+                recent.map((e) => (
+                  <div key={e.id} className={styles.recentRow}>
+                    <Badge tone={STATUS_TONE[e.status] ?? 'neutral'}>{e.status}</Badge>
+                    <span className={styles.recentModel}>{e.model_id}</span>
+                  </div>
+                ))}
+            </div>
+          )}
+        </>
       ) : (
         <>
           {waiting.map((e) => (
-            <div key={e.id} style={{ marginBottom: '0.6rem' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <div key={e.id} className={styles.row}>
+              <div className={styles.rowHead}>
                 <Badge tone={STATUS_TONE[e.status] ?? 'neutral'} dot>
                   {e.status}
                 </Badge>
-                <span style={{ fontWeight: 600 }}>{e.model_id}</span>
+                <span className={styles.model}>{e.model_id}</span>
                 {typeof e.position === 'number' && e.position > 0 && (
                   <Badge tone="accent">#{e.position}</Badge>
                 )}
@@ -95,32 +126,48 @@ export function QueueCard(props: { queueInvalidation?: number }) {
                 </Badge>
                 <button
                   type="button"
+                  className={styles.cancelBtn}
                   disabled={busyId === e.id}
                   onClick={() => void onCancel(e.id)}
-                  style={{ marginLeft: 'auto' }}
                 >
                   {busyId === e.id ? 'Cancelling…' : 'Cancel'}
                 </button>
               </div>
-              <div style={{ fontSize: '0.8rem', opacity: 0.75 }}>
+              <div className={styles.meta}>
                 {typeof e.footprint_mib === 'number' && e.footprint_mib > 0 && (
-                  <span>needs {e.footprint_mib} MiB · </span>
+                  <span>needs {e.footprint_mib} MiB</span>
                 )}
-                {typeof e.age_seconds === 'number' && <span>waiting {e.age_seconds}s</span>}
+                {typeof e.age_seconds === 'number' && (
+                  <span>waiting {e.age_seconds}s</span>
+                )}
               </div>
-              {e.blocked_reason && <Reason>{e.blocked_reason}</Reason>}
+              {e.blocked_reason && (
+                <div className={styles.reason}>
+                  <ClampText lines={2}>{e.blocked_reason}</ClampText>
+                </div>
+              )}
             </div>
           ))}
 
           {recent.length > 0 && (
-            <div style={{ fontSize: '0.8rem', opacity: 0.6, marginTop: '0.4rem' }}>Recent</div>
-          )}
-          {recent.map((e) => (
-            <div key={e.id} style={{ display: 'flex', gap: '0.5rem', opacity: 0.6 }}>
-              <Badge tone={STATUS_TONE[e.status] ?? 'neutral'}>{e.status}</Badge>
-              <span>{e.model_id}</span>
+            <div className={styles.history}>
+              <button
+                type="button"
+                className={styles.historyToggle}
+                onClick={() => setShowHistory((v) => !v)}
+                aria-expanded={showHistory}
+              >
+                {showHistory ? '▾' : '▸'} History ({recent.length})
+              </button>
+              {showHistory &&
+                recent.map((e) => (
+                  <div key={e.id} className={styles.recentRow}>
+                    <Badge tone={STATUS_TONE[e.status] ?? 'neutral'}>{e.status}</Badge>
+                    <span className={styles.recentModel}>{e.model_id}</span>
+                  </div>
+                ))}
             </div>
-          ))}
+          )}
         </>
       )}
     </Panel>

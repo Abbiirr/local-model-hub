@@ -41,7 +41,25 @@ const (
 	// cancelled, or drained) so the dashboard's queue card refetches /api/queue (P5.1). The
 	// event vocabulary matches lmwrapper's "queue.update" (research/lmwrapper-reuse-notes.md).
 	EventQueueUpdated EventType = "queue.update"
+	// EventJobUpdated fires on ANY async-job state change (queued→running→succeeded/failed/
+	// cancelled) so a WS subscriber refetches GET /api/jobs/{id} for the terminal result_json
+	// (P6.2, design §2.4). It carries a minimal JobEvent Data payload (id/state/model/reason) so a
+	// subscriber can react without a refetch round-trip; the result body itself stays off the WS
+	// frame (fetched over REST on the terminal event). Named `jobs.updated` to match the existing
+	// dotted EventType convention (models.updated / queue.update / instances.updated), not the
+	// lmwrapper literal names (request.accepted / response.completed) — one naming scheme, not two.
+	EventJobUpdated EventType = "jobs.updated"
 )
+
+// JobEvent is the minimal Data payload carried on an EventJobUpdated event (design §2.4). A WS
+// subscriber can react to the state transition without a refetch; Reason is populated only on a
+// failure/cancel terminal state (the mandatory-reason gate carried onto the event bus).
+type JobEvent struct {
+	ID      string `json:"id"`
+	State   string `json:"state"`
+	ModelID string `json:"model_id"`
+	Reason  string `json:"reason,omitempty"`
+}
 
 // Event is one change announcement. Data is optional — the Phase-1 client uses these purely
 // as a signal to refetch over REST, so publishers may leave Data nil and still be correct.

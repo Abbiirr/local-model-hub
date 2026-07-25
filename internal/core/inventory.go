@@ -113,6 +113,7 @@ SELECT id, display_name, source, format,
        size_bytes, COALESCE(sha256,''), COALESCE(compat_status,''),
        COALESCE(presence,'present'), COALESCE(missing_since,''), COALESCE(updated_at,'')
 FROM models
+WHERE COALESCE(source, '') <> 'ollama' AND COALESCE(format, '') <> 'ollama'
 ORDER BY display_name COLLATE NOCASE, id`
 	rows, err := s.deps.DB.QueryContext(ctx, q)
 	if err != nil {

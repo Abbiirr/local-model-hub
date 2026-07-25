@@ -120,6 +120,33 @@ CREATE TABLE inst_metrics (
   error_count     INTEGER
 );
 CREATE INDEX idx_inst_metrics_ts ON inst_metrics(ts);
+
+-- Async inference jobs (P6.2) ----------------------------------------------
+-- Durable record of an async inference request routed through the SAME residency admission
+-- as everything else (migration 0007_jobs.sql). A job is submitted, gets an id back
+-- immediately, and survives a daemon restart. State machine:
+--   queued -> running -> succeeded | failed | cancelled
+-- request_json is the OpenAI body verbatim (so a restart re-runs the exact request);
+-- result_json is the final non-streaming OpenAI response on success; error/reason carry the
+-- human-readable why on failure/cancel (mandatory-reason gate).
+CREATE TABLE jobs (
+  id            TEXT PRIMARY KEY,               -- uuid
+  model_id      TEXT NOT NULL,                  -- requested model slug (resolved like the proxy)
+  engine        TEXT,                           -- resolved engine (nullable until admission picks it)
+  request_json  TEXT NOT NULL,                  -- OpenAI request body as submitted (verbatim)
+  priority      INTEGER NOT NULL DEFAULT 1,     -- 0 interactive | 1 normal | 2 background
+  state         TEXT NOT NULL DEFAULT 'queued', -- queued|running|succeeded|failed|cancelled
+  result_json   TEXT,                           -- OpenAI response body on success (nullable)
+  error         TEXT,                           -- machine-ish error class on failure (nullable)
+  reason        TEXT,                           -- human-readable why (failure/cancel) (nullable)
+  queue_id      TEXT,                           -- residency queue row id while queued (nullable)
+  instance_id   TEXT,                           -- serving instance while running (nullable)
+  endpoint      TEXT NOT NULL DEFAULT 'chat',   -- 'chat' | 'completions' (which OpenAI path)
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  started_at    TEXT,
+  finished_at   TEXT
+);
+CREATE INDEX idx_jobs_state_created ON jobs(state, created_at);
 ```
 
 ## Retention
@@ -128,6 +155,8 @@ CREATE INDEX idx_inst_metrics_ts ON inst_metrics(ts);
   raw. A single `DELETE ... WHERE ts < ...` on a timer is enough at this scale.
 - `queue`: prune `DONE`/`REJECTED` older than N days.
 - `instances`: keep `STOPPED`/`FAILED` history (small, useful for debugging launches).
+- `jobs`: keep terminal (`succeeded`/`failed`/`cancelled`) rows for a bounded window, then
+  prune (results can be large — prune `result_json`-bearing rows first).
 
 ## Why `launch_flags_json` matters
 

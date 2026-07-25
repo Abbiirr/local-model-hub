@@ -322,6 +322,12 @@ export interface StartInstanceRequest {
   priority?: number;
   pin?: boolean;
   kv_quant?: boolean;
+  // GPU/CPU layer placement. Omitted/false = full GPU, NEVER split to CPU (default:
+  // llama.cpp `-ngl all`, Ollama `num_gpu=999`). true = allow a GPU/CPU split
+  // (`-ngl auto` / Ollama auto). Relaxes launch flags only — NOT the admission VRAM
+  // verdict (docs/api-spec.md §Instances). The client omits it entirely when false to
+  // keep the wire clean (default behavior needs no field).
+  allow_cpu_offload?: boolean;
 }
 
 // ── Residency queue (Phase 5 — GET/DELETE /api/queue) ─────────────────────────

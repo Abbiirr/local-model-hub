@@ -1,5 +1,11 @@
 // Shared presentational primitives: Panel, Badge, Chip, Bar, states.
-import type { ReactNode } from 'react';
+import {
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from 'react';
 import styles from './ui.module.css';
 
 export type Tone = 'ok' | 'warn' | 'crit' | 'neutral' | 'accent';
@@ -72,6 +78,61 @@ export function Reason(props: { children: ReactNode; crit?: boolean }) {
   return (
     <div className={`${styles.reason} ${props.crit ? styles.reasonCrit : ''}`}>
       {props.children}
+    </div>
+  );
+}
+
+/**
+ * ClampText — presentational only. Renders its children fully, but visually
+ * clamps to `lines` and reveals a "more/less" toggle when the content actually
+ * overflows. No data is hidden: the full text is always in the DOM (and fully
+ * shown when expanded). Used to tame long technical strings (verify reasons,
+ * blocked reasons) without dumping them raw.
+ */
+export function ClampText(props: {
+  children: ReactNode;
+  lines?: number;
+  className?: string;
+  crit?: boolean;
+}) {
+  const lines = props.lines ?? 2;
+  const ref = useRef<HTMLDivElement>(null);
+  const [overflowing, setOverflowing] = useState(false);
+  const [open, setOpen] = useState(false);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    // Measure against the clamped state.
+    setOverflowing(el.scrollHeight - el.clientHeight > 1);
+  }, [props.children, lines]);
+
+  return (
+    <div className={styles.clampWrap}>
+      <div
+        ref={ref}
+        className={`${styles.clamp} ${props.className ?? ''} ${
+          props.crit ? styles.reasonCrit : ''
+        }`}
+        style={
+          open
+            ? undefined
+            : ({ ['--clamp-lines' as string]: String(lines) } as CSSProperties)
+        }
+        data-clamped={open ? 'false' : 'true'}
+      >
+        {props.children}
+      </div>
+      {(overflowing || open) && (
+        <button
+          type="button"
+          className={styles.clampToggle}
+          onClick={() => setOpen((o) => !o)}
+          aria-expanded={open}
+        >
+          {open ? 'less' : 'more'}
+        </button>
+      )}
     </div>
   );
 }

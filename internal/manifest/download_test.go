@@ -109,6 +109,38 @@ func TestFetch_Resume(t *testing.T) {
 	}
 }
 
+// TestDownloadGGUFURL_OverCapDeletesFile is the FINDING-1 gate: a direct-URL GGUF has no trusted
+// size up front, so the hard cap can only be enforced AFTER Fetch finalized the file on disk. The
+// post-hoc check must DELETE the over-cap artifact (not just claim it in the reason) so it cannot
+// fill the model volume. Assert the finalized file is absent afterward AND the reason is honest.
+func TestDownloadGGUFURL_OverCapDeletesFile(t *testing.T) {
+	payload := []byte(strings.Repeat("x", 4096)) // 4 KiB — small, but we set a tiny cap below it.
+	srv, _ := rangeServer(t, payload)
+	dir := t.TempDir()
+
+	d := &Downloader{
+		Fetcher:  &FileFetcher{},
+		DestRoot: dir,
+		Guard:    GuardConfig{HardCapBytes: 1024}, // 1 KiB cap → the 4 KiB download blows it.
+	}
+	_, err := d.DownloadGGUFURL(context.Background(), GGUFURLRequest{URL: srv.URL + "/model.gguf", Filename: "model.gguf"}, nil)
+	if err == nil {
+		t.Fatal("expected an over-cap error")
+	}
+	if !strings.Contains(err.Error(), "hard cap") || !strings.Contains(err.Error(), "removed") {
+		t.Fatalf("expected an honest over-cap + removed reason, got %v", err)
+	}
+	// The finalized file must be gone — not left to wedge the disk.
+	dest := filepath.Join(dir, "model.gguf")
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Fatalf("expected the over-cap file %s to be deleted; it is still on disk", dest)
+	}
+	// And no orphaned .part either.
+	if _, statErr := os.Stat(dest + tmpSuffix); !os.IsNotExist(statErr) {
+		t.Fatal("expected no orphaned .part after over-cap removal")
+	}
+}
+
 // TestFetch_HashMismatchDeletesPartial verifies a bad expected-hash removes the temp file so a
 // retry re-downloads cleanly.
 func TestFetch_HashMismatchDeletesPartial(t *testing.T) {

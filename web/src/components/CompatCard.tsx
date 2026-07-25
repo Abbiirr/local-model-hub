@@ -50,6 +50,7 @@ export function CompatCard() {
           <span className={styles.label}>HF repo</span>
           <input
             className={styles.input}
+            name="compat-hf-repo"
             placeholder="e.g. bartowski/Llama-3.2-1B-Instruct-GGUF"
             value={repo}
             onChange={(e) => setRepo(e.target.value)}
@@ -63,6 +64,7 @@ export function CompatCard() {
           </span>
           <input
             className={styles.input}
+            name="compat-gguf-file"
             placeholder="e.g. Llama-3.2-1B-Instruct-Q4_K_M.gguf"
             value={file}
             onChange={(e) => setFile(e.target.value)}

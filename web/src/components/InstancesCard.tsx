@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { InstanceState, InstanceView, ModelSummary } from '../api/types';
-import { api, ApiError } from '../api/client';
+import { api, ApiError, isQueuedResponse } from '../api/client';
 import {
   Panel,
   Badge,
   Reason,
+  ClampText,
   EmptyState,
   ErrorState,
   Skeleton,
@@ -14,8 +15,10 @@ import styles from './InstancesCard.module.css';
 
 // InstancesCard is the Phase-4 run/stop surface (P4.1/P4.2). It shows every spawned instance
 // with its lifecycle state badge + mandatory reason + VRAM numbers + stop button, and offers a
-// start button per runnable inventory model (GGUF, compat runs/runs_degraded). ADMIN actions —
-// starting/stopping spawns/kills GPU processes; the daemon binds loopback + token-gates.
+// start button per PRESENT startable inventory model (GGUF or Ollama), each annotated with its
+// cached compat status. A "won't fit" model is still submittable — the daemon is the authority
+// and refuses with the numeric reason. ADMIN actions — starting/stopping spawns/kills GPU
+// processes; the daemon binds loopback + token-gates.
 
 // Map an instance state to a badge tone.
 const STATE_TONE: Record<InstanceState, Tone> = {
@@ -31,9 +34,27 @@ function isActive(s: InstanceState): boolean {
   return s === 'REQUESTED' || s === 'STARTING' || s === 'HEALTHY' || s === 'DRAINING';
 }
 
+// Annotate a picker option with its CACHED compat status. This is advisory only — a "won't fit"
+// option is still submittable; the daemon is the authority and refuses with the numeric reason.
+function compatAnnotation(status: string | undefined): { label: string; tone: Tone } {
+  switch (status) {
+    case 'runs':
+      return { label: 'fits', tone: 'ok' };
+    case 'runs_degraded':
+      return { label: 'fits (degraded)', tone: 'warn' };
+    case 'wont_run':
+      return { label: "won't fit", tone: 'crit' };
+    default:
+      return { label: 'unchecked', tone: 'neutral' };
+  }
+}
+
 export function InstancesCard(props: {
   models: ModelSummary[] | null;
   instancesInvalidation: number;
+  // Shared GPU/CPU placement toggle (lifted to App). false = full GPU (never split to CPU).
+  allowCpuOffload: boolean;
+  onAllowCpuOffloadChange: (v: boolean) => void;
 }) {
   const [instances, setInstances] = useState<InstanceView[] | null>(null);
   const [loading, setLoading] = useState(true);
@@ -41,6 +62,7 @@ export function InstancesCard(props: {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [startingModel, setStartingModel] = useState<string | null>(null);
   const [actionReason, setActionReason] = useState<string | null>(null);
+  const [showHistory, setShowHistory] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -70,8 +92,19 @@ export function InstancesCard(props: {
       setStartingModel(modelId);
       setActionReason(null);
       try {
-        const inst = await api.startInstance({ model_id: modelId });
-        setActionReason(`Started ${modelId}: ${inst.state}. ${inst.reason ?? ''}`);
+        const res = await api.startInstance(
+          { model_id: modelId },
+          { allowCpuOffload: props.allowCpuOffload },
+        );
+        if (isQueuedResponse(res)) {
+          // 202: residency queued the start on VRAM — nothing spawned yet. Surface the position +
+          // blocked_reason so the operator knows why it's waiting (mandatory-reason rule).
+          setActionReason(
+            `Queued ${modelId} (position ${res.position}): ${res.blocked_reason}`,
+          );
+        } else {
+          setActionReason(`Started ${modelId}: ${res.state}. ${res.reason ?? ''}`);
+        }
         void refresh();
       } catch (e) {
         // A 409 REFUSED carries the numeric why in `reason` (gate).
@@ -80,7 +113,7 @@ export function InstancesCard(props: {
         setStartingModel(null);
       }
     },
-    [refresh],
+    [refresh, props.allowCpuOffload],
   );
 
   const onStop = useCallback(
@@ -100,18 +133,21 @@ export function InstancesCard(props: {
     [refresh],
   );
 
-  // Runnable inventory models: local GGUFs with a runs / runs_degraded compat badge, and no
-  // active instance already running them.
+  // Startable inventory models: every PRESENT model with a spawnable engine (GGUF via llama.cpp,
+  // or an Ollama model), minus any already running. We deliberately do NOT filter by cached
+  // compat_status — a model may be unchecked, or the operator may want to try a wont_run one and
+  // let the daemon refuse with the authoritative numeric reason (source of truth is the core, not
+  // a UI filter). Each option is annotated with its cached compat status.
   const activeModelIds = new Set(
     (instances ?? []).filter((i) => isActive(i.state)).map((i) => i.model_id),
   );
-  const runnable = (props.models ?? []).filter(
+  const startable = (props.models ?? []).filter(
     (m) =>
       m.format === 'gguf' &&
       m.presence !== 'missing' &&
-      (m.compat_status === 'runs' || m.compat_status === 'runs_degraded') &&
       !activeModelIds.has(m.id),
   );
+  const inventoryEmpty = (props.models ?? []).length === 0;
 
   const active = (instances ?? []).filter((i) => isActive(i.state));
   const recent = (instances ?? []).filter((i) => !isActive(i.state)).slice(0, 5);
@@ -138,42 +174,85 @@ export function InstancesCard(props: {
             />
           ))}
 
+          {/* Terminal/stopped instances are kept out of the default view (the
+              homepage shows only what's live). They stay reachable behind a
+              quiet, collapsed-by-default History toggle. */}
           {recent.length > 0 && (
-            <div className={styles.recentHeading}>Recent</div>
+            <div className={styles.history}>
+              <button
+                type="button"
+                className={styles.historyToggle}
+                onClick={() => setShowHistory((v) => !v)}
+                aria-expanded={showHistory}
+              >
+                {showHistory ? '▾' : '▸'} History ({recent.length})
+              </button>
+              {showHistory &&
+                recent.map((inst) => (
+                  <InstanceRow key={inst.id} inst={inst} recent />
+                ))}
+            </div>
           )}
-          {recent.map((inst) => (
-            <InstanceRow key={inst.id} inst={inst} recent />
-          ))}
         </>
       )}
 
-      {/* Start controls: one button per runnable inventory model. */}
+      {/* Start controls: one row per startable inventory model, annotated with its cached compat
+          status. Every present GGUF/Ollama model is listed (not only cached-runs ones) — the
+          daemon refuses an over-budget start with the authoritative numeric reason. */}
       <div className={styles.startSection}>
         <div className={styles.startHeading}>Start a model</div>
-        {runnable.length === 0 ? (
+        {/* GPU/CPU placement toggle — applies to every start from this picker AND to Inventory
+            Run (shared, lifted to App). Off by default: full GPU, never split to CPU. */}
+        <label className={styles.offloadRow}>
+          <input
+            type="checkbox"
+            className={styles.offloadInput}
+            checked={props.allowCpuOffload}
+            onChange={(e) => props.onAllowCpuOffloadChange(e.target.checked)}
+          />
+          <span className={styles.offloadLabel}>Allow CPU offload</span>
+          <span className={styles.offloadHint}>
+            default: full GPU — never split to CPU
+          </span>
+        </label>
+        {startable.length === 0 ? (
           <EmptyState>
-            No runnable GGUF models. Run a compatibility check on a local GGUF first.
+            {inventoryEmpty ? (
+              <>
+                No models in inventory yet.
+                <br />
+                Add one from the Downloads panel (Hugging Face, a GGUF URL, or a local
+                import), then start it here.
+              </>
+            ) : (
+              <>
+                Every present model is already running.
+                <br />
+                Stop one above, or add more from the Downloads panel.
+              </>
+            )}
           </EmptyState>
         ) : (
           <ul className={styles.startList}>
-            {runnable.map((m) => (
-              <li key={m.id} className={styles.startItem}>
-                <div className={styles.startModel}>
-                  <span className={styles.startName}>{m.display_name}</span>
-                  <Badge tone={m.compat_status === 'runs' ? 'ok' : 'warn'}>
-                    {m.compat_status}
-                  </Badge>
-                </div>
-                <button
-                  type="button"
-                  className={styles.startBtn}
-                  disabled={startingModel !== null}
-                  onClick={() => onStart(m.id)}
-                >
-                  {startingModel === m.id ? 'Starting…' : 'Start'}
-                </button>
-              </li>
-            ))}
+            {startable.map((m) => {
+              const annot = compatAnnotation(m.compat_status);
+              return (
+                <li key={m.id} className={styles.startItem}>
+                  <div className={styles.startModel}>
+                    <span className={styles.startName}>{m.display_name}</span>
+                    <Badge tone={annot.tone}>{annot.label}</Badge>
+                  </div>
+                  <button
+                    type="button"
+                    className={styles.startBtn}
+                    disabled={startingModel !== null}
+                    onClick={() => onStart(m.id)}
+                  >
+                    {startingModel === m.id ? 'Starting…' : 'Start'}
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         )}
       </div>
@@ -216,7 +295,13 @@ function InstanceRow(props: {
         {inst.pid ? <span>pid {inst.pid}</span> : null}
       </div>
 
-      {inst.reason && <Reason crit={inst.state === 'FAILED'}>{inst.reason}</Reason>}
+      {inst.reason && (
+        <div className={styles.reason}>
+          <ClampText lines={2} crit={inst.state === 'FAILED'}>
+            {inst.reason}
+          </ClampText>
+        </div>
+      )}
     </div>
   );
 }

@@ -174,3 +174,64 @@ space changes monthly.
 - Tailscale Serve remains the preferred phone-access path because it proxies a localhost service to the tailnet, applies ACLs, and can pass identity headers.
 
 Re-run this source revalidation before changing ADR-001, ADR-002, ADR-004, or any engine adapter behavior.
+
+## ADR-008 — LAN federation of autonomous daemons (supersedes ADR-007 in part)
+
+**Decision:** LocalHub gains an optional cluster mode: a set of fully autonomous
+LocalHub daemons on a LAN/tailnet, federated by ONE coordinator role (a config-selected
+mode of the same binary, hub-and-spoke) that adds a node registry (push join +
+heartbeat, soft state), aggregated inventory/hardware views, verdict-based placement
+(the coordinator ASKS each node for its own live verdict and free VRAM; it never
+computes fits itself), and OpenAI-request routing to the owning node via the existing
+host-agnostic relay. Per-node behavior — residency, admission, never-kill-active,
+NVML-verified VRAM truth, manifests, reasons — is untouched; a node with clustering off
+is byte-identical to 1.0.
+
+**Why:** Project-owner directive, 2026-07-08 (verbatim): "also in future we shall be
+able to run it in cluster, add support for it, we shall implement and plan for it,
+write down the plans first and then start implementing", clarified as "cluster means
+not necessarily k8s or anything like that simple over the network gpu clusters". This
+amends ADR-007's "multi-node is deferred until real demand" — the demand is the owner's.
+ADR-007's *reasoning* survives: LocalHub still refuses to become a worse GPUStack, so
+the federation is the thinnest layer that answers "which of my boxes can run this, and
+route my request there." Hub-and-spoke because at 2–4 owner-controlled boxes a single
+coordinator eliminates all consensus/split-brain machinery, keeps failure legible
+(coordinator down ⇒ nodes fully functional locally), and any box can be made
+coordinator by config.
+
+**Carried-forward non-goals (binding):** no k8s/container orchestration; no cross-node
+VRAM preemption or fair-share scheduling (ADR-001 applies a fortiori); no model weight
+transfer between nodes in v1 (placement routes only to nodes that have the model; a
+node acquires models via its own supply chain); no distributed state store (coordinator
+soft state rebuilt from heartbeats; only an additive `nodes` table); no cross-box
+tensor/pipeline parallelism; no multi-tenant auth.
+
+**Consequence:** first feature to leave localhost ⇒ security posture changes are
+explicit and validation-enforced: a distinct shared cluster bearer token mandatory
+whenever clustered on a non-loopback bind, Tailscale as the recommended transport
+(loopback binds preserved), mTLS/per-node tokens as the recorded upgrade path. Full
+design, placement policy, failure modes, and P7.x gates: docs/cluster-plan.md.
+
+**Status:** Proposed 2026-07-08 (owner-directed; pending owner review of
+docs/cluster-plan.md §0 checklist; implementation proceeding under the owner's
+plan-then-implement directive).
+
+---
+
+## ADR-009 — Retire Ollama as a LocalHub runtime
+
+**Decision:** LocalHub serves GGUF exclusively through supervised llama.cpp instances;
+Ollama is not configured, detected, warmed, or used for downloads in new deployments.
+Safetensors/AWQ continue to route to vLLM.
+
+**Why:** A supervised llama.cpp process gives LocalHub deterministic lifecycle ownership,
+per-model ports, and verified VRAM release. Ollama is a shared daemon with opaque
+content-addressed blobs and asynchronous unload semantics, which conflicts with the
+single-box residency correctness bar.
+
+**Migration boundary:** an Ollama tag is not a llama.cpp model path. LocalHub must not
+relabel it as one. Existing Ollama artifacts require a standalone GGUF import or
+re-download; multi-file/modifier artifacts remain manual migration work and receive a
+human-readable reason rather than a false runnable verdict.
+
+**Status:** Accepted 2026-07-11 (project-owner directive).

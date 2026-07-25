@@ -130,7 +130,7 @@ type fakeCalibration struct {
 	peaks map[string]int
 }
 
-func (f fakeCalibration) ObservedPeak(key string) (int, bool) {
+func (f fakeCalibration) ObservedPeak(key string, _ int, _ KVCacheType) (int, bool) {
 	v, ok := f.peaks[key]
 	return v, ok
 }

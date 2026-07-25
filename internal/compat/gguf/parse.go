@@ -47,6 +47,18 @@ func parseAndEstimate(ctx context.Context, source Source, opts Options) (Result,
 			ParserVersion, sum.Architecture, sum.ContextSize, opts.FlashAttention,
 			kvLabel(opts.KVCacheType), nglLabel(opts.NGL), parallel(opts.ParallelSeq)),
 	}
+
+	// iSWA KV correction (ADR-002: wrap, don't fork). gguf-parser-go v0.24.1 does
+	// not model Gemma-4 interleaved SWA and (under SkipLargeMetadata) prices its KV
+	// at 0 — an under-price that could OOM at high ctx. When the model is SWA and
+	// our metadata-derived iSWA floor exceeds the library's KV number, add the
+	// shortfall. See iswa.go for the derivation.
+	ctxVRAM := 0
+	if add, kvFloorMiB, note, ok := iswaCorrection(ctx, source, f, run, opts); ok {
+		vramBytes += add
+		ctxVRAM = kvFloorMiB
+		notes = append(notes, note)
+	}
 	if run.Projector != nil {
 		notes = append(notes, "note: multimodal projector (mmproj) present; its VRAM is included by the estimator only if you passed it explicitly — a sibling mmproj file loaded at runtime adds VRAM not counted here")
 	}
@@ -54,13 +66,35 @@ func parseAndEstimate(ctx context.Context, source Source, opts Options) (Result,
 	return Result{
 		VRAMMiB:       bytesToMiB(vramBytes),
 		RAMMiB:        bytesToMiB(ramBytes),
-		CtxVRAMMiB:    0, // library summary does not cleanly separate KV from weights per device; left 0.
+		CtxVRAMMiB:    ctxVRAM, // set only when the iSWA correction computed a KV floor; else 0.
 		Layers:        int(item.OffloadLayers),
 		Confidence:    ConfidenceApproximate,
 		Notes:         notes,
 		ParserVersion: ParserVersion,
 		Architecture:  sum.Architecture,
 	}, nil
+}
+
+// localReadOptions are the read options applied to LOCAL GGUF parses. They are a pure
+// performance fix (fix-agent P6.1 <2s gate) with ZERO effect on the estimate:
+//
+//   - UseMMap(): map the file and read the header + tensor-info section straight from
+//     mapped pages instead of buffered file reads. Measured on the reference box (HDD,
+//     Windows), this alone drops a single ParseGGUFFile from ~2.3s to ~0.14s — a fixed,
+//     model-SIZE-INDEPENDENT parse cost (the P6.1 root cause: evaluateGGUF parses 4× per
+//     Evaluate — once at the requested ctx + three ctxCandidates — so 4 × ~2.3s ≈ the
+//     observed ~10s blocked-admission latency).
+//   - SkipLargeMetadata(): skip the large tokenizer/vocab arrays the VRAM estimate does
+//     not consume. Independently ~2× faster; combined with mmap a parse is ~30ms.
+//
+// Verified byte-identical VRAM across models (1B/8B/32B) and every ctxCandidate
+// (4096/8192/16384/32768) vs the default parse (TestMMapReadOptionsPreserveEstimate).
+// TQ3_* files still fail to parse with the SAME GGMLType(46) error, so the file-size
+// fallback path is unchanged. These options are LOCAL-ONLY: remote sources range-read
+// over HTTP (no mmap), and their timeout budget (Options.RemoteTimeout) is the byte cap.
+var localReadOptions = []ggufparser.GGUFReadOption{
+	ggufparser.UseMMap(),
+	ggufparser.SkipLargeMetadata(),
 }
 
 // parseSource dispatches to the correct gguf-parser-go parse entry point. For
@@ -70,7 +104,7 @@ func parseAndEstimate(ctx context.Context, source Source, opts Options) (Result,
 func parseSource(ctx context.Context, source Source) (*ggufparser.GGUFFile, error) {
 	switch source.kind {
 	case sourceLocal:
-		return ggufparser.ParseGGUFFile(source.path)
+		return ggufparser.ParseGGUFFile(source.path, localReadOptions...)
 	case sourceHF:
 		var readOpts []ggufparser.GGUFReadOption
 		if source.revision != "" {

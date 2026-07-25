@@ -53,6 +53,19 @@ type StartInstanceRequest struct {
 	Priority int    `json:"priority,omitempty"`
 	Pin      bool   `json:"pin,omitempty"`
 	KVQuant  bool   `json:"kv_quant,omitempty"`
+	// AllowCPUOffload opts into a GPU/CPU split for this start. Default false = FULL GPU, never
+	// offload to CPU (the hard default: llama.cpp -ngl all / Ollama num_gpu forced to all layers).
+	// When true, borderline models may split across GPU+CPU (llama.cpp -ngl auto / Ollama num_gpu:-1
+	// dynamic). It relaxes only the launch FLAGS, NOT admission: a model whose weights exceed VRAM is
+	// still refused by the compat verdict (docs/api-spec.md instances §allow_cpu_offload).
+	AllowCPUOffload bool `json:"allow_cpu_offload,omitempty"`
+	// Speculative opts into draft-free self-speculative decoding for this start. "" (default) = off,
+	// today's flags. "ngram-cache" appends llama.cpp's `--spec-type ngram-cache` (draft-free n-gram
+	// self-speculation): no second model, ~zero extra VRAM (a hash pool), so it relaxes NOTHING in
+	// admission — it only changes the launch FLAGS and can speed up structured/repetitive output.
+	// Any other value is rejected at StartInstance with a reason listing the valid values
+	// (compat.ValidateSpeculative; docs/api-spec.md instances §speculative). llama.cpp path only.
+	Speculative string `json:"speculative,omitempty"`
 }
 
 // InstanceView is the API projection of an instances.Instance (GET /api/instances). It carries
@@ -102,6 +115,9 @@ func (s *Service) Instances(ctx context.Context) ([]InstanceView, error) {
 	}
 	out := make([]InstanceView, 0, len(list))
 	for _, inst := range list {
+		if inst.Engine == instances.EngineOllama {
+			continue // pre-migration shared-daemon rows are no longer a LocalHub runtime.
+		}
 		out = append(out, instanceToView(inst))
 	}
 	return out, nil
@@ -115,6 +131,9 @@ func (s *Service) Instance(ctx context.Context, id string) (InstanceView, error)
 	inst, err := s.deps.InstanceStore.Get(ctx, id)
 	if err != nil {
 		return InstanceView{}, err
+	}
+	if inst.Engine == instances.EngineOllama {
+		return InstanceView{}, fmt.Errorf("instance %s belongs to the retired Ollama runtime; import a standalone GGUF and start it with llamacpp instead", id)
 	}
 	return instanceToView(inst), nil
 }
@@ -137,10 +156,33 @@ func (s *Service) StartInstance(ctx context.Context, req StartInstanceRequest) (
 	if req.ModelID == "" {
 		return InstanceView{}, fmt.Errorf("start instance: model_id is required")
 	}
+	if req.Engine == string(instances.EngineOllama) || s.isRetiredOllamaModel(ctx, req.ModelID) {
+		return InstanceView{}, fmt.Errorf("start instance: Ollama is retired; import or download a standalone GGUF and run it with llamacpp instead")
+	}
+	// Validate the per-start speculative knob up front (empty=off is always valid) so an invalid
+	// value is refused with a human reason regardless of the target engine. It is applied only on the
+	// llama.cpp launch path below; other engines ignore it (see StartInstanceRequest.Speculative).
+	spec, err := compat.ValidateSpeculative(req.Speculative)
+	if err != nil {
+		return InstanceView{}, fmt.Errorf("start instance: %w", err)
+	}
+	req.Speculative = spec
 	engine := req.Engine
 	if engine == "" {
-		engine = string(instances.EngineLlamaCPP)
+		// Infer the owning engine from the model's inventory source when the caller did not pin
+		// one. The OpenAI proxy (ResolveForProxy) always passes Engine:"" — an ollama-source model
+		// must route to the shared Ollama daemon (warm), NOT the llama.cpp spawn path (which needs a
+		// local GGUF file the ollama row has no local_path for, so it would 502 "no local file").
+		// This realizes proxy.go's contract: "an Ollama-registry ref resolves to Ollama inside the
+		// descriptor/compat path; do not hard-code engine in the proxy" (P6.1 routing). Non-ollama
+		// sources (local_path/huggingface GGUF, safetensors) keep the llama.cpp default unchanged.
+		engine = s.engineForModelSource(ctx, req.ModelID)
 	}
+	// Carry the resolved engine on req so the dispatched engine paths (and their unified admission —
+	// fix 2) see the concrete engine, not the caller's empty value. Without this an Ollama/vLLM start
+	// reached via Engine:"" would admit as llamacpp (admitForStart's default), mis-estimating the
+	// footprint and mis-routing eviction.
+	req.Engine = engine
 
 	reqCtx := req.Ctx
 	if reqCtx <= 0 {
@@ -159,6 +201,35 @@ func (s *Service) StartInstance(ctx context.Context, req StartInstanceRequest) (
 	if engine != string(instances.EngineLlamaCPP) {
 		return InstanceView{}, fmt.Errorf("start instance: engine %q not supported in Phase 4 (llamacpp + ollama + vllm)", engine)
 	}
+
+	// --- Warm-route short-circuit (fixes proxy self-shadowing, the P1 /v1 503-on-resident bug). ---
+	// If a HEALTHY llama.cpp instance already serves this model, route to it WITHOUT recomputing the
+	// compat verdict or re-running admission. WHY this must happen BEFORE the verdict: ResolveForProxy
+	// starts with Ctx:0 → DefaultContext, and for a large RESIDENT model the recomputed verdict is
+	// evaluated against the hardware snapshot's FREE VRAM — which already EXCLUDES the model's own
+	// (e.g. a 9 GB resident of ~13 GB free leaves ~4 GB), so Compat.Evaluate returns wont_run and
+	// admitGate REFUSES at its verdict-status gate BEFORE residency's own warm check (admission.go
+	// step 1) is ever consulted. That is a false self-shadow: the instance is healthy and the counted
+	// per-request relay works fine. Residency's warm match is ctx-INDEPENDENT (model+engine+HEALTHY);
+	// we mirror it exactly here and run NO fit math against the model itself. A genuinely COLD start
+	// (no healthy instance) falls through to the full verdict + admission path below, unchanged — so
+	// correctness is preserved (a real over-budget cold start is still refused/queued).
+	//
+	// Ctx semantics (v1, intentional + documented): the match ignores ctx, exactly like residency. If
+	// the client asked for a larger ctx than the running instance was started with, we STILL route to
+	// the running instance at its current ctx rather than restart it — the pragmatic v1 (a ctx-aware
+	// re-start is future work). See KNOWN-LIMITATIONS / docs/api-spec.md.
+	if s.deps.InstanceStore != nil {
+		if list, lerr := s.deps.InstanceStore.List(ctx, true); lerr == nil {
+			for i := range list {
+				if list[i].State == instances.StateHealthy && list[i].ModelID == req.ModelID &&
+					list[i].Engine == instances.EngineLlamaCPP {
+					return instanceToView(list[i]), nil // route_loaded: warm HEALTHY instance, no spawn.
+				}
+			}
+		}
+	}
+
 	if s.deps.LlamaRunner == nil {
 		return InstanceView{}, fmt.Errorf("start instance: llama.cpp runner not configured")
 	}
@@ -181,55 +252,50 @@ func (s *Service) StartInstance(ctx context.Context, req StartInstanceRequest) (
 		Descriptor: desc, RequestedCtx: reqCtx, Batch: req.Batch, KVQuant: req.KVQuant,
 	}, snap, avail)
 
+	// --- MoE CPU-offload sizing (BEFORE admission; no binary needed). ---
+	// For a MoE GGUF under allow_cpu_offload, the expert weights are placed on CPU (`-ncmoe`, emitted
+	// by PlanLlamaLaunch below), so admission must size against the REDUCED GPU footprint (total −
+	// expert bytes) — that reduction is what lets an oversize MoE fit. MoEOffloadSizing reads only the
+	// GGUF metadata (no binary, unlike PlanLlamaLaunch), so it is safe to call before admission. It
+	// DECLINES (error) when a MoE opts into offload but its expert bytes are not derivable (compat
+	// honest-sizing rule; no speculative admission). A non-MoE / unparseable / offload-off model
+	// returns 0 and admission proceeds on the full footprint, unchanged.
+	admitVerdict := verdict
+	if offloadMiB, moeErr := compat.MoEOffloadSizing(desc, req.AllowCPUOffload); moeErr != nil {
+		return InstanceView{}, fmt.Errorf("REFUSED: %v", moeErr)
+	} else if offloadMiB > 0 && admitVerdict.EstimatedVRAMMiB > offloadMiB {
+		admitVerdict.EstimatedVRAMMiB -= offloadMiB
+	}
+
 	// --- Admission (P5.1) — replaces the Phase-4 safety pre-check. ---
 	// The verdict must still be runs/runs_degraded (a wont_run/unknown model is never admitted),
 	// then residency decides fit: route_loaded (warm) / load_new (fits) / evict_then_load (freed
-	// room with a per-eviction VRAM re-read) / queue / reject — each with a numeric reason.
-	//
-	// When residency is not configured (config residency.enabled=false), fall back to the
-	// conservative phase-4 pre-check so the daemon still refuses an over-budget start.
-	if verdict.Status != compat.StatusRuns && verdict.Status != compat.StatusRunsDegraded {
-		return InstanceView{}, fmt.Errorf("REFUSED: compatibility verdict is %q (needs 'runs' or 'runs_degraded'). %s",
-			verdict.Status, verdict.Reason)
+	// room with a per-eviction VRAM re-read) / queue / reject — each with a numeric reason. This is
+	// the SAME admission gate Ollama and vLLM use (fix 2 — one residency policy across all engines).
+	warm, evicted, aerr := s.admitGate(ctx, req, reqCtx, admitVerdict, snap)
+	if aerr != nil {
+		return InstanceView{}, aerr
+	}
+	if warm != nil {
+		return *warm, nil // route_loaded: already HEALTHY-resident, no spawn.
 	}
 	if s.deps.Residency != nil {
-		decision, aerr := s.admitForStart(ctx, req, reqCtx, verdict.EstimatedVRAMMiB)
-		if aerr != nil {
-			return InstanceView{}, fmt.Errorf("admission: %w", aerr)
-		}
-		switch decision.Decision {
-		case residency.DecisionRouteLoaded:
-			// Already warm: return the existing HEALTHY instance (no spawn).
-			if decision.WarmInstance != nil {
-				return instanceToView(*decision.WarmInstance), nil
-			}
-		case residency.DecisionLoadNew, residency.DecisionEvictThenLoad:
-			// Room exists (directly or after the verified evictions residency already executed);
-			// fall through to the spawn below. Re-read the snapshot so freeBefore reflects the
-			// post-eviction state for the calibration footprint.
-			if decision.Decision == residency.DecisionEvictThenLoad {
-				if s2, serr := s.deps.Hardware.Snapshot(ctx); serr == nil {
-					snap = s2
-				}
-				s.publishQueueUpdated()
-			}
-		case residency.DecisionQueue:
-			// Blocked: nothing spawned; the caller (API) returns 202 + queue position. Carry the
-			// numeric blocked_reason + position in a typed QUEUED error the handler classifies.
-			s.publishQueueUpdated()
-			return InstanceView{}, &QueuedError{QueueID: decision.QueueID, Position: decision.QueuePosition, ReasonS: decision.Reason}
-		case residency.DecisionReject:
-			return InstanceView{}, fmt.Errorf("REFUSED: %s", decision.Reason)
-		}
-	} else {
-		// Residency disabled → conservative phase-4 pre-check (free − 1.5 GB budget).
-		if err := s.phase4SafetyCheck(verdict, snap); err != nil {
-			return InstanceView{}, err
+		defer s.deps.Residency.ReleaseReservation(req.ModelID, req.Engine)
+	}
+	if evicted {
+		// evict_then_load: residency already executed the verified evictions; re-read the snapshot so
+		// freeBefore reflects the post-eviction state for the calibration footprint.
+		if s2, serr := s.deps.Hardware.Snapshot(ctx); serr == nil {
+			snap = s2
 		}
 	}
 
 	// --- Build the launch plan (shared binary/flag selection). ---
-	plan, err := compat.PlanLlamaLaunch(desc, avail, reqCtx, req.KVQuant)
+	// Runs AFTER admission so a genuine refusal/queue surfaces before the binary-dependent plan (a
+	// missing binary is a plan error, not an admission decision). For a MoE offload it re-derives and
+	// emits `-ncmoe N`; the reduced footprint was already applied to admission above via
+	// MoEOffloadSizing, so a non-derivable MoE was declined before we reached here.
+	plan, err := compat.PlanLlamaLaunch(desc, avail, reqCtx, req.KVQuant, req.AllowCPUOffload, req.Speculative)
 	if err != nil {
 		return InstanceView{}, fmt.Errorf("plan launch for %q: %w", req.ModelID, err)
 	}
@@ -288,6 +354,54 @@ func (s *Service) phase4SafetyCheck(v compat.Verdict, snap hardware.Snapshot) er
 	return nil
 }
 
+// engineForModelSource returns the engine that should run modelID when the caller did not pin one
+// (req.Engine==""). Routing is FORMAT-based (ADR-002/ADR-004: GGUF→llama.cpp, safetensors/pytorch→
+// vLLM) with the ollama SOURCE taking precedence (it warms the shared daemon, which has no local
+// GGUF file to spawn). The `models` row carries both `source` and `format` (migration 0001):
+//   - source == "ollama"                  → Ollama (shared-daemon warm, P6.1 routing fix).
+//   - format == "safetensors" | "pytorch" → vLLM (a safetensors row has no GGUF for llama.cpp;
+//     routing it to llama.cpp yields a non-GGUF error).
+//   - everything else (gguf, or unknown)  → llama.cpp — the historical default.
+//
+// A missing row or DB error falls back to the llama.cpp default so the descriptor-resolution step
+// downstream produces the proper not-found reason (this helper never fails the start on its own).
+// NOTE: when the routed engine (vLLM) is disabled in config, StartInstance's vLLM dispatch returns a
+// CLEAR refusal ("vllm runner not configured (is vLLM enabled?)") — NOT the confusing llama.cpp
+// non-GGUF error a mis-route would produce.
+func (s *Service) engineForModelSource(ctx context.Context, modelID string) string {
+	if s.deps.DB == nil || modelID == "" {
+		return string(instances.EngineLlamaCPP)
+	}
+	var source, format string
+	err := s.deps.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(source,''), COALESCE(format,'') FROM models WHERE id = ?`, modelID).Scan(&source, &format)
+	if err != nil {
+		return string(instances.EngineLlamaCPP)
+	}
+	if source == "ollama" {
+		return string(instances.EngineOllama)
+	}
+	switch format {
+	case "safetensors", "pytorch":
+		return string(instances.EngineVLLM)
+	}
+	return string(instances.EngineLlamaCPP)
+}
+
+// isRetiredOllamaModel prevents a persisted pre-migration catalog row from being
+// launched through a caller-supplied engine value. Models() hides those rows, but
+// this guard also closes direct REST/RPC/proxy starts by ID.
+func (s *Service) isRetiredOllamaModel(ctx context.Context, modelID string) bool {
+	if s.deps.DB == nil || modelID == "" {
+		return false
+	}
+	var source, format string
+	err := s.deps.DB.QueryRowContext(ctx,
+		`SELECT COALESCE(source,''), COALESCE(format,'') FROM models WHERE id = ?`, modelID).
+		Scan(&source, &format)
+	return err == nil && (source == "ollama" || format == "ollama")
+}
+
 // calibrateAfterHealthy runs the P2.5 calibration loop for a freshly HEALTHY instance: a tiny
 // (<=16 token) completion to force full VRAM allocation, then a peak sample, then a record into
 // the calibration store keyed by model_id. All best-effort — a failure here never affects the
@@ -327,6 +441,9 @@ func (s *Service) StopInstance(ctx context.Context, id string) (InstanceView, er
 	inst, err := s.deps.InstanceStore.Get(ctx, id)
 	if err != nil {
 		return InstanceView{}, err
+	}
+	if inst.Engine == instances.EngineOllama {
+		return InstanceView{}, fmt.Errorf("stop instance: Ollama is retired; its legacy instance is not managed by LocalHub")
 	}
 
 	// Ollama: unload (keep_alive:0) + /api/ps poll + VRAM-delta verify (never kills the daemon).
@@ -415,9 +532,19 @@ func (s *Service) StopInstanceAsync(ctx context.Context, id string) (InstanceVie
 
 	// Detach the real stop from the request context. It runs to completion (final STOPPED write +
 	// VRAM verify) even if the HTTP caller disconnects — the fix for the DRAINING-stuck bug.
+	// Before the kill, the goroutine honors the DRAINING contract via residency.EvaluateDrain:
+	// active in-flight requests are allowed to finish (bounded by drain_timeout_seconds) so a
+	// user stop never cuts a live stream mid-generation. Without this wait the DRAINING mark was
+	// purely cosmetic — the process was signalled immediately after the transition.
+	drainingSince := time.Now()
 	go func() {
-		bg, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		drainTimeout := time.Duration(s.deps.Cfg.Residency.DrainTimeoutSeconds) * time.Second
+		if drainTimeout <= 0 {
+			drainTimeout = residency.DefaultDrainTimeoutSecs * time.Second
+		}
+		bg, cancel := context.WithTimeout(context.Background(), drainTimeout+5*time.Minute)
 		defer cancel()
+		s.waitForDrain(bg, id, drainingSince, drainTimeout)
 		if _, serr := s.StopInstance(bg, id); serr != nil {
 			// Best-effort: log via the event bus is not available; the reconciler will reap a
 			// DRAINING-with-dead-pid row on the next tick if this failed after the kill.
@@ -426,6 +553,32 @@ func (s *Service) StopInstanceAsync(ctx context.Context, id string) (InstanceVie
 	}()
 
 	return instanceToView(draining), nil
+}
+
+// waitForDrain blocks until the instance has no active in-flight requests or the drain timeout
+// elapses — the residency.EvaluateDrain contract for user-initiated stops (never-kill-active).
+// Nil-safe: with no in-flight tracker configured the decision is an immediate stop (nothing is
+// counted, so nothing can be waited for). The context bounds the wait as a last resort.
+func (s *Service) waitForDrain(ctx context.Context, id string, drainingSince time.Time, drainTimeout time.Duration) {
+	// A typed-nil *InFlightTracker must not reach the interface parameter as a non-nil
+	// interface value; pass an untyped nil instead so EvaluateDrain's nil check works.
+	var tracker residency.ActiveTracker
+	if s.deps.InFlight != nil {
+		tracker = s.deps.InFlight
+	}
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		d := residency.EvaluateDrain(id, tracker, drainingSince, time.Now(), drainTimeout)
+		if d.Stop {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
 }
 
 // ReconcileInstances runs the daemon-startup reconciliation. Called once at boot (main wires it)

@@ -12,6 +12,7 @@ package ollama
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -90,6 +91,10 @@ type WarmSpec struct {
 	Pinned     bool   // pin => keep_alive:-1 (overrides KeepAlive)
 	Priority   int
 	TTLSeconds int
+	// NumGPU is the load-time layer-offload count sent to the daemon (Ollama num_gpu). nil => omit
+	// the option (daemon dynamic default -1 = auto-split). The core sets it to forceFullGPULayers
+	// for the full-GPU default and nil for allow_cpu_offload=true (see core.startOllamaInstance).
+	NumGPU *int
 }
 
 // Warm creates the REQUESTED→STARTING→HEALTHY lifecycle for an Ollama model: it POSTs the warm
@@ -132,7 +137,7 @@ func (r *Runner) Warm(ctx context.Context, spec WarmSpec) (instances.Instance, e
 	}
 
 	// 3. Send the warm request.
-	if _, err := r.client.Warm(ctx, spec.OllamaTag, keepAlive); err != nil {
+	if _, err := r.client.Warm(ctx, spec.OllamaTag, keepAlive, spec.NumGPU); err != nil {
 		r.failWarm(ctx, spec.InstanceID, "warm request failed: "+err.Error())
 		return instances.Instance{}, err
 	}
@@ -153,6 +158,18 @@ func (r *Runner) Warm(ctx context.Context, spec WarmSpec) (instances.Instance, e
 		VRAMObsMiB: &vramMiB,
 	})
 	if err != nil {
+		// Idempotency (P6.1 live-fix): the periodic /api/ps mirror (SyncOllamaMirror) races this
+		// warm — it independently observes the same tag becoming resident and can adopt THIS row to
+		// HEALTHY first. Our STARTING→HEALTHY then lands on an already-HEALTHY row and returns a typed
+		// IllegalTransitionError (HEALTHY→HEALTHY). That is not a failure: the model IS resident and
+		// HEALTHY, which is exactly the success state. Re-fetch and return it. Any OTHER transition
+		// error (or a non-HEALTHY current state) is still a real failure.
+		var illegal *instances.IllegalTransitionError
+		if errors.As(err, &illegal) {
+			if cur, gerr := r.store.Get(ctx, spec.InstanceID); gerr == nil && cur.State == instances.StateHealthy {
+				return cur, nil
+			}
+		}
 		return instances.Instance{}, err
 	}
 	return healthy, nil

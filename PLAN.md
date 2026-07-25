@@ -29,8 +29,9 @@ Source of truth for intent (read before implementing any area):
 
 ## Target machine (the reference box — all gates close on this hardware)
 
-- Windows 10 Home 10.0.19045; PowerShell + Git Bash; **not a git repository** (user
-  must `git init`/commit themselves per global agent rules).
+- Windows 10 Home 10.0.19045; PowerShell + Git Bash; **git-initialized 2026-07-06,
+  local-only (no remote ever)** — commits remain the user's per global agent rules
+  (C2); everything staged with COMMIT_MSG.txt ready.
 - GPU: NVIDIA RTX 4060 Ti **16 GB** (compute capability 8.9), driver 576.40.
 - System RAM: **16 GB** (hard constraint — see safeguards).
 - Engines present: Ollama (`K:\Softwares\ollama\ollama.exe`), llama.cpp
@@ -176,6 +177,10 @@ every task, not just phase ends.
   cite them; `docs/decisions.md` revalidation log was last run 2026-07-06 (today — fresh).
 - **ADR-003 (llama-swap vs custom residency)** resolves during Phase 0 trial;
   llama-swap ships Windows binaries (Go). Whichever way it lands, ADR gets updated.
-- **No git history**: user's global rules forbid the agent from git writes; all
-  checkpoints are file-based (this workflow + `.planflow/`). User should `git init` and
-  commit at phase boundaries — flagged in TODO as user actions.
+- **No agent git writes**: user's global rules forbid the agent from git writes; all
+  checkpoints are file-based (this workflow + `.planflow/`). The repo is git-initialized
+  (local-only); the user commits at phase boundaries — flagged in TODO as user actions.
+- **Recorded phase-order exception (2026-07-07)**: P1.6 (phone-over-Tailscale check) is
+  a MANUAL user action blocked on an elevated Tailscale service restart; it does not
+  block agent-side P2–P6/C1 work. All agent-preparable P1.6 items are done; the user
+  check closes it under C2.

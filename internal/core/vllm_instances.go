@@ -33,6 +33,7 @@ func (s *Service) startVLLMInstance(ctx context.Context, req StartInstanceReques
 		ModelID:         req.ModelID,
 		MaxModelLen:     reqCtx,
 		GPUMemUtil:      s.deps.Cfg.Engines.VLLM.DefaultGPUMemoryUtil,
+		ExtraArgs:       s.deps.Cfg.Engines.VLLM.ExtraArgs,
 		ExtraDockerArgs: s.deps.Cfg.Engines.VLLM.ExtraDockerArgs,
 		Priority:        req.Priority,
 		Pinned:          req.Pin,
@@ -71,8 +72,22 @@ func (s *Service) startVLLMInstance(ctx context.Context, req StartInstanceReques
 	verdict := s.deps.Compat.Evaluate(ctx, compat.Request{
 		Descriptor: desc, RequestedCtx: reqCtx, Batch: req.Batch, KVQuant: req.KVQuant,
 	}, snap, avail)
-	if err := s.phase4SafetyCheck(verdict, snap); err != nil {
-		return InstanceView{}, err
+
+	// Unified admission (fix 2): the SAME residency gate llama.cpp/Ollama use — route_loaded /
+	// load_new / evict_then_load / queue / reject (falling back to the Phase-4 pre-check when
+	// residency is off). For vLLM, admission's estimator computes the footprint as
+	// gpu_memory_utilization × total VRAM (admitForStart drops the compat estimate for vLLM), which
+	// is what vLLM actually pre-allocates. Engine-specific docker/subprocess mechanics below are
+	// unchanged. (attach mode returned earlier and is exempt — LocalHub does not allocate its VRAM.)
+	warm, _, aerr := s.admitGate(ctx, req, reqCtx, verdict, snap)
+	if aerr != nil {
+		return InstanceView{}, aerr
+	}
+	if warm != nil {
+		return *warm, nil // already HEALTHY-resident on vLLM.
+	}
+	if s.deps.Residency != nil {
+		defer s.deps.Residency.ReleaseReservation(req.ModelID, req.Engine)
 	}
 	spec.VRAMEstMiB = verdict.EstimatedVRAMMiB
 

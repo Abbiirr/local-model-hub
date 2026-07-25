@@ -154,9 +154,10 @@ const ParserVersion = "gguf-parser-go@v0.24.1"
 // peaks are recorded in the DB during load validation and looked up by a stable
 // model key. Tests use a fake.
 type CalibrationStore interface {
-	// ObservedPeak returns the recorded peak VRAM in MiB for modelKey, and ok
-	// false if none is recorded.
-	ObservedPeak(modelKey string) (mib int, ok bool)
+	// ObservedPeak returns a measurement only when it was captured with the same
+	// context length and KV cache type. A peak at a smaller context is never
+	// evidence that a larger context fits.
+	ObservedPeak(modelKey string, contextLen int, kvType KVCacheType) (mib int, ok bool)
 }
 
 // Source identifies where to read the GGUF metadata from. Construct one with
@@ -261,7 +262,7 @@ func estimateWith(ctx context.Context, source Source, opts Options, store Calibr
 
 	// (1) Calibration override — measured VRAM beats any estimate.
 	if store != nil {
-		if mib, ok := store.ObservedPeak(source.modelKey); ok {
+		if mib, ok := store.ObservedPeak(source.modelKey, opts.ContextLen, opts.KVCacheType); ok {
 			return Result{
 				VRAMMiB:    mib,
 				Confidence: ConfidenceExact,

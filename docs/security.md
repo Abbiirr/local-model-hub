@@ -29,7 +29,17 @@ MVP, layered:
 2. **Tailscale identity** — when served over Tailscale, trust the identity headers
    Tailscale injects (only when LocalHub itself listens on localhost and Tailscale is the
    proxy; do not trust such headers on an arbitrary bind).
-3. **Optional bearer token** — for LAN/headless setups, a single admin token in config.
+3. **Optional bearer token — enforced (shipped).** For LAN/headless setups, set a single
+   admin token in `server.admin_token`. When set, `authMiddleware`
+   (`internal/api/middleware.go`) requires `Authorization: Bearer <admin_token>` on **every
+   `/api/*` and `/v1/*` request**, using a constant-time compare (`crypto/subtle`). Two paths
+   are exempt by design: `GET /api/health` (so liveness probes still work) and the static UI
+   assets on `/` (they are useless without API access, and a browser cannot inject the header —
+   the token's audience is headless/API clients). When the token is null (default), the trust
+   model is the loopback bind + Tailscale identity above. **Caveat:** the token gates admin
+   *and* proxy inference endpoints uniformly; there is no per-endpoint scoping, and static UI
+   assets are always reachable. Do not treat the exempt static assets as a leak of control —
+   they cannot drive the API without the token.
 
 Do not build OAuth/multi-tenant/RBAC in MVP — that's the enterprise path this product
 explicitly isn't (see [product-brief.md](product-brief.md#non-goals)).

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/localhub/localhub/internal/compat"
+	"github.com/localhub/localhub/internal/hardware"
 	"github.com/localhub/localhub/internal/instances"
 	"github.com/localhub/localhub/internal/residency"
 )
@@ -115,6 +116,66 @@ func (e residencyEvictor) Evict(ctx context.Context, inst instances.Instance) (i
 	}
 }
 
+// admitGate is the ONE admission gate shared by all three engine start paths (fix 2: llama.cpp
+// spawn, Ollama warm, vLLM docker all route through the same residency policy — before this, only
+// llama.cpp reached Admit while Ollama/vLLM stopped at the Phase-4 free-VRAM pre-check, so
+// /api/instances, /v1/*, and jobs got no route_loaded/load_new/evict_then_load/queue behavior for
+// those engines despite the docs promising ONE policy).
+//
+// It first enforces the compat verdict gate (a wont_run/unknown model is never admitted), then:
+//   - Residency configured → residency.Admit decides fit. It returns:
+//     route_loaded    → (warm=&view, evicted=false, nil): caller returns the warm instance, no spawn.
+//     load_new        → (nil, false, nil): caller proceeds to the engine-specific start.
+//     evict_then_load → (nil, true, nil): residency already executed the verified evictions;
+//     caller proceeds to start and should re-read its snapshot.
+//     queue           → (nil, false, *QueuedError): caller returns it (API → 202 + position;
+//     proxy → fast 503; jobs → leave queued). Carries the numeric blocked_reason
+//     (now including ram_blocked, fix 4).
+//     reject          → (nil, false, error "REFUSED: ...").
+//   - Residency NOT configured → the conservative Phase-4 pre-check (free − 1.5 GB budget) so the
+//     daemon still refuses an over-budget start.
+//
+// Engine-specific start/stop mechanics are UNCHANGED — only admission is unified. The caller owns
+// the actual warm/spawn/docker-run after a proceed result.
+func (s *Service) admitGate(ctx context.Context, req StartInstanceRequest, reqCtx int, verdict compat.Verdict, snap hardware.Snapshot) (warm *InstanceView, evicted bool, err error) {
+	if verdict.Status != compat.StatusRuns && verdict.Status != compat.StatusRunsDegraded {
+		return nil, false, fmt.Errorf("REFUSED: compatibility verdict is %q (needs 'runs' or 'runs_degraded'). %s",
+			verdict.Status, verdict.Reason)
+	}
+	if s.deps.Residency == nil {
+		// Residency disabled → conservative phase-4 pre-check (free − 1.5 GB budget).
+		if perr := s.phase4SafetyCheck(verdict, snap); perr != nil {
+			return nil, false, perr
+		}
+		return nil, false, nil
+	}
+	decision, aerr := s.admitForStart(ctx, req, reqCtx, verdict.EstimatedVRAMMiB)
+	if aerr != nil {
+		return nil, false, fmt.Errorf("admission: %w", aerr)
+	}
+	switch decision.Decision {
+	case residency.DecisionRouteLoaded:
+		if decision.WarmInstance != nil {
+			v := instanceToView(*decision.WarmInstance)
+			return &v, false, nil
+		}
+		return nil, false, nil
+	case residency.DecisionEvictThenLoad:
+		s.publishQueueUpdated()
+		return nil, true, nil
+	case residency.DecisionLoadNew:
+		return nil, false, nil
+	case residency.DecisionQueue:
+		// Blocked: nothing started; carry the numeric blocked_reason + position in a typed QUEUED
+		// error the caller (API 202 / proxy 503 / jobs leave-queued) classifies.
+		s.publishQueueUpdated()
+		return nil, false, &QueuedError{QueueID: decision.QueueID, Position: decision.QueuePosition, ReasonS: decision.Reason}
+	case residency.DecisionReject:
+		return nil, false, fmt.Errorf("REFUSED: %s", decision.Reason)
+	}
+	return nil, false, nil
+}
+
 // admitForStart runs the residency admission flow for a start request and returns the decision.
 // StartInstance uses it to decide whether to proceed to spawn (RouteLoaded/LoadNew/EvictThenLoad)
 // or to refuse-with-queue-position (Queue/Reject). It passes the precomputed footprint from the
@@ -132,6 +193,14 @@ func (s *Service) admitForStart(ctx context.Context, req StartInstanceRequest, r
 	}
 	if spec.Engine == "" {
 		spec.Engine = string(instances.EngineLlamaCPP)
+	}
+	// vLLM's real footprint is gpu_memory_utilization × TOTAL VRAM (it pre-allocates its whole
+	// configured fraction, not the model size — KNOWN-LIMITATIONS #3 / the P4.5 lesson). The compat
+	// verdict estimate is the model's *required* VRAM, which UNDER-counts what vLLM actually grabs.
+	// So for vLLM we drop the precomputed footprint and let residency's estimator compute util×total
+	// (residencyEstimator.Footprint) — the conservative, anti-OOM number for admission (fix 2).
+	if spec.Engine == string(instances.EngineVLLM) {
+		spec.FootprintMiB = 0
 	}
 	return s.deps.Residency.Admit(ctx, spec)
 }
@@ -181,6 +250,17 @@ func (s *Service) Queue(ctx context.Context) ([]QueueEntryView, error) {
 		out = append(out, v)
 	}
 	return out, nil
+}
+
+// queueEntryWaiting reports whether the given residency queue id is still a live WAITING request
+// (the drain loop still owns it). Used by the jobs worker to hold AT MOST ONE live residency row per
+// job (fix 1): while a blocked job's queue_id is WAITING, the worker must not re-admit and mint a
+// duplicate row. Returns false when residency is unconfigured or the id is empty/gone.
+func (s *Service) queueEntryWaiting(queueID string) bool {
+	if s.deps.Residency == nil || queueID == "" {
+		return false
+	}
+	return s.deps.Residency.IsWaiting(queueID)
 }
 
 // CancelQueueEntry cancels a WAITING queue entry (DELETE /api/queue/{id}).

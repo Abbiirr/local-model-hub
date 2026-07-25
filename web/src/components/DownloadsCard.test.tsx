@@ -30,6 +30,12 @@ describe('DownloadsCard', () => {
     cleanup(); // unmount so the polling interval + DOM don't leak across tests
   });
 
+  it('does not advertise the retired Ollama pull route', () => {
+    render(<DownloadsCard />);
+    expect(screen.queryByRole('button', { name: /ollama pull/i })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/ollama model name/i)).not.toBeInTheDocument();
+  });
+
   it('two-step HF: resolves and shows the pinned commit + files before downloading', async () => {
     (api.createDownload as ReturnType<typeof vi.fn>).mockResolvedValue(awaitingJobFixture);
     render(<DownloadsCard />);

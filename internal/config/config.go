@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -26,6 +27,45 @@ type Config struct {
 	Residency     ResidencyConfig     `yaml:"residency"`
 	Security      SecurityConfig      `yaml:"security"`
 	Logging       LoggingConfig       `yaml:"logging"`
+	Jobs          JobsConfig          `yaml:"jobs"`
+	Cluster       ClusterConfig       `yaml:"cluster"`
+}
+
+// ClusterConfig is the optional LAN-federation block (P7.1, ADR-008 / docs/cluster-plan.md).
+// Role "off" (the default) is a strict zero: no routes, no goroutines, byte-identical to a
+// single-box 1.0 daemon (cluster-plan §1.3). The same binary is either a coordinator (accepts
+// node join/heartbeat, exposes /api/cluster/*) or a node (dials a coordinator and heartbeats),
+// selected here — never a separate binary (cluster-plan §0 decision 1, §2.2).
+type ClusterConfig struct {
+	// Role selects the cluster behavior: "off" | "coordinator" | "node" (cluster-plan §0.1).
+	Role string `yaml:"role"`
+	// CoordinatorURL is where a node dials the coordinator (node mode only), e.g.
+	// "http://box-a.tailnet.ts.net:39876" (cluster-plan §2.4). Required when role=node.
+	CoordinatorURL string `yaml:"coordinator_url"`
+	// Token is the shared cluster bearer, DISTINCT from server.admin_token (cluster-plan §4.2):
+	// the admin token is one box's human credential; the cluster token is the machine credential
+	// shared by the federation. Gates every cluster-plane call. Required for role=node, and
+	// mandatory whenever a clustered role binds non-loopback (validation-enforced; §4.4).
+	Token string `yaml:"cluster_token"`
+	// NodeName is the human label the coordinator shows for this daemon ("basement-4090").
+	// Defaults to the OS hostname (normalize()).
+	NodeName string `yaml:"node_name"`
+	// AdvertiseURL is how the coordinator reaches THIS node back — the node's non-loopback bind
+	// or tailnet address, explicitly configured and never guessed from the socket peer address
+	// (cluster-plan §2.4, NAT/proxy-safe). Empty => derived from server.bind:port (fine for the
+	// loopback two-daemon dev rig; must be set for a real second box).
+	AdvertiseURL string `yaml:"advertise_url"`
+	// HeartbeatIntervalSeconds is the node's join+heartbeat cadence and the unit the coordinator
+	// derives ONLINE/STALE/UNREACHABLE from (cluster-plan §2.4). Default 10; 0 => 10.
+	HeartbeatIntervalSeconds int `yaml:"heartbeat_interval_seconds"`
+}
+
+// JobsConfig gates the P6.2 async-inference-jobs worker (design §2.3). Enabled by default; a
+// gate mirroring residency.enabled so an operator can turn the background job worker off (the
+// jobs table + REST endpoints still exist, but no worker drains them). When false, main.go skips
+// `go svc.RunJobWorker(ctx)` and submitted jobs sit `queued` until the feature is re-enabled.
+type JobsConfig struct {
+	Enabled bool `yaml:"enabled"`
 }
 
 type ServerConfig struct {
@@ -105,6 +145,11 @@ type VLLMConfig struct {
 	AttachURL            string  `yaml:"attach_url"`
 	PortRange            [2]int  `yaml:"port_range"`
 	DefaultGPUMemoryUtil float64 `yaml:"default_gpu_memory_utilization"`
+	// ExtraArgs are vLLM engine flags appended after the image/model for docker mode and
+	// after the positional model for subprocess mode. Use them only for model-specific
+	// runtime requirements that cannot be expressed by the admission plan, for example
+	// `--skip-mm-profiling` on a constrained multimodal deployment.
+	ExtraArgs []string `yaml:"extra_args"`
 	// ExtraDockerArgs are DOCKER-level args (mounts, env, etc.) inserted before the image name
 	// in `docker run` for mode=docker. Use for e.g. mounting an HF cache off the C: drive
 	// (`-v K:\hf-cache:/root/.cache/huggingface`) or setting env (`-e HF_HUB_ENABLE_HF_TRANSFER=0`).
@@ -138,6 +183,28 @@ type ResidencyConfig struct {
 	// Purpose: ops VRAM reservation AND storm testing (a tight budget forces eviction/queue
 	// pressure without physically filling the card).
 	VRAMBudgetMB int `yaml:"vram_budget_mib"`
+	// MinFreeRAMMiB is the system-RAM floor (fix 4, full-project-review finding 4). Admission
+	// refuses to start a NEW process/warm (llama.cpp spawn, Ollama warm, vLLM docker) when FRESH
+	// free system RAM is below this, queueing with a numeric ram_blocked reason surfaced exactly
+	// like VRAM shortages. On a 16 GB-RAM box RAM binds before VRAM (four llama-server processes
+	// drove free RAM to ~0.24 GB while VRAM never OOMed). This is a GLOBAL guard — not a per-model
+	// RAM estimate and not RAM-based eviction victim selection. Default 2048; 0 disables the check.
+	MinFreeRAMMiB int `yaml:"min_free_ram_mib"`
+	// MaxGPUTempC is the GPU-temperature admission ceiling (Celsius). When the FRESH GPU core
+	// temperature at admission time is above this, admission refuses to start/warm a NEW model,
+	// queueing with a numeric gpu_hot reason; the drain loop re-admits once the card cools. This is
+	// an admission-time guard only — a RUNNING model is never killed for crossing it (never-kill-
+	// active). Default 87: the RTX 4060 Ti's NVIDIA-spec Maximum GPU Temperature is 90C
+	// (https://www.nvidia.com/en-us/geforce/graphics-cards/40-series/rtx-4060-4060ti/) and it begins
+	// thermal-throttling around 83C, so 87 leaves headroom below the hard max while still allowing
+	// normal warm operation. 0 disables the check. Valid: 0 or 60..100.
+	MaxGPUTempC int `yaml:"max_gpu_temp_c"`
+	// MaxGPUUtilPct is the GPU-utilization admission ceiling (percent, 0..100). When the FRESH GPU
+	// utilization at admission time is above this, admission defers the start the same way (gpu_busy
+	// reason, drain re-admits when it falls). Disabled by default (0): starting a model while the GPU
+	// is momentarily busy is often legitimate. Set it (e.g. 80) when the box doubles as a gaming/
+	// render machine and you want model loads to wait for the GPU to be mostly free. Valid: 0..100.
+	MaxGPUUtilPct int `yaml:"max_gpu_util_pct"`
 	// Queue tunes the custom priority queue (P5.0, docs/residency-priority-queue.md). Zero-value
 	// fields fall back to the documented defaults (60/120s aging, coalesce 4, caps 64/256/512).
 	Queue QueueTuning `yaml:"queue"`
@@ -177,12 +244,7 @@ func Default() Config {
 			TrustTailscaleHeaders: true,
 			AllowNonlocal:         false,
 		},
-		Data: DataConfig{
-			DBPath: "./localhub.db",
-			ModelDirs: []string{
-				`K:\projects\llm_models\models`,
-			},
-		},
+		Data: defaultDataConfig(),
 		Hardware: HardwareConfig{
 			NVIDIA:              true,
 			ROCm:                false,
@@ -190,7 +252,9 @@ func Default() Config {
 		},
 		Engines: EnginesConfig{
 			Ollama: OllamaConfig{
-				Enabled:               true,
+				// Deprecated: Ollama is no longer a LocalHub runtime. Existing
+				// registry blobs must be re-imported as standalone GGUF files.
+				Enabled:               false,
 				BaseURL:               "http://127.0.0.1:11434",
 				MirrorIntervalSeconds: 10,
 			},
@@ -229,7 +293,10 @@ func Default() Config {
 			NeverKillActiveByDefault: true,
 			DrainTimeoutSeconds:      300,
 			DrainIntervalSeconds:     10,
-			VRAMBudgetMB:             0, // disabled by default → real free VRAM
+			VRAMBudgetMB:             0,    // disabled by default → real free VRAM
+			MinFreeRAMMiB:            2048, // RAM floor: don't start a new process/warm below 2 GiB free (fix 4)
+			MaxGPUTempC:              87,   // GPU-temp ceiling: don't start/warm above 87C (RTX 4060 Ti max 90C, throttles ~83C); 0 disables
+			MaxGPUUtilPct:            0,    // GPU-util ceiling disabled by default (starting while GPU busy is often legitimate)
 			// Queue tuning left zero → the documented defaults apply (60/120s aging, coalesce 4,
 			// caps 64/256/512). See docs/residency-priority-queue.md.
 		},
@@ -242,8 +309,42 @@ func Default() Config {
 			Level:  "info",
 			Format: "text",
 		},
+		Jobs: JobsConfig{
+			Enabled: true, // async inference jobs on by default (design §2.3)
+		},
+		Cluster: ClusterConfig{
+			// Off by default: a fresh daemon is a single box, byte-identical to 1.0 (ADR-008,
+			// cluster-plan §1.3). Clustering is opt-in per box.
+			Role:                     "off",
+			HeartbeatIntervalSeconds: 10,
+		},
 	}
 }
+
+// defaultDataConfig keeps the reference-box paths on Windows while giving a
+// service launched from an arbitrary Linux working directory stable, writable
+// XDG locations. Operators can always override these in YAML.
+func defaultDataConfig() DataConfig {
+	if runtime.GOOS == "windows" {
+		return DataConfig{DBPath: "./localhub.db", ModelDirs: []string{`K:\projects\llm_models\models`}}
+	}
+	state := os.Getenv("XDG_STATE_HOME")
+	if state == "" {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			state = filepath.Join(home, ".local", "state")
+		} else {
+			state = "/var/lib"
+		}
+	}
+	base := filepath.Join(state, "localhub")
+	return DataConfig{DBPath: filepath.Join(base, "localhub.db"), ModelDirs: []string{filepath.Join(base, "models")}, DataDir: base}
+}
+
+// validClusterRoles are the cluster modes the daemon understands (cluster-plan §0.1).
+var validClusterRoles = map[string]bool{"off": true, "coordinator": true, "node": true}
+
+// DefaultHeartbeatIntervalSeconds is the fallback join/heartbeat cadence (cluster-plan §2.4).
+const DefaultHeartbeatIntervalSeconds = 10
 
 // validVLLMModes are the launch modes the adapter understands (PLAN.md resolution 4).
 var validVLLMModes = map[string]bool{"docker": true, "attach": true, "subprocess": true}
@@ -296,6 +397,26 @@ func (c *Config) normalize() {
 	c.Logging.Level = strings.ToLower(strings.TrimSpace(c.Logging.Level))
 	c.Logging.Format = strings.ToLower(strings.TrimSpace(c.Logging.Format))
 	c.Engines.VLLM.Mode = strings.ToLower(strings.TrimSpace(c.Engines.VLLM.Mode))
+
+	// Cluster normalization (P7.1). An empty/omitted role folds to "off" so a config that never
+	// mentions clustering behaves byte-identically to 1.0 (cluster-plan §1.3). node_name defaults
+	// to the OS hostname; heartbeat cadence folds to the documented default.
+	cl := &c.Cluster
+	cl.Role = strings.ToLower(strings.TrimSpace(cl.Role))
+	if cl.Role == "" {
+		cl.Role = "off"
+	}
+	cl.CoordinatorURL = strings.TrimSpace(cl.CoordinatorURL)
+	cl.AdvertiseURL = strings.TrimSpace(cl.AdvertiseURL)
+	cl.NodeName = strings.TrimSpace(cl.NodeName)
+	if cl.NodeName == "" {
+		if hn, err := os.Hostname(); err == nil {
+			cl.NodeName = hn
+		}
+	}
+	if cl.HeartbeatIntervalSeconds <= 0 {
+		cl.HeartbeatIntervalSeconds = DefaultHeartbeatIntervalSeconds
+	}
 }
 
 // Validate returns the first configuration error found. The loopback-bind check is the
@@ -317,8 +438,8 @@ func (c *Config) Validate() error {
 	if c.Hardware.PollIntervalSeconds < 1 {
 		return fmt.Errorf("hardware.poll_interval_seconds must be >= 1")
 	}
-	if c.Engines.Ollama.Enabled && strings.TrimSpace(c.Engines.Ollama.BaseURL) == "" {
-		return fmt.Errorf("engines.ollama.base_url must be set when ollama is enabled")
+	if c.Engines.Ollama.Enabled {
+		return fmt.Errorf("engines.ollama is retired: import or download a standalone GGUF and run it with llamacpp instead")
 	}
 	if c.Engines.LlamaCPP.Enabled {
 		if err := validatePortRange("engines.llamacpp.port_range", c.Engines.LlamaCPP.PortRange); err != nil {
@@ -345,13 +466,70 @@ func (c *Config) Validate() error {
 	if c.Compatibility.DefaultContext < 1 {
 		return fmt.Errorf("compatibility.default_context must be >= 1")
 	}
+	if t := c.Residency.MaxGPUTempC; t != 0 && (t < 60 || t > 100) {
+		return fmt.Errorf("residency.max_gpu_temp_c %d out of range: use 0 (disabled) or 60..100 C", t)
+	}
+	if u := c.Residency.MaxGPUUtilPct; u < 0 || u > 100 {
+		return fmt.Errorf("residency.max_gpu_util_pct %d out of range 0..100", u)
+	}
 	if !validLogLevels[c.Logging.Level] {
 		return fmt.Errorf("logging.level %q invalid (want debug|info|warn|error)", c.Logging.Level)
 	}
 	if !validLogFormats[c.Logging.Format] {
 		return fmt.Errorf("logging.format %q invalid (want text|json)", c.Logging.Format)
 	}
+	if err := c.validateCluster(); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateCluster enforces the P7.1 cluster rules (cluster-plan §4.2, §4.4). role=off is a
+// strict zero — no cluster requirements apply, so a non-clustered daemon is validated exactly as
+// 1.0. For clustered roles the security posture changes (this is the first feature to leave
+// localhost): a node needs a coordinator to dial and the shared token; ANY clustered role on a
+// non-loopback bind must carry the cluster token (the validation-enforced trio: non-loopback bind
+// + allow_nonlocal already gated by validateBind, PLUS cluster_token here). P7.5 hardens this
+// further (both-sides per-endpoint scoping, negative-auth suites); P7.1 enforces this slice.
+func (c *Config) validateCluster() error {
+	cl := c.Cluster
+	if !validClusterRoles[cl.Role] {
+		return fmt.Errorf("cluster.role %q invalid (want off|coordinator|node)", cl.Role)
+	}
+	if cl.Role == "off" {
+		return nil // zero behavioral change; nothing else to check
+	}
+	if cl.Role == "node" {
+		// A node must know where to dial and must present the shared credential (cluster-plan §2.4,
+		// §4.2). Missing coordinator_url is the #1 setup mistake; give a readable reason.
+		if cl.CoordinatorURL == "" {
+			return fmt.Errorf("cluster.coordinator_url must be set when cluster.role=node (the URL of the coordinator to join)")
+		}
+		if cl.Token == "" {
+			return fmt.Errorf("cluster.cluster_token must be set when cluster.role=node (the shared cluster bearer, distinct from server.admin_token)")
+		}
+	}
+	// Mandatory-token-on-non-loopback (cluster-plan §4.4): there is no unauthenticated cluster mode
+	// off 127.0.0.1. The loopback two-daemon dev rig MAY run tokenless (coordinator side); once the
+	// bind is routable the token is required so a clustered admin surface never lands unauthenticated
+	// on the LAN — the same hard-fail philosophy as validateBind.
+	if !isLoopbackBind(c.Server.Bind) && cl.Token == "" {
+		return fmt.Errorf(
+			"cluster.cluster_token must be set when cluster.role=%q on a non-loopback bind %q "+
+				"(refusing to expose the cluster plane unauthenticated off 127.0.0.1 — see docs/security.md, docs/cluster-plan.md §4.4)",
+			cl.Role, c.Server.Bind)
+	}
+	return nil
+}
+
+// isLoopbackBind reports whether bind is a recognized loopback address/name. Mirrors the accept
+// set of validateBind (IP loopback literals and the "localhost" name) so the cluster non-loopback
+// token rule keys off the same notion of "off 127.0.0.1" as the bind guard.
+func isLoopbackBind(bind string) bool {
+	if ip := net.ParseIP(strings.TrimSpace(bind)); ip != nil {
+		return ip.IsLoopback()
+	}
+	return strings.EqualFold(strings.TrimSpace(bind), "localhost")
 }
 
 // validateBind enforces loopback-only unless allowNonlocal is explicitly set. A hostname

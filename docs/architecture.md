@@ -23,7 +23,7 @@
    ┌────────────────▼─────────────────┐
    │  Web UI (bundled static assets)  │   GPU • models • queue • engines • logs
    └────────────────┬─────────────────┘
-                    │  REST + SSE
+                    │  REST + SSE + WebSocket + JSON-RPC + OpenAI proxy (/v1/*)
    ┌────────────────▼─────────────────┐
    │        Control Plane (daemon)    │
    │  ┌────────────┬────────────────┐ │
@@ -37,7 +37,7 @@
    └────────┼──────────────┼──────────┘
             │              │
      Engine adapters   Hardware probe
-            │           (NVML/ROCm/psutil)
+            │        (nvidia-smi now; NVML/ROCm later)
    ┌────────┼──────────┬─────────────┐
    ▼        ▼          ▼
  Ollama   llama.cpp   vLLM
@@ -47,9 +47,11 @@
 
 ### Control plane
 
-Long-running daemon. Owns SQLite, exposes the REST + SSE API, runs the metrics loop,
-supervises engine processes it launched (llama.cpp, vLLM), and talks to the shared
-Ollama daemon over HTTP.
+Long-running daemon. Owns SQLite, exposes the API over four thin transports (REST + SSE +
+WebSocket + JSON-RPC 2.0) plus the Phase-6 OpenAI proxy (`/v1/*`) — all sitting over **one**
+service core, no business logic duplicated per transport (PLAN.md decision 7). Runs the
+hardware/metrics loop, supervises engine processes it launched (llama.cpp, vLLM), and talks
+to the shared Ollama daemon over HTTP.
 
 ### Engine adapters
 
@@ -62,9 +64,13 @@ One module per engine implementing a common contract (see
 
 ### Hardware probe
 
-Reads GPU/CPU/RAM/disk. NVIDIA-first via NVML (`go-nvml` or `pynvml`); ROCm via
-`rocm-smi`/`amd-smi`; CPU/RAM/disk via gopsutil/psutil. Feeds both the live dashboard and
-the compatibility engine (which needs *current free VRAM*, not just total).
+Reads GPU/CPU/RAM/disk behind a probe **interface** with swappable implementations. Current
+impl: a **`nvidia-smi` subprocess** (parses its XML/CSV output) — the control plane
+deliberately does not link CUDA/NVML ([ADR-005](decisions.md#adr-005): the control plane must
+not link CUDA). Native NVML (Linux) and ROCm/`amd-smi` are alternate implementations of the
+same interface, not yet shipped. CPU/RAM/disk via gopsutil. Feeds both the live dashboard and
+the compatibility engine (which needs *current free VRAM*, not just total). The same probe
+delta is what verifies a `stop`/`evict` actually freed VRAM — never a trusted engine HTTP 200.
 
 ### Compatibility engine + estimator
 
@@ -95,9 +101,16 @@ REQUESTED → STARTING → HEALTHY → (DRAINING) → STOPPED
 ```
 
 `DRAINING` = marked for eviction but has in-flight requests; do not kill until drained
-(see residency rules).
+(see residency rules). A `DRAINING` instance whose process is already dead is reconciled to
+`STOPPED` on the restart/reconcile pass (so a stop whose HTTP caller disconnects mid-drain
+does not leave the row stuck).
 
 ## Stack decision (read this before choosing a language)
+
+> **Resolved: Go ([ADR-006](decisions.md#adr-006), Accepted 2026-07-06).** The shipped
+> control plane is a single Go binary (module `github.com/localhub/localhub`), SQLite (WAL) via
+> `modernc.org/sqlite`, React/Vite frontend embedded via `go:embed`. The options below are
+> retained as the rationale, not an open choice.
 
 The plan proposed "Python/FastAPI for prototype, Go single-binary later." For a **real
 FOSS product whose adoption depends on install friction**, the distribution story is not
@@ -140,5 +153,8 @@ client → /v1/chat/completions (thin proxy)
       → record tokens/s, TTFT, latency, memory delta
 ```
 
-Before Phase 6, there is **no proxy** — LocalHub only manages/monitors, and clients hit
-the engines directly. Ship value without the proxy first.
+The Phase-6 proxy is shipped: `/v1/chat/completions` and `/v1/completions` route by model
+name through admission and stream tokens back with byte-passthrough. Because every proxied
+request goes through the counted relay, a non-pinned instance serving a proxied stream is
+visible to the never-kill-active gate — the active-stream safety story is only complete when
+clients enter through LocalHub (proxy/relay), not when they hit an engine `base_url` directly.

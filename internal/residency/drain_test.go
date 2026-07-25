@@ -75,10 +75,13 @@ func mgrForDrain(t *testing.T, store *QueueStore, probeFree int, active []instan
 // enqueue directly enqueues a WAITING request (in-memory + durable) so the drain loop has work.
 func enqueueWaiting(t *testing.T, m *Manager, store *QueueStore, req Request, blocked string) {
 	t.Helper()
-	if err := m.queue.Enqueue(req); err != nil {
+	stored, err := m.queue.Enqueue(req)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.InsertWaiting(context.Background(), req, blocked, req.Cost.EstimateMiB); err != nil {
+	// Persist the STORED copy (with the assigned seq) — mirrors the production fix so durable rows
+	// carry the FIFO seq the in-memory queue uses (fix 3).
+	if err := store.InsertWaiting(context.Background(), stored, blocked, req.Cost.EstimateMiB); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -138,6 +141,57 @@ func TestDrainQueue_LeavesQueuedWhenNoRoom(t *testing.T) {
 	}
 	if len(res.Requeued) != 1 {
 		t.Errorf("Requeued = %v, want [q1]", res.Requeued)
+	}
+}
+
+// TestDrainQueue_SkipsBlockedHeadForSmallerCandidate is the head-of-line regression gate: a
+// large request may remain queued while a later, smaller request starts in the same pass. The
+// scheduler must not infer that "head did not fit" means no later request can fit.
+func TestDrainQueue_SkipsBlockedHeadForSmallerCandidate(t *testing.T) {
+	store, _ := drainTestStore(t)
+	starter := &recordingStarter{outcomes: []starterOutcome{{requeued: true}, {started: true}}}
+	m := mgrForDrain(t, store, 5000, nil, starter)
+	enqueueWaiting(t, m, store, Request{ID: "large", ModelID: "m1", Engine: "llamacpp", Class: ClassInteractive,
+		Cost: CostHint{EstimateMiB: 9000}}, "waiting for VRAM")
+	enqueueWaiting(t, m, store, Request{ID: "small", ModelID: "m1", Engine: "llamacpp", Class: ClassNormal,
+		Cost: CostHint{EstimateMiB: 1000}}, "waiting for VRAM")
+
+	res, err := m.DrainQueue(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Requeued) != 1 || res.Requeued[0] != "large" {
+		t.Fatalf("Requeued = %v, want [large]", res.Requeued)
+	}
+	if len(res.Started) != 1 || res.Started[0] != "small" {
+		t.Fatalf("Started = %v, want [small]", res.Started)
+	}
+}
+
+// TestRestoreWaiting_RebuildsQueueFromDurableRows proves a daemon restart preserves ordering and
+// the start context required by the drain loop.
+func TestRestoreWaiting_RebuildsQueueFromDurableRows(t *testing.T) {
+	store, _ := drainTestStore(t)
+	before := mgrForDrain(t, store, 15000, nil, &recordingStarter{outcomes: []starterOutcome{{started: true}}})
+	enqueueWaiting(t, before, store, Request{ID: "first", ModelID: "m1", Engine: "llamacpp", Class: ClassNormal,
+		Ctx: 2048, Batch: 64, Pin: true, Priority: 1, Cost: CostHint{EstimateMiB: 3000}}, "waiting")
+	enqueueWaiting(t, before, store, Request{ID: "second", ModelID: "m1", Engine: "llamacpp", Class: ClassNormal,
+		Ctx: 4096, Batch: 128, Priority: 1, Cost: CostHint{EstimateMiB: 4000}}, "waiting")
+
+	after := mgrForDrain(t, store, 15000, nil, &recordingStarter{outcomes: []starterOutcome{{started: true}}})
+	n, err := after.RestoreWaiting(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("restored %d rows, want 2", n)
+	}
+	snap := after.Queue().Snapshot(NextInput{})
+	if len(snap) != 2 || snap[0].ID != "first" || snap[1].ID != "second" {
+		t.Fatalf("restored order = %#v, want first, second", snap)
+	}
+	if snap[0].Ctx != 2048 || snap[0].Batch != 64 || !snap[0].Pin || snap[0].Cost.EstimateMiB != 3000 {
+		t.Fatalf("restored request lost context: %+v", snap[0])
 	}
 }
 

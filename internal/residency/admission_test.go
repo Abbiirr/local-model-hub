@@ -3,9 +3,11 @@ package residency
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/localhub/localhub/internal/db"
 	"github.com/localhub/localhub/internal/instances"
 )
 
@@ -103,6 +105,35 @@ func TestAdmit_FitsDirectly(t *testing.T) {
 	}
 	if probe.calls != 1 {
 		t.Fatalf("probe read %d times for a direct fit, want exactly 1", probe.calls)
+	}
+}
+
+// TestAdmit_QueuePersistenceFailureDoesNotAccept verifies that a returned queue decision always
+// has a durable row. Losing the DB after in-memory enqueue must be an error, not a false 202 that
+// vanishes on restart.
+func TestAdmit_QueuePersistenceFailureDoesNotAccept(t *testing.T) {
+	d, err := db.Open(filepath.Join(t.TempDir(), "closed-queue.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(ManagerConfig{
+		QueueStore:      NewQueueStore(d.DB),
+		Probe:           &countingProbe{vals: []int{1000}},
+		Lister:          staticLister{nil},
+		Evictor:         &recordingEvictor{},
+		Estimator:       fixedEstimator{mib: 4000},
+		Clock:           newFakeClock(),
+		SafetyMarginMiB: 1024,
+	})
+	_, err = m.Admit(context.Background(), AdmitSpec{ModelID: "m1", Engine: "llamacpp", Class: ClassNormal})
+	if err == nil {
+		t.Fatal("Admit succeeded despite durable queue insert failure")
+	}
+	if got := m.Queue().Len(); got != 0 {
+		t.Fatalf("in-memory queue retained %d request(s) after persistence failure", got)
 	}
 }
 
@@ -209,7 +240,7 @@ func TestAdmit_CannotFit_Queued(t *testing.T) {
 func TestAdmit_CannotFit_RejectWhenCapped(t *testing.T) {
 	q := NewQueue(QueueConfig{Caps: ClassCaps{Interactive: 1, Normal: 1, Background: 1}}, EvictionPolicy{Now: baseTime}.clockAt())
 	// Pre-fill the normal queue to its cap of 1.
-	if err := q.Enqueue(Request{ID: "filler", ModelID: "x", Class: ClassNormal}); err != nil {
+	if _, err := q.Enqueue(Request{ID: "filler", ModelID: "x", Class: ClassNormal}); err != nil {
 		t.Fatal(err)
 	}
 	probe := &countingProbe{vals: []int{1000}}

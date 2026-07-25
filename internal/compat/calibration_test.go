@@ -32,7 +32,7 @@ func TestCalibrationStore_RecordThenObservedPeak(t *testing.T) {
 	ctx := context.Background()
 
 	// No peak yet.
-	if _, ok := store.ObservedPeak("glm-ocr-q8_0"); ok {
+	if _, ok := store.ObservedPeak("glm-ocr-q8_0", 4096, gguf.KVCacheF16); ok {
 		t.Fatal("ObservedPeak on empty store must be ok=false")
 	}
 
@@ -44,7 +44,7 @@ func TestCalibrationStore_RecordThenObservedPeak(t *testing.T) {
 		t.Fatalf("Record: %v", err)
 	}
 
-	mib, ok := store.ObservedPeak("glm-ocr-q8_0")
+	mib, ok := store.ObservedPeak("glm-ocr-q8_0", 4096, gguf.KVCacheF16)
 	if !ok || mib != 1105 {
 		t.Fatalf("ObservedPeak = (%d,%v), want (1105,true)", mib, ok)
 	}
@@ -73,7 +73,7 @@ func TestCalibrationStore_RecordUpsertsNewestWins(t *testing.T) {
 	if err := store.Record(ctx, ObservedPeak{ModelKey: "m", PeakVRAMMiB: 1234, Ctx: 8192, KVType: "q4_0"}); err != nil {
 		t.Fatalf("second Record: %v", err)
 	}
-	mib, ok := store.ObservedPeak("m")
+	mib, ok := store.ObservedPeak("m", 8192, gguf.KVCacheQ4_0)
 	if !ok || mib != 1234 {
 		t.Fatalf("after upsert ObservedPeak = (%d,%v), want (1234,true)", mib, ok)
 	}
@@ -100,11 +100,11 @@ func TestCalibrationStore_RecordRejectsInvalid(t *testing.T) {
 func TestCalibrationStore_ObservedPeakFailSafeOnNilOrMissing(t *testing.T) {
 	// A nil store / nil db must never panic and must report "no calibration".
 	var nilStore *CalibrationStore
-	if _, ok := nilStore.ObservedPeak("x"); ok {
+	if _, ok := nilStore.ObservedPeak("x", 4096, gguf.KVCacheF16); ok {
 		t.Error("nil store must report ok=false")
 	}
 	_, store := openCalibDB(t)
-	if _, ok := store.ObservedPeak(""); ok {
+	if _, ok := store.ObservedPeak("", 4096, gguf.KVCacheF16); ok {
 		t.Error("empty key must report ok=false")
 	}
 }
@@ -132,7 +132,7 @@ func TestVerdictUsesObservedPeak(t *testing.T) {
 	// A TQ3 model gguf-parser cannot parse: absent calibration, the fallback estimate would be
 	// a large file-size heuristic (~14900 MiB). We instead record a measured peak that fits.
 	if err := store.Record(ctx, ObservedPeak{
-		ModelKey: key, PeakVRAMMiB: 10800, Ctx: 8192, KVType: "tq3_0",
+		ModelKey: key, PeakVRAMMiB: 10800, Ctx: 8192, KVType: "f16",
 		GPU: "NVIDIA GeForce RTX 4060 Ti", Driver: "576.40",
 	}); err != nil {
 		t.Fatalf("Record: %v", err)
@@ -186,8 +186,8 @@ func TestVerdictTightensAfterRecording(t *testing.T) {
 	// fallback estimate. We simulate the fallback by intercepting AFTER the store misses.
 	e := NewWithCalibration(store)
 	fallback := gguf.Result{VRAMMiB: 9000, Confidence: gguf.ConfidenceFallback, ParserVersion: gguf.ParserVersion + "+fallback-heuristic"}
-	e.ggufEstimate = func(_ context.Context, _ gguf.Source, _ gguf.Options) (gguf.Result, error) {
-		if mib, ok := store.ObservedPeak(key); ok {
+	e.ggufEstimate = func(_ context.Context, _ gguf.Source, opts gguf.Options) (gguf.Result, error) {
+		if mib, ok := store.ObservedPeak(key, opts.ContextLen, opts.KVCacheType); ok {
 			return gguf.Result{VRAMMiB: mib, Confidence: gguf.ConfidenceExact, ParserVersion: "calibration/observed-peak"}, nil
 		}
 		return fallback, nil
@@ -206,7 +206,7 @@ func TestVerdictTightensAfterRecording(t *testing.T) {
 	}
 
 	// Record a measured peak that is smaller and authoritative.
-	if err := store.Record(ctx, ObservedPeak{ModelKey: key, PeakVRAMMiB: 7000, Ctx: 8192, KVType: "tq3_0"}); err != nil {
+	if err := store.Record(ctx, ObservedPeak{ModelKey: key, PeakVRAMMiB: 7000, Ctx: 8192, KVType: "f16"}); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
 

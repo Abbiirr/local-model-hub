@@ -86,9 +86,15 @@ function EngineCard({ e }: { e: Engine }) {
         </div>
       </div>
 
-      {binaryLabel && <div className={styles.baseUrl}>{binaryLabel}</div>}
+      {binaryLabel && (
+        <div className={styles.baseUrl} title={binaryLabel}>
+          {binaryLabel}
+        </div>
+      )}
       {!binaryLabel && e.base_url && (
-        <div className={styles.baseUrl}>{e.base_url}</div>
+        <div className={styles.baseUrl} title={e.base_url}>
+          {e.base_url}
+        </div>
       )}
 
       {(backends.length > 0 || caps.length > 0) && (

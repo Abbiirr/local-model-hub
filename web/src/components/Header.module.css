@@ -5,22 +5,23 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 10px 16px;
-  padding-top: max(10px, env(safe-area-inset-top));
-  background: rgba(11, 14, 20, 0.9);
-  backdrop-filter: blur(8px);
+  gap: var(--s3);
+  padding: var(--s3) var(--s4);
+  padding-top: max(var(--s3), env(safe-area-inset-top));
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
   border-bottom: 1px solid var(--border);
 }
 
 .brand {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: var(--s2);
   min-width: 0;
 }
 .logo {
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 700;
   letter-spacing: -0.02em;
   color: var(--text);
@@ -28,6 +29,7 @@
 }
 .logo span {
   color: var(--accent);
+  font-weight: 650;
 }
 .ver {
   font-family: var(--mono);
@@ -39,13 +41,13 @@
 .right {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--s3);
   flex-shrink: 0;
 }
 .updated {
   font-size: 11px;
   color: var(--text-faint);
-  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 

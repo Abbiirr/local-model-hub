@@ -88,7 +88,11 @@ func (e *Engine) evaluateGGUF(ctx context.Context, model string, d ModelDescript
 	maxCtx := e.ggufMaxContext(ctx, d, bin, kvType, batch, usable, reqCtx, estReq.VRAMMiB)
 
 	// --- Run flags for the chosen binary. ---
-	flags := ggufRunFlags(d, bin, reqCtx, kvType, kvQuantUsed)
+	// The verdict advertises the DEFAULT full-GPU flags (-ngl all). allow_cpu_offload and speculative
+	// are per-start launch options (StartInstanceRequest), not verdict inputs — the verdict describes
+	// fit under the full-GPU default with no speculative decoding, so it passes allowCPUOffload=false
+	// and SpeculativeOff here. (--spec-type ngram-cache adds ~zero VRAM, so it never changes the fit.)
+	flags := ggufRunFlags(d, bin, reqCtx, kvType, kvQuantUsed, false, SpeculativeOff)
 
 	// --- Build the recommended (llama.cpp) alternative + decide status. ---
 	engineLabel := "llamacpp"
@@ -238,7 +242,7 @@ func (e *Engine) ggufMaxContext(ctx context.Context, d ModelDescriptor, bin Llam
 func (e *Engine) tryGGUFDegrade(ctx context.Context, d ModelDescriptor, bin LlamaBinary, batch int, usable float64, maxCtx, reqVRAM, total, free int, kvQuantUsed bool) (bool, string, []string, int) {
 	// (a) reduced context.
 	if maxCtx >= MinDegradedContext {
-		flags := ggufRunFlags(d, bin, maxCtx, gguf.KVCacheF16, false)
+		flags := ggufRunFlags(d, bin, maxCtx, gguf.KVCacheF16, false, false, SpeculativeOff)
 		reason := fmt.Sprintf("does not fit at the requested context in %.0f MiB usable (%d total × %.2f safety − %d in use), "+
 			"but fits at a reduced %s ctx — runs degraded at the smaller context.",
 			usable, total, SafetyFactor, total-free, ctxLabel(maxCtx))
@@ -254,7 +258,7 @@ func (e *Engine) tryGGUFDegrade(ctx context.Context, d ModelDescriptor, bin Llam
 			ParallelSeq:    batch,
 		})
 		if err == nil && float64(est.VRAMMiB) <= usable {
-			flags := ggufRunFlags(d, bin, defaultRequestedContext, gguf.KVCacheQ4_0, true)
+			flags := ggufRunFlags(d, bin, defaultRequestedContext, gguf.KVCacheQ4_0, true, false, SpeculativeOff)
 			reason := fmt.Sprintf("does not fit with an f16 KV cache, but fits at %s ctx with a quantized KV cache "+
 				"(-ctk/-ctv q4_0, ~%d MiB in %.0f MiB usable) — runs degraded (KV quantization trades a little quality for memory).",
 				ctxLabel(defaultRequestedContext), est.VRAMMiB, usable)

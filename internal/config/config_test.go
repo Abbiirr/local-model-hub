@@ -46,8 +46,37 @@ func TestLoadMergesOverDefaults(t *testing.T) {
 	if cfg.Server.Bind != "127.0.0.1" {
 		t.Errorf("bind = %q, want default 127.0.0.1 (merge over defaults)", cfg.Server.Bind)
 	}
-	if cfg.Engines.Ollama.BaseURL != "http://127.0.0.1:11434" {
-		t.Errorf("ollama base_url = %q, want default", cfg.Engines.Ollama.BaseURL)
+	if cfg.Engines.Ollama.Enabled {
+		t.Error("ollama must be disabled by default after the llama.cpp migration")
+	}
+}
+
+func TestValidateRejectsRetiredOllamaRuntime(t *testing.T) {
+	cfg := Default()
+	cfg.Engines.Ollama.Enabled = true
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() accepted retired Ollama runtime")
+	}
+}
+
+func TestLoadVLLMExtraArgs(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "vllm.yaml")
+	if err := os.WriteFile(p, []byte("engines:\n  vllm:\n    extra_args: [--skip-mm-profiling, --trust-remote-code]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	want := []string{"--skip-mm-profiling", "--trust-remote-code"}
+	if len(cfg.Engines.VLLM.ExtraArgs) != len(want) {
+		t.Fatalf("extra_args = %#v, want %#v", cfg.Engines.VLLM.ExtraArgs, want)
+	}
+	for i := range want {
+		if cfg.Engines.VLLM.ExtraArgs[i] != want[i] {
+			t.Errorf("extra_args[%d] = %q, want %q", i, cfg.Engines.VLLM.ExtraArgs[i], want[i])
+		}
 	}
 }
 
@@ -99,6 +128,10 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		{"bad vllm mode", func(c *Config) { c.Engines.VLLM.Mode = "spawn" }},
 		{"vllm attach without url", func(c *Config) { c.Engines.VLLM.Mode = "attach"; c.Engines.VLLM.AttachURL = "" }},
 		{"bad llamacpp port range", func(c *Config) { c.Engines.LlamaCPP.PortRange = [2]int{500, 100} }},
+		{"gpu temp below sane range", func(c *Config) { c.Residency.MaxGPUTempC = 40 }},
+		{"gpu temp above sane range", func(c *Config) { c.Residency.MaxGPUTempC = 120 }},
+		{"gpu util negative", func(c *Config) { c.Residency.MaxGPUUtilPct = -1 }},
+		{"gpu util over 100", func(c *Config) { c.Residency.MaxGPUUtilPct = 101 }},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -106,6 +139,33 @@ func TestValidateRejectsBadValues(t *testing.T) {
 			tc.mutate(&cfg)
 			if err := cfg.Validate(); err == nil {
 				t.Errorf("Validate() = nil, want error for %s", tc.name)
+			}
+		})
+	}
+}
+
+// TestValidateAcceptsGPUCeilingBoundaries: the disabled sentinel (0) and the inclusive range
+// boundaries for the GPU ceilings must validate cleanly (temp 0/60/100, util 0/100), and the
+// default (temp 87, util 0) already validates via TestDefaultIsValid.
+func TestValidateAcceptsGPUCeilingBoundaries(t *testing.T) {
+	cases := []struct {
+		name string
+		temp int
+		util int
+	}{
+		{"both disabled", 0, 0},
+		{"temp low bound", 60, 0},
+		{"temp high bound", 100, 0},
+		{"util high bound", 0, 100},
+		{"default-ish", 87, 80},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Default()
+			cfg.Residency.MaxGPUTempC = tc.temp
+			cfg.Residency.MaxGPUUtilPct = tc.util
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("Validate() = %v, want nil for temp=%d util=%d", err, tc.temp, tc.util)
 			}
 		})
 	}
@@ -152,5 +212,75 @@ func TestExpandHome(t *testing.T) {
 	}
 	if got := expandHome("/abs/path"); got != "/abs/path" {
 		t.Errorf("expandHome(/abs/path) = %q, want unchanged", got)
+	}
+}
+
+// TestClusterDefaultOff pins the zero-behavioral-change default (ADR-008, cluster-plan §1.3).
+func TestClusterDefaultOff(t *testing.T) {
+	cfg := Default()
+	if cfg.Cluster.Role != "off" {
+		t.Fatalf("default cluster.role = %q, want off", cfg.Cluster.Role)
+	}
+	if cfg.Cluster.HeartbeatIntervalSeconds != DefaultHeartbeatIntervalSeconds {
+		t.Errorf("default heartbeat interval = %d, want %d", cfg.Cluster.HeartbeatIntervalSeconds, DefaultHeartbeatIntervalSeconds)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("default (role=off) must validate: %v", err)
+	}
+}
+
+// TestClusterValidation covers the P7.1 rules (cluster-plan §4.2, §4.4): node needs a coordinator
+// URL + token; any clustered role on a non-loopback bind needs the token; role=off is unconstrained.
+func TestClusterValidation(t *testing.T) {
+	base := func() Config { return Default() } // valid single-box baseline
+
+	tests := []struct {
+		name    string
+		mutate  func(c *Config)
+		wantErr bool
+	}{
+		{"off is unconstrained", func(c *Config) { c.Cluster.Role = "off" }, false},
+		{"invalid role", func(c *Config) { c.Cluster.Role = "leader" }, true},
+		{"node missing coordinator_url", func(c *Config) {
+			c.Cluster.Role = "node"
+			c.Cluster.Token = "tok"
+		}, true},
+		{"node missing token", func(c *Config) {
+			c.Cluster.Role = "node"
+			c.Cluster.CoordinatorURL = "http://127.0.0.1:39921"
+		}, true},
+		{"node complete on loopback", func(c *Config) {
+			c.Cluster.Role = "node"
+			c.Cluster.CoordinatorURL = "http://127.0.0.1:39921"
+			c.Cluster.Token = "tok"
+		}, false},
+		{"coordinator loopback tokenless ok", func(c *Config) {
+			c.Cluster.Role = "coordinator"
+		}, false},
+		{"coordinator non-loopback without token refused", func(c *Config) {
+			c.Server.Bind = "192.168.1.50"
+			c.Server.AllowNonlocal = true
+			c.Cluster.Role = "coordinator"
+		}, true},
+		{"coordinator non-loopback with token ok", func(c *Config) {
+			c.Server.Bind = "192.168.1.50"
+			c.Server.AllowNonlocal = true
+			c.Cluster.Role = "coordinator"
+			c.Cluster.Token = "tok"
+		}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := base()
+			tt.mutate(&cfg)
+			cfg.normalize()
+			err := cfg.Validate()
+			if tt.wantErr && err == nil {
+				t.Errorf("expected validation error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("expected valid config, got: %v", err)
+			}
+		})
 	}
 }

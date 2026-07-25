@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/coder/websocket"
@@ -35,8 +37,18 @@ type wsFrame struct {
 // InsecureSkipVerify on the origin check because a loopback daemon has no meaningful origin
 // allowlist and the browser same-origin policy plus the loopback bind already gate access.
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	// A loopback bind does not stop a hostile page from opening a WebSocket via
+	// the victim's browser. Browser handshakes carry Origin; require it to match.
+	// Clients that omit Origin remain supported.
+	if origin := r.Header.Get("Origin"); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || !strings.EqualFold(u.Host, r.Host) {
+			writeError(w, http.StatusForbidden, "forbidden_origin", "WebSocket origin is not allowed", "Origin must match the LocalHub host")
+			return
+		}
+	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true, // loopback-only daemon; same-origin + bind gate access
+		InsecureSkipVerify: true, // Origin is checked explicitly above.
 	})
 	if err != nil {
 		// Accept already wrote an HTTP error response (e.g. 426 if not an upgrade); nothing
@@ -52,9 +64,29 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	events, unsubscribe := s.svc.Events().Subscribe()
 	defer unsubscribe()
 
-	// Drain incoming control/data frames in the background so pings are answered and a
-	// client close is observed promptly (it cancels ctx via conn.CloseRead).
-	ctx = conn.CloseRead(ctx)
+	// Read inbound frames in the background. A text frame carrying "jsonrpc":"2.0" is a JSON-RPC
+	// request (dispatch it via the shared dispatcher, write the response frame back — P6.3, design
+	// §3.1); any other client frame is ignored (the push channel is server→client only). A read
+	// error / client close cancels rpcCtx, which we propagate to end the push loop below. We cannot
+	// also use conn.CloseRead here — CloseRead spawns its own reader; this loop replaces it.
+	rpcCtx, cancelRead := context.WithCancel(ctx)
+	defer cancelRead()
+	go func() {
+		defer cancelRead()
+		for {
+			typ, data, err := conn.Read(rpcCtx)
+			if err != nil {
+				return // client closed / ctx cancelled / read error: stop reading, end the connection
+			}
+			if typ != websocket.MessageText {
+				continue // JSON-RPC frames are text; ignore binary/control frames here
+			}
+			if _, werr := handleWSFrame(rpcCtx, conn, s.rpc, data, s.logger); werr != nil {
+				return // a response-write failure means the socket is gone; stop
+			}
+		}
+	}()
+	ctx = rpcCtx // the push select-loop below now ends when the reader ends
 
 	// Immediate first hardware snapshot so the UI paints on connect.
 	if !s.wsSendHardware(ctx, conn) {

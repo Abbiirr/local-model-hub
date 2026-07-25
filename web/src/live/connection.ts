@@ -20,12 +20,20 @@ import type { Engine, HardwareSnapshot, ModelSummary } from '../api/types';
 // into this discriminated union. The Phase-1 SSE endpoint /api/hardware/live emits
 // bare hardware snapshots (no `type` field) — we treat an untyped frame that looks
 // like a HardwareSnapshot as `hardware.snapshot`.
+// The server publishes these framed `type` strings over /api/ws (internal/core/events.go). SSE
+// (/api/hardware/live) carries ONLY hardware; every OTHER invalidation arrives over WS, which is why
+// WS is now the default transport (see DEFAULT_LIVE_CONFIG) — an SSE-only client would miss
+// models/instances/downloads/queue/jobs updates and show stale inventory.
 export type LiveEvent =
   | { type: 'heartbeat'; ts?: string }
   | { type: 'hardware.snapshot'; data: HardwareSnapshot }
   | { type: 'models.updated'; data: ModelSummary[] }
   | { type: 'engines.updated'; data: Engine[] }
-  | { type: 'instances.updated' };
+  | { type: 'instances.updated' }
+  | { type: 'queue.update' }
+  | { type: 'jobs.updated' }
+  | { type: 'download.progress' }
+  | { type: 'download.done' };
 
 export type ConnectionState =
   | 'idle'
@@ -66,9 +74,12 @@ export interface LiveConfig {
 }
 
 export const DEFAULT_LIVE_CONFIG: LiveConfig = {
-  // Phase 1: SSE only. The WS server side is a documented later task; flip to
-  // 'auto' (or 'ws') once /api/ws exists per wiring-p15.md.
-  transport: 'sse',
+  // WS is now the default: the Go /api/ws endpoint ships (internal/api/ws.go) and is the ONLY
+  // transport that carries models/instances/downloads/queue/jobs invalidations — SSE
+  // (/api/hardware/live) carries hardware only. A page loaded before the startup scan finishes would,
+  // under SSE, miss models.updated and show stale inventory. 'auto' prefers WS and falls back to SSE
+  // (hardware still flows) if the socket won't upgrade, so there is no regression on WS-less setups.
+  transport: 'auto',
   sseUrl: '/api/hardware/live',
   wsUrl: defaultWsUrl(),
   backoffMs: [1000, 2000, 4000, 8000, 15000, 30000],
@@ -389,6 +400,16 @@ export function parseFrame(raw: unknown): LiveEvent | null {
         return { type: 'engines.updated', data: (rec.data as Engine[]) ?? [] };
       case 'instances.updated':
         return { type: 'instances.updated' };
+      // Signal-only invalidations (no payload; the subscriber refetches the matching REST list).
+      // These arrive over WS only — the SSE hardware stream never carries them.
+      case 'queue.update':
+        return { type: 'queue.update' };
+      case 'jobs.updated':
+        return { type: 'jobs.updated' };
+      case 'download.progress':
+        return { type: 'download.progress' };
+      case 'download.done':
+        return { type: 'download.done' };
       default:
         return null;
     }

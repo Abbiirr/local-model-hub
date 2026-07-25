@@ -258,10 +258,14 @@ func (q *Queue) DepthByClass() (interactive, normal, background int) {
 	return
 }
 
-// Enqueue admits a request to the WAITING set, assigning its seq + enqueuedAt. It returns a
-// *QueueFullError (numeric reason) if the request's class is at capacity — the request is NOT
-// added in that case. The request's Class is clamped to a valid value.
-func (q *Queue) Enqueue(r Request) error {
+// Enqueue admits a request to the WAITING set, assigning its seq + enqueuedAt. It returns the
+// STORED copy (with seq + enqueuedAt populated) so the caller can persist the same FIFO/total-order
+// key the in-memory queue uses — the durable mirror (queue.InsertWaiting) MUST record the assigned
+// seq, or restart/read paths that ORDER BY seq lose FIFO determinism (fix 3: the copy the queue
+// owns held the seq while the caller's original Request stayed seq=0). It returns a *QueueFullError
+// (numeric reason) if the request's class is at capacity — the request is NOT added in that case
+// (the returned Request is then the zero value). The request's Class is clamped to a valid value.
+func (q *Queue) Enqueue(r Request) (Request, error) {
 	if !r.Class.Valid() {
 		r.Class = ClassNormal
 	}
@@ -269,7 +273,7 @@ func (q *Queue) Enqueue(r Request) error {
 	depth := q.classDepth(r.Class)
 	capN := q.cfg.Caps.cap(r.Class)
 	if depth >= capN {
-		return &QueueFullError{
+		return Request{}, &QueueFullError{
 			Class: r.Class, Depth: depth, Cap: capN,
 			ReasonS: fmt.Sprintf(
 				"queue_full: %s queue is at capacity (%d/%d waiting); reject rather than unbounded-buffer — retry after a slot frees",
@@ -277,10 +281,42 @@ func (q *Queue) Enqueue(r Request) error {
 		}
 	}
 	rc := r // copy; the queue owns its items
-	rc.seq = q.nextSeq
+	// seq is 1-based: pre-increment so the FIRST enqueue gets seq=1, never 0. A persisted seq of 0
+	// then unambiguously means "never assigned" (fix 3 — the durable row COALESCEs a missing seq to
+	// 0, so a legitimate first request must not also be 0 or restart ordering can't tell them apart).
 	q.nextSeq++
+	rc.seq = q.nextSeq
 	rc.enqueuedAt = q.clock.Now()
 	q.items = append(q.items, &rc)
+	return rc, nil // return the assigned copy so the caller persists the SAME seq (fix 3)
+}
+
+// Restore re-seeds a request that was durably queued before a daemon restart. Unlike Enqueue it
+// preserves the original sequence and enqueue time and deliberately bypasses today's class caps:
+// a persisted request must never be discarded merely because an operator later lowers a cap.
+// Restore is only for startup recovery; callers must serialize it with other queue operations.
+func (q *Queue) Restore(r Request, seq int64, enqueuedAt time.Time) error {
+	if r.ID == "" {
+		return fmt.Errorf("restore queue request: missing id")
+	}
+	if q.Has(r.ID) {
+		return fmt.Errorf("restore queue request %q: duplicate id", r.ID)
+	}
+	if !r.Class.Valid() {
+		r.Class = ClassFromPriority(r.Priority)
+	}
+	if seq <= 0 {
+		return fmt.Errorf("restore queue request %q: invalid seq %d", r.ID, seq)
+	}
+	if enqueuedAt.IsZero() {
+		return fmt.Errorf("restore queue request %q: missing enqueue time", r.ID)
+	}
+	r.seq = seq
+	r.enqueuedAt = enqueuedAt
+	q.items = append(q.items, &r)
+	if seq > q.nextSeq {
+		q.nextSeq = seq
+	}
 	return nil
 }
 
@@ -292,6 +328,20 @@ func (q *Queue) classDepth(class PriorityClass) int {
 		}
 	}
 	return n
+}
+
+// Has reports whether a WAITING request with the given id is currently in the queue. It is the
+// authoritative "still queued" signal (the in-memory queue owns WAITING; a request leaves it only
+// via Next/Remove). Used by the jobs worker to hold AT MOST ONE live residency row per job (fix 1):
+// while a blocked job's queue_id is still WAITING, the worker skips re-admission (the drain loop
+// owns it) rather than calling Admit again and minting a duplicate WAITING row.
+func (q *Queue) Has(id string) bool {
+	for _, r := range q.items {
+		if r.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // Remove deletes a WAITING request by id (e.g. cancelled via DELETE /api/queue/{id}, or admitted

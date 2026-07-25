@@ -103,7 +103,13 @@ The `queue` table backs a simple WAITING→ADMITTED flow, not a fair scheduler:
 - A blocked low-priority request waits until eviction frees room or a running model exits.
 - `blocked_reason` is always populated and shown in the UI ("waiting: 3.2 GB short,
   no evictable model").
-- No starvation guarantees in v1; document this. If it bites, add simple aging later.
+- **Anti-starvation: superseded by [docs/residency-priority-queue.md](residency-priority-queue.md)
+  (P5.0, Accepted).** The "no starvation guarantees in v1" note above is out of date — the
+  shipped queue provides bounded-wait anti-starvation via age-based class promotion (three
+  classes, size/cost-aware tie-break, bounded coalescing, per-class caps). See that doc for the
+  algorithm, worked examples, and property tests; implementation in
+  `internal/residency/queue.go`. Victim-ordering and the whole-model load/unload posture in the
+  rest of this section still hold.
 
 ## What success looks like
 

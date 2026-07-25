@@ -176,8 +176,8 @@ func TestHandleEnginesAllDisabled(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &views); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if len(views) != 3 {
-		t.Fatalf("engines = %d, want 3 (ollama/llamacpp/vllm)", len(views))
+	if len(views) != 2 {
+		t.Fatalf("engines = %d, want 2 (llamacpp/vllm; ollama is retired)", len(views))
 	}
 	names := map[string]bool{}
 	for _, v := range views {
@@ -189,7 +189,7 @@ func TestHandleEnginesAllDisabled(t *testing.T) {
 			t.Errorf("engine %q has empty reason (non-waivable)", v.Name)
 		}
 	}
-	for _, want := range []string{"ollama", "llamacpp", "vllm"} {
+	for _, want := range []string{"llamacpp", "vllm"} {
 		if !names[want] {
 			t.Errorf("engines response missing %q", want)
 		}

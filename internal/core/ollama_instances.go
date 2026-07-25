@@ -44,13 +44,55 @@ func (s *Service) startOllamaInstance(ctx context.Context, req StartInstanceRequ
 	verdict := s.deps.Compat.Evaluate(ctx, compat.Request{
 		Descriptor: desc, RequestedCtx: reqCtx, Batch: req.Batch, KVQuant: req.KVQuant,
 	}, snap, avail)
-	if err := s.phase4SafetyCheck(verdict, snap); err != nil {
-		return InstanceView{}, err
+
+	// Ollama models carry no local GGUF path (the daemon owns the blob), so the GGUF estimator
+	// returns an "unknown" verdict (empty source). That is not a real incompatibility — Ollama
+	// CAN serve the model — so for the unknown case we substitute a CONSERVATIVE size-based
+	// estimate derived from the catalog row's size_bytes (the on-disk blob size, which for a
+	// GGUF-backed Ollama model is a sound lower bound on the resident VRAM footprint; Ollama
+	// full-offloads by default). This keeps the correctness bar (never a false "runs" that OOMs:
+	// the size-based number over-estimates slightly, and the real size_vram is re-measured at
+	// HEALTHY) while letting a genuinely-fitting Ollama model warm (P6.1 #p61c routing). A
+	// runs/runs_degraded verdict from a real estimate (e.g. the sibling local GGUF was found)
+	// is used as-is. TODO(agent): a pre-warm /api/show probe could tighten this; size_bytes is
+	// the conservative stand-in.
+	if verdict.Status == compat.StatusUnknown {
+		if sizeMiB := s.ollamaSizeEstimateMiB(ctx, req.ModelID); sizeMiB > 0 {
+			verdict.Status = compat.StatusRuns
+			verdict.EstimatedVRAMMiB = sizeMiB
+			verdict.Reason = fmt.Sprintf("Ollama model (no local GGUF to parse); using a conservative "+
+				"size-based estimate of ~%d MiB from the catalog blob size for the admission pre-check. "+
+				"The real VRAM footprint is re-measured from Ollama /api/ps size_vram once resident.", sizeMiB)
+		}
+	}
+
+	// Unified admission (fix 2): the SAME residency gate llama.cpp uses — route_loaded / load_new /
+	// evict_then_load / queue / reject (falling back to the Phase-4 pre-check when residency is off).
+	// admitForStart passes verdict.EstimatedVRAMMiB (here the size-based fallback) as the precomputed
+	// footprint, so admission does NOT re-run the estimator (which would re-derive the unknown Ollama
+	// verdict and reject). Engine-specific warm mechanics below are unchanged.
+	warm, _, aerr := s.admitGate(ctx, req, reqCtx, verdict, snap)
+	if aerr != nil {
+		return InstanceView{}, aerr
+	}
+	if warm != nil {
+		return *warm, nil // already HEALTHY-resident in the Ollama daemon.
 	}
 
 	freeBefore := 0
 	if len(snap.GPUs) > 0 {
 		freeBefore = snap.GPUs[0].VRAMFreeMiB
+	}
+
+	// Layer placement (num_gpu): the FULL-GPU default forces all layers onto the GPU
+	// (ollama.FullGPULayers()), matching the user directive "all full gpu, never offload to cpu" and
+	// aligning Ollama with llama.cpp's -ngl all. NOTE this is a deliberate behavior CHANGE: before
+	// this the warm sent NO options, so the daemon used its dynamic default (num_gpu -1 = auto-split
+	// across GPU+CPU). allow_cpu_offload=true restores that auto-split by sending num_gpu=nil (omitted
+	// → daemon dynamic -1). It changes only the launch option, NOT admission.
+	var numGPU *int
+	if !req.AllowCPUOffload {
+		numGPU = ollama.FullGPULayers()
 	}
 
 	instanceID := uuid.NewString()
@@ -61,6 +103,7 @@ func (s *Service) startOllamaInstance(ctx context.Context, req StartInstanceRequ
 		Pinned:     req.Pin,
 		Priority:   req.Priority,
 		TTLSeconds: s.deps.Cfg.Residency.DefaultTTLSeconds,
+		NumGPU:     numGPU,
 	})
 	if err != nil {
 		s.publishInstanceUpdated()
@@ -84,6 +127,29 @@ func (s *Service) startOllamaInstance(ctx context.Context, req StartInstanceRequ
 	_ = freeBefore // Ollama reports size_vram directly; no post-hoc peak sample needed.
 
 	return instanceToView(inst), nil
+}
+
+// ollamaSizeEstimateMiB returns a CONSERVATIVE VRAM estimate (MiB) for an Ollama model from its
+// catalog size_bytes, or 0 when unknown. The blob size is scaled by a small overhead (weights load
+// ~1:1 into VRAM under Ollama full-offload; the +8% covers the KV cache + CUDA context reserve so
+// the pre-check stays on the safe/over-estimating side of the correctness bar). It is only used to
+// unblock the admission pre-check for an ollama-source model whose GGUF cannot be parsed locally;
+// the authoritative footprint is re-measured from /api/ps size_vram at HEALTHY.
+func (s *Service) ollamaSizeEstimateMiB(ctx context.Context, modelID string) int {
+	if s.deps.DB == nil {
+		return 0
+	}
+	var size sql.NullInt64
+	if err := s.deps.DB.QueryRowContext(ctx,
+		`SELECT size_bytes FROM models WHERE id = ?`, modelID).Scan(&size); err != nil {
+		return 0
+	}
+	if !size.Valid || size.Int64 <= 0 {
+		return 0
+	}
+	const mib = 1024 * 1024
+	// +8% overhead, conservative (over-estimate) to preserve "no false runs that OOMs".
+	return int(float64(size.Int64) * 1.08 / float64(mib))
 }
 
 // SyncOllamaMirror runs one mirror pass (/api/ps → instance rows). Wired at reconcile time and on

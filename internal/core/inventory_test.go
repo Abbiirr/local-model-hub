@@ -90,13 +90,13 @@ func TestRescanOllamaUnreachableDoesNotFailOrMarkMissing(t *testing.T) {
 	}
 }
 
-// TestEnginesSweepReadOnlyDisabled confirms an all-nil registry yields three not-installed
+// TestEnginesSweepReadOnlyDisabled confirms an all-nil registry yields the two supported engines
 // entries each with a reason and makes no external calls.
 func TestEnginesSweepReadOnlyDisabled(t *testing.T) {
 	svc := New(Deps{Cfg: config.Default(), DB: coreTestDB(t)})
 	views := svc.Engines(context.Background())
-	if len(views) != 3 {
-		t.Fatalf("engines = %d, want 3", len(views))
+	if len(views) != 2 {
+		t.Fatalf("engines = %d, want 2 (llamacpp/vllm; ollama is retired)", len(views))
 	}
 	for _, v := range views {
 		if v.Installed || v.Running {

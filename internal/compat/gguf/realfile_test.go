@@ -95,6 +95,39 @@ func TestRealFile_TQ3_Fallback(t *testing.T) {
 	t.Logf("TQ3 notes: %s", joined)
 }
 
+// TestRealFile_LocalParseIsFast is the P6.1 latency regression (fix-agent): a LOCAL GGUF
+// parse+estimate must complete quickly, because evaluateGGUF calls Estimate 4× per Evaluate
+// (requested ctx + 3 ctxCandidates) and StartInstance runs that Evaluate synchronously on the
+// blocked-admission path — the P6.1 gate requires the resulting 503 in <2s. Before the fix a
+// single default ParseGGUFFile took ~2.3s (size-independent buffered reads), so 4 parses ≈ 10s.
+// The fix (parse.go localReadOptions: UseMMap + SkipLargeMetadata) drops a parse to ~30–140ms.
+//
+// This asserts a generous ceiling (well under 2s for ONE Estimate; four fit comfortably in the
+// gate). It skips when the file is absent so a box without the models still tests green. It does
+// NOT re-assert VRAM numbers — the sibling GLM-OCR/embedding tests already pin those, and the fix
+// is byte-identical to the default parse (verified: same VRAM at every ctxCandidate).
+func TestRealFile_LocalParseIsFast(t *testing.T) {
+	skipIfMissing(t, realGLMOCR)
+
+	start := time.Now()
+	_, err := Estimate(context.Background(), LocalFile(realGLMOCR), Options{
+		ContextLen: 8192, FlashAttention: true, NGL: -1, ParallelSeq: 4,
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Estimate(GLM-OCR): %v", err)
+	}
+	// One parse+estimate must be well under 2s. The measured post-fix cost is ~30–140ms; a
+	// 2s ceiling on a SINGLE parse (vs the ~2.3s pre-fix cost that made 4 parses ~10s) is the
+	// regression trip-wire — if it fires, the fast read options were dropped from the local path.
+	if elapsed >= 2*time.Second {
+		t.Fatalf("local GGUF parse+estimate took %s (want < 2s); the mmap/skip-large-metadata read "+
+			"options were likely dropped from parseSource's local path — see parse.go localReadOptions "+
+			"and the P6.1 <2s blocked-admission gate", elapsed)
+	}
+	t.Logf("local GGUF parse+estimate: %s (mmap+skip-large-metadata fast path)", elapsed)
+}
+
 // (e) OPTIONAL remote HF metadata read, guarded by both -short and a network env
 // flag (LOCALHUB_TEST_NETWORK=1). Records against P0.2: bartowski Llama-3.2-1B
 // GGUF was 1798 MiB @8K. Tolerates a CI-less / offline environment by skipping.

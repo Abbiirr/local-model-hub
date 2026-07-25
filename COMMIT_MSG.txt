@@ -1,22 +1,49 @@
-LocalHub Compass v0.1.0-dev: Phases 0-5 (docs handoff -> working product)
+LocalHub Compass v0.1.0-dev: full product (Phases 0-6 + C1) + post-1.0 wave
 
-Phase 0: field validation (friction log, GO_STANDALONE, ADR-003 custom
-residency, ADR-006 Go). Phase 1: read-only daemon + phone-first dashboard
-(nvidia-smi probe, engine detection w/ capability probing, inventory,
-REST/SSE/WS, embedded React UI). Phase 2: compatibility engine
+Core (gates in TESTING.md, evidence in research/):
+Phase 0 field validation (GO_STANDALONE, ADR-003/006). Phase 1 read-only
+daemon + phone-first dashboard (nvidia-smi probe, engine detection,
+inventory, REST/SSE/WS, embedded React UI). Phase 2 compatibility engine
 (gguf-parser-go wrapper + TQ3 fallback, GQA-aware safetensors estimator,
-verdicts w/ mandatory reasons, 21-model validation matrix, zero false
-'runs', measured-peak calibration). Phase 3: supply chain (immutable
-manifests, HF commit pinning + resumable sha256 downloads, ollama pull,
-local import, warn-not-block, reproduce export). Phase 4: run/stop
-(instance state machine + Job Objects + reconciliation, llama.cpp/
-Ollama/vLLM adapters, VRAM-delta-verified stops, real vLLM docker E2E).
-Phase 5: coarse residency (custom priority queue w/ aging + coalescing,
-admission control w/ per-eviction VRAM re-reads, idle-only eviction,
-load-storm testing).
+verdicts w/ mandatory reasons, 21-model matrix, zero false 'runs',
+measured-peak calibration). Phase 3 supply chain (immutable manifests, HF
+commit pinning, resumable sha256 downloads, ollama pull, local import,
+reproduce export, over-cap deletion). Phase 4 run/stop (state machine +
+Job Objects + reconciliation, llama.cpp/Ollama/vLLM adapters,
+VRAM-delta-verified stops, vLLM docker E2E). Phase 5 coarse residency
+(custom priority queue w/ aging + coalescing + persisted seq, admission w/
+per-eviction VRAM re-reads, idle-only eviction, never-kill-active proven
+live incl. non-pinned streams, load storms). Phase 6 thin OpenAI proxy
+(byte-passthrough streaming, fast-503 w/ numeric reasons, warm-route
+self-shadow fix), durable async jobs (restart-safe, WS events, honest
+cancel), JSON-RPC 2.0 over HTTP+WS (18 methods, spec-compliant framing).
+C1 master gate walked on real hardware.
 
-Engine behavior citations: Ollama api.md, docs.vllm.ai, gguf-parser-go
-v0.24.1 (all re-verified 2026-07-06; see docs/decisions.md revalidation
-log and research/ evidence files).
+Post-1.0 wave (TODO.md X1-X7 + P7.1-P7.2):
+Security: enforced admin_token bearer middleware; relay path allow-list.
+Admission guards: RAM floor (min_free_ram_mib), GPU temp/util ceilings
+(gpu_hot/gpu_busy reasons), unified Ollama/vLLM admission via admitGate.
+Full-GPU default (llama.cpp -ngl all, Ollama num_gpu forced) with
+allow_cpu_offload opt-in end-to-end incl. UI toggle + MoE -ncmoe with
+metadata-derived sizing. Speculative decoding opt-in (ngram-cache).
+gemma-4 iSWA KV underpricing corrected (conservative floor, hand-verified
+numbers). Estimator hot path mmap fix (blocked-503 ~10s -> ~1.4s). UI:
+minimal redesign, Run-per-row, fit-annotated picker, WS-default live
+transport, queued-start surfacing, mobile overflow fixes. Six-model live
+campaign 6/6 (gemma-12B ran 49/49 layers on GPU; honest refusals for
+ASR/OCR/60GB-BF16/version-gated Ollama/vLLM-GGUF; residency drill all
+PASS). Cluster (ADR-008, LAN federation, docs/cluster-plan.md): P7.1 node
+identity + join/heartbeat + soft-state registry; P7.2 aggregated
+node-attributed views w/ partial-failure semantics. P7.3-P7.5 + remaining
+live demos specified in docs/future-work.md (work stopped by owner
+2026-07-08 in favor of docs).
+
+Three Codex review cycles: 15 findings total, all triaged and fixed with
+tests. Suites at close: go vet/build/test ./... fully green; web 79/79
+vitest; dist embedded fresh.
+
+Engine behavior citations: Ollama api docs, docs.vllm.ai, gguf-parser-go
+v0.24.1, local llama-server b8833 --help dumps (re-verified 2026-07-06/08;
+see docs/decisions.md revalidation log + docs/18 + research/ evidence).
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>

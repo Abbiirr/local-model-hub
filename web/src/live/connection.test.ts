@@ -77,6 +77,18 @@ describe('parseFrame', () => {
     );
   });
 
+  // FINDING-6 gate: the server publishes queue/jobs/download invalidations over /api/ws
+  // (internal/core/events.go). parseFrame must recognize each so the subscriber can refetch — an
+  // unrecognized frame is dropped and the UI goes stale.
+  it('parses the WS-only invalidation frames (queue/jobs/downloads)', () => {
+    expect(parseFrame({ type: 'queue.update' })?.type).toBe('queue.update');
+    expect(parseFrame({ type: 'jobs.updated' })?.type).toBe('jobs.updated');
+    expect(parseFrame({ type: 'download.progress' })?.type).toBe(
+      'download.progress',
+    );
+    expect(parseFrame({ type: 'download.done' })?.type).toBe('download.done');
+  });
+
   it('ignores SSE comments, blanks, and junk', () => {
     expect(parseFrame(':keep-alive')).toBeNull();
     expect(parseFrame('')).toBeNull();
@@ -265,11 +277,24 @@ class FakeWebSocket {
   close() {
     this.closed = true;
   }
+  emitOpen() {
+    this.onopen?.(new Event('open'));
+  }
+  emitMessage(data: unknown) {
+    this.onmessage?.(
+      new MessageEvent('message', {
+        data: typeof data === 'string' ? data : JSON.stringify(data),
+      }),
+    );
+  }
   emitError() {
     this.onerror?.(new Event('error'));
   }
   static reset() {
     FakeWebSocket.instances = [];
+  }
+  static get last(): FakeWebSocket {
+    return FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
   }
 }
 
@@ -309,6 +334,39 @@ describe('LiveConnection auto transport WS→SSE fallback', () => {
     FakeEventSource.last.emitOpen();
     expect(conn.getStatus().state).toBe('connected');
     expect(conn.getStatus().transport).toBe('sse');
+    conn.stop();
+  });
+
+  // FINDING-6 gate: a WS connection must deliver each new invalidation frame type to onEvent
+  // subscribers (queue/jobs/downloads) — these ride WS only, so dropping them leaves stale UI.
+  it('dispatches each WS invalidation frame type to onEvent', () => {
+    const conn = new LiveConnection({ transport: 'ws', stallTimeoutMs: 0 });
+    const events: LiveEvent[] = [];
+    conn.onEvent((e) => events.push(e));
+    conn.start();
+    FakeWebSocket.last.emitOpen();
+    expect(conn.getStatus().transport).toBe('ws');
+
+    for (const type of [
+      'models.updated',
+      'instances.updated',
+      'queue.update',
+      'jobs.updated',
+      'download.progress',
+      'download.done',
+    ]) {
+      FakeWebSocket.last.emitMessage(
+        type === 'models.updated' ? { type, data: [] } : { type },
+      );
+    }
+    expect(events.map((e) => e.type)).toEqual([
+      'models.updated',
+      'instances.updated',
+      'queue.update',
+      'jobs.updated',
+      'download.progress',
+      'download.done',
+    ]);
     conn.stop();
   });
 });

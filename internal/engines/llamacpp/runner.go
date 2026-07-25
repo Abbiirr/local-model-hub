@@ -207,6 +207,7 @@ func (r *Runner) Start(ctx context.Context, spec StartSpec) (instances.Instance,
 	}); err != nil {
 		_ = p.Kill()
 		r.failStart(ctx, spec.InstanceID, port, logFile, "state error: "+err.Error(), ring)
+		r.live.remove(spec.InstanceID)
 		return instances.Instance{}, err
 	}
 

@@ -145,3 +145,35 @@ func TestStopInstance_DispatchesToRunner(t *testing.T) {
 		t.Errorf("runner.Stop not called with id; got %q", fr.stopped)
 	}
 }
+
+// TestEngineForModelSource is the FINDING-2 routing gate: with req.Engine=="" the engine is inferred
+// from the model's SOURCE and FORMAT (ADR-002/ADR-004): a safetensors row must default to vLLM (not
+// fall through to llama.cpp, which then produces a non-GGUF error), a gguf row to llama.cpp, and an
+// ollama-source row to Ollama.
+func TestEngineForModelSource(t *testing.T) {
+	d := coreTestDB(t)
+	seed := func(id, source, format string) {
+		if _, err := d.Exec(`INSERT INTO models (id, display_name, source, format) VALUES (?,?,?,?)`,
+			id, id, source, format); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+	seed("st1", "huggingface", "safetensors")
+	seed("pt1", "huggingface", "pytorch")
+	seed("gg1", "local_path", "gguf")
+	seed("ol1", "ollama", "ollama")
+
+	svc := New(Deps{DB: d})
+	cases := []struct{ id, want string }{
+		{"st1", string(instances.EngineVLLM)},
+		{"pt1", string(instances.EngineVLLM)},
+		{"gg1", string(instances.EngineLlamaCPP)},
+		{"ol1", string(instances.EngineOllama)},
+		{"missing", string(instances.EngineLlamaCPP)}, // unknown row → safe llama.cpp default
+	}
+	for _, c := range cases {
+		if got := svc.engineForModelSource(context.Background(), c.id); got != c.want {
+			t.Errorf("engineForModelSource(%q) = %q, want %q", c.id, got, c.want)
+		}
+	}
+}

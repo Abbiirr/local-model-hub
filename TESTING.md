@@ -207,6 +207,19 @@ P45 session if still feasible); streaming byte-passthrough verified (SSE chunks
 unmodified); blocked admission → fast 503 + blocked_reason (measured <2s); grep-level
 audit confirms no budgets/keys/fallback/multi-provider code. Phase 6 close gate.
 
+STATUS 2026-07-07: **PASS** — evidence research/phase-6-live-gates.md (+ Amendment).
+/v1/models OpenAI list shape (10 GGUF models; Ollama model appears once daemon up);
+llama.cpp real: cold start streamed 12 chunks + [DONE] raw passthrough, warm 1617ms/35
+chunks; Ollama real: 200 via sam860/deepseek-r1-0528-qwen3:8b (relay rewrites model→tag
+for Ollama only; three pre-existing routing defects fixed + unit-tested); vLLM via stub
+(Agent A unit tests). Blocked→503: initially ~10s (gguf-parser 4×~2.7s CPU parse before
+Admit); fixed via mmap+SkipLargeMetadata on local parse (byte-identical estimates,
+TestRealFile_EvaluateUnder2s) → live 1.36–1.54s over 8 trials incl. first-call, numeric
+blocked_reason preserved. Byte-identity: bytes.Equal capture-and-diff vs httptest fake
+upstream (Agent A) + live chunk-shape check. Grep audit of internal/proxy: only
+disclaimer-comment hits. In-flight counting through the proxy closes the P5 gap
+(ActiveCount asserted in tests; eviction skips active). Full suite green (18 pkgs).
+
 ## P62
 
 Criteria: submit async job → id returned immediately; result retrievable by poll AND
@@ -215,6 +228,16 @@ delivered over WebSocket subscription; cancellation works mid-queue and mid-infe
 jobs still present and runnable; all failure states carry reasons. Integration test
 against a real small llama.cpp model within safeguards.
 
+STATUS 2026-07-07: **PASS** — evidence research/phase-6-live-gates.md. Real llama.cpp
+1B: submit → 201 {id,queued} in 102ms; poll reached succeeded with full OpenAI
+result_json; WS jobs.updated frames queued→running→succeeded captured on /api/ws with
+pushes flowing alongside. Cancel mid-queue: 200 cancelled, reason non-empty. Restart
+with same DB: queued job survived and remained runnable; running→failed with reason
+"daemon restarted mid-inference" (live via seeded running row — a 1B finishes <1s so
+mid-run kill timing is impractical; path also unit-tested by Agent A). Reasons asserted
+non-empty on every failed/cancelled row (unit). ReconcileJobs runs at boot before the
+worker (main.go wiring).
+
 ## P63
 
 Criteria: JSON-RPC 2.0 compliance (id echo, error codes, batch requests) verified by
@@ -222,13 +245,88 @@ tests; method coverage mirrors REST core (hardware/engines/models/compat/instanc
 residency/jobs); works over both HTTP POST and WebSocket; no business logic duplicated
 (code review confirms thin-transport rule from PLAN.md decision 7).
 
+STATUS 2026-07-07: **PASS** — internal/jsonrpc: 13 test functions green (id echo table
+incl. present-null vs absent-id notification; -32700/-32600(+empty batch)/-32601/
+-32602/-32000 with data.reason; mixed batch 2 req + 1 notif → exactly 2 responses;
+method coverage asserts all 18 methods reach core). Thin-transport verified
+structurally (TestPackageImportsOnlyCoreAndStdlib: imports = core + stdlib only).
+Live (research/phase-6-live-gates.md): POST /api/rpc 200 with id echo; WS parity —
+same method over a WS frame returns the same result, notification produces no response
+frame, non-RPC frames ignored, pushes keep flowing; jobs.submit over RPC created a real
+job (coreJobService shim proven); batch over HTTP → 2 responses. Codex findings on the
+fragments (id:null semantics, -32700 for malformed single) fixed with tests.
+
 ## C1
 
 Criteria: five master success criteria walked and evidenced on this box; docs/18
 updated (dated); changelog + known-limitations written; final code-review sweep clean of
 blocking findings; all phase gates PASS recorded.
 
+STATUS 2026-07-07: **PASS (agent-side complete; master #4 pending C2 user check)** —
+evidence research/c1-verification-walk.md + research/phase-6-live-gates.md (+Amendment).
+Master criteria: #1 inventory+verdicts PASS (3 verdicts w/ reason+vram+ctx+flags, incl.
+wont_run cross-checked vs live free VRAM and TQ3 fallback); #2 live evict-then-load PASS
+(NVML re-read freed_measured=2311, no OOM); #3 never-kill-active PASS with the audit's
+missing live proof closed — a NON-pinned stream survived a temporally-overlapping
+eviction protected purely by InFlightTracker ActiveCount (7511 chunks + [DONE] intact);
+#4 phone-over-Tailscale BLOCKED-user (all agent-side prep done; closes under C2);
+#5 manifests PASS (live local_import manifest + reproduce export with hashes).
+All 7 non-waivable gates re-confirmed PASS (localhost binds verified via netstat incl.
+child llama-servers; no conversion path; no preemption; reasons on proxy 503 / job
+failure / JSON-RPC data.reason). Docs: docs/18 dated 2026-07-07, CHANGELOG.md +
+KNOWN-LIMITATIONS.md written, api-spec/architecture/security/README synced. Code review:
+three Codex sweeps this cycle (pre-P6, post-integration, final) — 15 findings total, all
+triaged and fixed with tests (incl. P1 auth enforcement, P1 job queue-row leak, P1
+over-cap download cleanup, unified Ollama/vLLM admission, RAM floor
+residency.min_free_ram_mib, format-based safetensors→vLLM routing, WS-default dashboard).
+Suites at close: go vet/build/test ./... green (18 pkgs); web 66/66 vitest; web/dist
+rebuilt for go:embed.
+
 ## C2
 
-MANUAL(user): git init + initial commit; phone dashboard confirmation; sign-off on
+MANUAL(user): initial commit (repo already git-initialized, local-only — run
+`git add -A && git commit -F COMMIT_MSG.txt`); phone dashboard confirmation; sign-off on
 PLAN.md#decisions (ADR-006 Go, vLLM strategy, Phase 0 GO, model budget).
+
+## P71
+
+Criteria (two-daemon rig on this box — coordinator + node on separate ports, disjoint
+scratch DBs): node with cluster.role=node joins the coordinator (push join + heartbeat,
+one idempotent upsert); GET /api/cluster/nodes shows the node with last_seen/status;
+kill the node → status degrades within one heartbeat interval; restart coordinator →
+registry rebuilt from heartbeats (soft state). cluster.role=off (default) is
+byte-identical to 1.0: full suite green + a regression test proving no new routes/fields
+leak when off. cluster_token validation trio per docs/cluster-plan.md when non-loopback.
+
+## P72
+
+Criteria: coordinator /api/cluster/models + /api/cluster/hardware fan out to all UP
+nodes and aggregate with node attribution; coordinator /v1/models returns the
+union-deduped runnable set; a dead node yields partial results with an explicit
+partial/degraded marker, never a hang or hard failure (rig: kill one daemon mid-query).
+
+## P73
+
+Criteria (money milestone): POST /v1/chat/completions on the coordinator routes to the
+correct node by placement policy (already-warm > has-model-on-disk > runs beats
+runs_degraded > most-free-VRAM > round-robin — divergence created via disjoint
+model_dirs + different vram_budget_mib on the rig); streaming byte-passthrough via the
+existing relay; block reasons propagate with node-name prefixes; a request for a model
+no node has → 404 with reason listing per-node status.
+
+## P74
+
+Criteria: coordinator subscribes to each node /api/ws and republishes {node_id, event}
+frames on its own /api/ws (rig: instance start on the node produces node-attributed
+instances.updated on the coordinator socket); jobs submitted to the coordinator are
+placed and forwarded, job record durable on the OWNING node (coordinator restart does
+not lose it; node restart honors the node's own ReconcileJobs semantics).
+
+## P75
+
+Criteria: with cluster.role != off AND a non-loopback bind, startup REFUSES unless the
+cluster token trio (per docs/cluster-plan.md §security) is configured — validation-time
+error with a clear reason; negative-auth tests (wrong/missing token → 401 on every
+cluster endpoint incl. WS join); token rotation runbook documented; dev-endpoint
+allow-list audit extended to the coordinator relay (never forwards vLLM dev endpoints
+cross-node); Tailscale cluster guide in examples/.

@@ -91,6 +91,7 @@ func (d *Downloader) DownloadHF(ctx context.Context, info RepoInfo, files []stri
 		DownloadedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 
+	var primaryWeightSize int64 = -1
 	for i, f := range selected {
 		dest, err := SafeJoin(d.DestRoot, hfLocalRel(info.Repo, f.Path))
 		if err != nil {
@@ -103,8 +104,9 @@ func (d *Downloader) DownloadHF(ctx context.Context, info RepoInfo, files []stri
 		}
 		m.Files = append(m.Files, File{Path: f.Path, SHA256: res.SHA256, SizeBytes: res.SizeBytes})
 		// Record the primary local path + format/quant from the biggest weight file.
-		if isWeightFile(f.Path) && (m.LocalPath == "" || res.SizeBytes > 0) {
+		if isWeightFile(f.Path) && res.SizeBytes > primaryWeightSize {
 			m.LocalPath = res.Path
+			primaryWeightSize = res.SizeBytes
 			m.Format = formatFromExt(f.Path)
 			if q := quantFromName(f.Path); q != "" {
 				m.Quantization = q
@@ -142,15 +144,22 @@ func (d *Downloader) DownloadGGUFURL(ctx context.Context, req GGUFURLRequest, pr
 	if err != nil {
 		return nil, err
 	}
-	// Size unknown up front (no metadata) → the hard cap is enforced during/after by the disk,
-	// but we still can't precheck. Proceed; the fetcher streams and ctx can cancel.
-	res, err := d.Fetcher.Fetch(ctx, req.URL, dest, "", prog, 1, 1)
+	// Size is unknown up front, so FetchWithLimit enforces the hard cap while
+	// streaming; an arbitrary URL cannot fill the model volume before cleanup.
+	res, err := d.Fetcher.FetchWithLimit(ctx, req.URL, dest, "", prog, 1, 1, d.Guard.hardCap())
 	if err != nil {
 		return nil, fmt.Errorf("download %s: %w", name, err)
 	}
-	// Post-hoc hard-cap check (defensive): if the downloaded file blew the cap, flag it.
+	// Defensive backstop for future fetcher changes: the streaming limiter above
+	// should make this unreachable.
 	if res.SizeBytes > d.Guard.hardCap() {
-		return nil, fmt.Errorf("downloaded %s exceeds the %s hard cap (%s); removing", name, humanBytes(d.Guard.hardCap()), humanBytes(res.SizeBytes))
+		reason := fmt.Sprintf("downloaded %s exceeds the %s hard cap (%s)", name, humanBytes(d.Guard.hardCap()), humanBytes(res.SizeBytes))
+		if rmErr := os.Remove(res.Path); rmErr != nil {
+			// Removal failed → be honest: the over-cap file is STILL on disk. Surface both facts so the
+			// operator can free it manually (we do not want a reason that lies about cleanup).
+			return nil, fmt.Errorf("%s; failed to remove the over-cap file %s: %v (delete it manually to reclaim disk)", reason, res.Path, rmErr)
+		}
+		return nil, fmt.Errorf("%s; removed the over-cap file", reason)
 	}
 	m := &Manifest{
 		ID:           newUUID(),

@@ -5,42 +5,57 @@
 :root {
   color-scheme: dark;
 
-  /* palette — near-black slate, cool accents */
-  --bg: #0b0e14;
-  --bg-raised: #121722;
-  --bg-panel: #151b28;
-  --bg-hover: #1b2333;
-  --border: #232c3d;
-  --border-strong: #33405a;
+  /* ── Palette ────────────────────────────────────────────────────────────
+     Near-black slate with subtle layering. Surfaces are separated by tone and
+     hairline dividers rather than boxed borders. One accent (blue) — reserved
+     for live/health signals; status greens/ambers/reds are semantic only. */
+  --bg: #0a0c11;          /* page */
+  --bg-raised: #101420;   /* insets: inputs, chips, code, stat tiles */
+  --bg-panel: #0e121b;    /* panel surface — barely lifted off the page */
+  --bg-hover: #161c29;
+  --border: #1b2130;      /* hairline — near-invisible, structural only */
+  --border-strong: #2a3349;
 
-  --text: #d7deea;
+  --text: #e4e9f2;
   --text-dim: #9aa6bc;
-  --text-faint: #6b768c;
+  --text-faint: #616c82;
 
-  --accent: #4f93ff;
+  --accent: #5b9dff;
   --accent-dim: #2b5aa0;
+  --accent-bg: rgba(91, 157, 255, 0.12);
 
   /* status */
-  --ok: #35c98a;
-  --ok-bg: rgba(53, 201, 138, 0.14);
+  --ok: #3fd39a;
+  --ok-bg: rgba(63, 211, 154, 0.13);
   --warn: #e8b13a;
-  --warn-bg: rgba(232, 177, 58, 0.14);
-  --crit: #ef5f6b;
-  --crit-bg: rgba(239, 95, 107, 0.14);
+  --warn-bg: rgba(232, 177, 58, 0.13);
+  --crit: #f26a75;
+  --crit-bg: rgba(242, 106, 117, 0.13);
   --neutral: #7c8aa5;
-  --neutral-bg: rgba(124, 138, 165, 0.14);
+  --neutral-bg: rgba(124, 138, 165, 0.12);
 
   --mono: ui-monospace, "Cascadia Code", "SF Mono", "JetBrains Mono", Menlo,
     Consolas, "Liberation Mono", monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
     "Noto Sans", sans-serif;
 
-  --radius: 10px;
-  --radius-sm: 6px;
-  --gap: 12px;
-  --pad: 14px;
+  /* ── Rhythm — 4/8px scale ─────────────────────────────────────────────── */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
 
-  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 4px 16px rgba(0, 0, 0, 0.25);
+  --radius: 12px;
+  --radius-sm: 7px;
+  --gap: 12px;
+  --pad: 18px;
+
+  /* Panels rest on the page with the faintest elevation, not a hard box. */
+  --shadow: 0 1px 0 rgba(255, 255, 255, 0.02) inset,
+    0 1px 2px rgba(0, 0, 0, 0.3);
+  --focus: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent-dim);
 }
 
 * {
@@ -60,7 +75,7 @@ body {
   color: var(--text);
   font-family: var(--sans);
   font-size: 14px;
-  line-height: 1.45;
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
   overflow-x: hidden;
@@ -70,8 +85,8 @@ h1,
 h2,
 h3 {
   margin: 0;
-  font-weight: 600;
-  letter-spacing: -0.01em;
+  font-weight: 650;
+  letter-spacing: -0.015em;
 }
 
 a {
@@ -86,7 +101,29 @@ button {
 code,
 .mono {
   font-family: var(--mono);
-  font-size: 0.92em;
+  font-size: 0.9em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Metrics and any element that opts in reads as instrument type. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Consistent, visible keyboard focus everywhere (quality floor). */
+:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+  border-radius: var(--radius-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
 }
 
 ::-webkit-scrollbar {

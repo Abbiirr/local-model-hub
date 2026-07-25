@@ -16,9 +16,7 @@ hardware:
   poll_interval_seconds: 1
 
 engines:
-  ollama:
-    enabled: true
-    base_url: "http://127.0.0.1:11434"
+  # Ollama is retired as a runtime. Use direct GGUF downloads/imports with llama.cpp.
   llamacpp:
     enabled: true
     binary_path: "llama-server"
@@ -28,6 +26,7 @@ engines:
     binary_path: "vllm"
     port_range: [40201, 40300]
     default_gpu_memory_utilization: 0.90
+    extra_args: []                 # vLLM engine flags, e.g. ["--skip-mm-profiling"]
 
 compatibility:
   safety_factor: 0.92
@@ -43,6 +42,14 @@ residency:
   drain_timeout_seconds: 300     # user-stop of a busy instance drains up to this, then stops
   drain_interval_seconds: 10     # periodic re-admit tick: auto-start queued requests when room frees
   vram_budget_mib: 0             # 0 = use real free VRAM; >0 caps VRAM our instances may occupy
+  min_free_ram_mib: 2048         # RAM floor: refuse a new process/warm below this free system RAM
+                                 # (RAM binds before VRAM on a small-RAM box; ram_blocked reason like
+                                 # VRAM shortages; global guard, no RAM-based eviction; 0 disables). fix 4.
+  max_gpu_temp_c: 87             # GPU-temp ceiling: don't start/warm above this core temp (gpu_hot; drain
+                                 # re-admits once it cools). RTX 4060 Ti max 90C, throttles ~83C; admission-
+                                 # time guard only (running models never killed). 0 disables or 60..100.
+  max_gpu_util_pct: 0            # GPU-util ceiling: 0 = disabled. Set e.g. 80 for a gaming/render box to make
+                                 # loads wait for the GPU to be mostly free (gpu_busy; drain re-admits). 0..100.
   queue:                         # custom priority-queue tuning (docs/residency-priority-queue.md)
     age_promote_normal_seconds: 60
     age_promote_background_seconds: 120
@@ -51,7 +58,19 @@ residency:
     cap_normal: 256
     cap_background: 512
 
+jobs:
+  enabled: true                  # P6.2 async inference jobs worker (default true)
+
 security:
   strict_model_artifact_mode: false
   warn_on_pickle: true
   warn_on_trust_remote_code: true
+
+cluster:                       # P7.1 LAN federation (ADR-008, docs/cluster-plan.md). OPT-IN, off by default.
+  role: "off"                  # off (byte-identical to single-box 1.0) | coordinator | node
+  coordinator_url: ""          # node mode: URL of the coordinator to join
+  cluster_token: ""            # shared cluster bearer, distinct from admin_token; required for node role
+                               # and mandatory for any clustered role on a non-loopback bind
+  node_name: ""                # human label (defaults to the OS hostname)
+  advertise_url: ""            # node mode: how the coordinator reaches this node back (empty => bind:port)
+  heartbeat_interval_seconds: 10

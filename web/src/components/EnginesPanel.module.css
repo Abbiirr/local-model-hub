@@ -1,35 +1,42 @@
+/* Engines are hairline-separated rows on the panel surface, not nested boxes. */
 .list {
   display: grid;
-  gap: 10px;
 }
 
 .card {
-  background: var(--bg-raised);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 11px 12px;
+  padding: var(--s4) 0;
+}
+.card:first-child {
+  padding-top: 0;
+}
+.card:last-child {
+  padding-bottom: 0;
+}
+.card + .card {
+  border-top: 1px solid var(--border);
 }
 .cardUnreachable {
-  border-color: rgba(232, 177, 58, 0.25);
 }
 .cardMissing {
-  opacity: 0.85;
+  opacity: 0.6;
 }
 
 .head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 6px;
+  gap: var(--s2);
+  margin-bottom: var(--s2);
 }
 .name {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: var(--s2);
+  min-width: 0;
 }
 .name h3 {
   font-size: 14px;
+  letter-spacing: -0.01em;
 }
 .version {
   font-family: var(--mono);
@@ -38,15 +45,19 @@
 }
 .badges {
   display: flex;
-  gap: 6px;
+  gap: var(--s1);
   flex-wrap: wrap;
   justify-content: flex-end;
 }
 
+/* Long binary path / base URL: mono, truncated to one line (full value in the
+   element title on the row). */
 .baseUrl {
   font-family: var(--mono);
   font-size: 11px;
   color: var(--text-dim);
-  margin: 4px 0 6px;
-  word-break: break-all;
+  margin: var(--s1) 0 var(--s2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

@@ -15,8 +15,15 @@ import {
 export interface UseLiveResult {
   hardware: HardwareSnapshot | null;
   status: ConnectionStatus;
-  /** increments whenever the server signals models/engines/instances changed (for refetch). */
-  invalidations: { models: number; engines: number; instances: number };
+  /** increments whenever the server signals the matching resource changed (for refetch). */
+  invalidations: {
+    models: number;
+    engines: number;
+    instances: number;
+    queue: number;
+    jobs: number;
+    downloads: number;
+  };
 }
 
 export function useLive(cfg?: Partial<LiveConfig>): UseLiveResult {
@@ -32,6 +39,9 @@ export function useLive(cfg?: Partial<LiveConfig>): UseLiveResult {
     models: 0,
     engines: 0,
     instances: 0,
+    queue: 0,
+    jobs: 0,
+    downloads: 0,
   });
 
   // Stable config across renders; only the first value is used (connection is
@@ -54,6 +64,16 @@ export function useLive(cfg?: Partial<LiveConfig>): UseLiveResult {
           break;
         case 'instances.updated':
           setInvalidations((v) => ({ ...v, instances: v.instances + 1 }));
+          break;
+        case 'queue.update':
+          setInvalidations((v) => ({ ...v, queue: v.queue + 1 }));
+          break;
+        case 'jobs.updated':
+          setInvalidations((v) => ({ ...v, jobs: v.jobs + 1 }));
+          break;
+        case 'download.progress':
+        case 'download.done':
+          setInvalidations((v) => ({ ...v, downloads: v.downloads + 1 }));
           break;
         case 'heartbeat':
           break;
