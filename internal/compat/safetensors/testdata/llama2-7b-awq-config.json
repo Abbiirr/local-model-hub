@@ -1,0 +1,20 @@
+{
+  "architectures": ["LlamaForCausalLM"],
+  "model_type": "llama",
+  "hidden_size": 4096,
+  "intermediate_size": 11008,
+  "num_hidden_layers": 32,
+  "num_attention_heads": 32,
+  "num_key_value_heads": 32,
+  "vocab_size": 32000,
+  "max_position_embeddings": 4096,
+  "torch_dtype": "float16",
+  "tie_word_embeddings": false,
+  "quantization_config": {
+    "quant_method": "awq",
+    "bits": 4,
+    "group_size": 128,
+    "version": "gemm",
+    "zero_point": true
+  }
+}

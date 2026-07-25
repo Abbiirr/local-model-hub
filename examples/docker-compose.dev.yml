@@ -1,0 +1,12 @@
+services:
+  localhub:
+    image: localhub-dev:latest
+    build: ..
+    network_mode: host
+    volumes:
+      - ./config.example.yaml:/app/config.yaml:ro
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      - ~/models:/models
+    environment:
+      - LOCALHUB_CONFIG=/app/config.yaml
+    # For NVIDIA GPU metrics in containerized development, configure NVIDIA Container Toolkit.

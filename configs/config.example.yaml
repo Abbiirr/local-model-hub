@@ -1,0 +1,91 @@
+# LocalHub Compass — example configuration.
+#
+# Every value here is also the built-in default (internal/config.Default), so the daemon
+# runs on the reference box (Windows 10, RTX 4060 Ti, Ollama on 127.0.0.1:11434) with NO
+# config file at all. Copy this to configs/config.yaml and edit to override.
+#
+# Kept in sync with examples/config.example.yaml. Fields new to P1.1 (allow_nonlocal,
+# llamacpp.binary_paths, vllm.mode/attach_url, logging.*) are documented inline.
+
+server:
+  bind: "127.0.0.1"          # loopback only. Non-loopback binds hard-fail unless allow_nonlocal.
+  port: 39876
+  admin_token: null          # optional single bearer token for LAN/headless use
+  trust_tailscale_headers: true
+  # DANGEROUS: allow binding off 127.0.0.1. LocalHub can free/allocate GPU memory and stop
+  # model processes; off-loopback exposes admin controls with no auth by default. Leave false.
+  allow_nonlocal: false
+
+data:
+  db_path: "./localhub.db"
+  model_dirs:
+    - "K:\\projects\\llm_models\\models"
+  # Where the daemon writes runtime artifacts it owns: per-instance engine log files
+  # (P4.2, size-capped). Empty => a "logs" dir beside the DB file.
+  data_dir: ""
+
+hardware:
+  nvidia: true
+  rocm: false
+  poll_interval_seconds: 1
+
+engines:
+  ollama:
+    enabled: true
+    base_url: "http://127.0.0.1:11434"
+    # How often the /api/ps -> instances mirror runs (P4.3), seconds. Default 10.
+    mirror_interval_seconds: 10
+  llamacpp:
+    enabled: true
+    binary_path: "llama-server"   # winget llama-server on PATH (primary candidate)
+    # additional ordered fallbacks; the CUDA fork build (fork-only flags — verify per adapter):
+    binary_paths:
+      - "K:\\projects\\llm_models\\llama.cpp-tq3\\build\\bin\\llama-server.exe"
+    # Directories prepended to PATH when probing/spawning the EXPLICIT-path (absolute)
+    # candidates above, so their runtime DLLs resolve. The CUDA fork needs the CUDA v12.5
+    # bin dir on PATH to load its CUDA DLLs at --version probe time. Applied only to
+    # absolute-path binaries; the bare-name winget build on PATH is unaffected.
+    extra_path:
+      - "K:\\Softwares\\Nvidia GPU Compiling Toolkit\\CUDA\\v12.5\\bin"
+    port_range: [40100, 40200]
+    # Seconds to wait for a spawned model's /health to answer before FAILED (P4.2). Big
+    # models load slowly; default 120.
+    health_timeout_seconds: 120
+  vllm:
+    enabled: true
+    # vLLM has no native Windows support (PLAN.md resolution 4): use "docker" (spawn
+    # container) or "attach" (pre-existing endpoint). "subprocess" is Linux-only.
+    mode: "docker"
+    binary_path: "vllm"
+    attach_url: ""                # required when mode == "attach"
+    port_range: [40201, 40300]
+    default_gpu_memory_utilization: 0.90
+
+compatibility:
+  safety_factor: 0.92
+  default_context: 8192
+  default_batch: 4
+  vllm_overhead_mb: 2048
+
+residency:
+  enabled: true                  # P5 admission control + eviction + priority queue
+  safety_margin_mb: 1024         # additive margin: admit needs free >= footprint + this (PLAN res. 9)
+  default_ttl_seconds: 900       # idle TTL for a spawned instance; expired-TTL is evicted first
+  never_kill_active_by_default: true
+  drain_timeout_seconds: 300     # user-stop of a busy instance drains up to this, then stops anyway
+  queue:                         # custom priority-queue tuning (docs/residency-priority-queue.md)
+    age_promote_normal_seconds: 60       # normal → interactive-equivalent after this wait
+    age_promote_background_seconds: 120  # background → normal-equivalent after this wait
+    coalesce_max: 4              # bounded same-model coalescing (0 disables)
+    cap_interactive: 64          # per-class WAITING caps → queue_full rejection past the cap
+    cap_normal: 256
+    cap_background: 512
+
+security:
+  strict_model_artifact_mode: false
+  warn_on_pickle: true
+  warn_on_trust_remote_code: true
+
+logging:
+  level: "info"                # debug | info | warn | error
+  format: "text"               # text | json

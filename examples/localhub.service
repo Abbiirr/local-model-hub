@@ -1,0 +1,15 @@
+[Unit]
+Description=LocalHub Compass
+After=network.target
+
+[Service]
+Type=simple
+User=localhub
+Group=localhub
+ExecStart=/usr/local/bin/localhub --config /etc/localhub/config.yaml
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

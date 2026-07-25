@@ -1,0 +1,92 @@
+.grid {
+  display: grid;
+  gap: 16px;
+}
+
+.gpuCard + .gpuCard {
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.gpuName {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.gpuName h3 {
+  font-size: 15px;
+}
+.gpuMeta {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-family: var(--mono);
+}
+
+.vramRow {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  gap: 8px;
+}
+.vramNums {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.vramUsed {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* stat tiles for util/temp/power */
+.stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-top: 14px;
+}
+.stat {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  text-align: center;
+}
+.statVal {
+  font-family: var(--mono);
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.2;
+}
+.statLabel {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  margin-top: 2px;
+}
+
+.sysRow {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 14px;
+}
+.sysItem {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.sysItem b {
+  color: var(--text);
+  font-family: var(--mono);
+  font-weight: 600;
+}
+.diskList {
+  margin-top: 4px;
+  display: grid;
+  gap: 2px;
+}

@@ -1,0 +1,23 @@
+models:
+  - id: small-gguf-fit
+    source: huggingface
+    format: gguf
+    expected: runs
+  - id: medium-gguf-degraded
+    source: local_path
+    format: gguf
+    expected: runs_degraded
+  - id: large-gguf-no-fit
+    source: huggingface
+    format: gguf
+    expected: wont_run
+  - id: safetensors-fit
+    source: huggingface
+    format: safetensors
+    expected: runs
+  - id: safetensors-no-fit
+    source: huggingface
+    format: safetensors
+    expected: wont_run
+
+# Replace placeholders with exact repo/file/revision during Phase 0.

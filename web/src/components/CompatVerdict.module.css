@@ -1,0 +1,122 @@
+.verdict {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: var(--text);
+  font-size: 0.85rem;
+  text-align: left;
+}
+
+.summary:hover .chevron {
+  color: var(--text);
+}
+
+.engine {
+  color: var(--text-dim);
+}
+
+.vram {
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.chevron {
+  color: var(--text-faint);
+  margin-left: auto;
+}
+
+.detail {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 8px 0 2px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 3px 12px;
+  margin: 0;
+  font-size: 0.82rem;
+}
+
+.grid dt {
+  color: var(--text-faint);
+}
+
+.grid dd {
+  margin: 0;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.mono {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+}
+
+.flags {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.flagsLabel {
+  color: var(--text-faint);
+  font-size: 0.78rem;
+}
+
+.flagsCode {
+  display: block;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  color: var(--text);
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.warnings {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--warn);
+  font-size: 0.8rem;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.alts {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.alt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.8rem;
+}
+
+.altDetail {
+  color: var(--text-dim);
+}
+
+.altStatus {
+  color: var(--text-faint);
+  margin-left: auto;
+}

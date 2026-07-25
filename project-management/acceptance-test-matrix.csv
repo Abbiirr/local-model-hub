@@ -1,0 +1,13 @@
+id,phase,test,method,pass_criteria,gate
+AT-001,1,Hardware snapshot,GET /api/hardware vs nvidia-smi/free/df,Values match within tolerance,G1
+AT-002,1,Phone dashboard,Open dashboard over Tailscale Serve on phone,Live GPU/engine data visible,G1
+AT-003,2,GGUF fit prediction,gguf-parser verdict then real llama-server load,No false-positive runs,G2
+AT-004,2,Safetensors fit prediction,vLLM verdict then real vLLM load,No false-positive runs,G2
+AT-005,3,Manifest completeness,Download/import model,"Manifest has source, revision, files, hashes, warnings",G3
+AT-006,3,Strict mode warning,Import pickle/trust_remote_code model,Warning shown/stored; strict mode blocks,G3
+AT-007,4,llama.cpp start/stop,Start and stop GGUF model,Health ok; VRAM reclaimed,G4
+AT-008,4,vLLM start/stop,Start and stop safetensors model,Health ok; VRAM reclaimed,G4
+AT-009,4,Ollama warm/unload,Warm and unload via keep_alive,/api/ps and VRAM reflect state,G4
+AT-010,5,Load-storm,Request 6 models > GPU capacity,"No OOM, no active kill, no crash, blocked reasons",G5
+AT-011,6,Proxy streaming,OpenAI client streaming request,Chunks relayed intact,G6
+AT-012,Security,Default exposure,Port scan LAN/public path,Localhost only unless configured,Release

@@ -1,0 +1,22 @@
+LocalHub Compass v0.1.0-dev: Phases 0-5 (docs handoff -> working product)
+
+Phase 0: field validation (friction log, GO_STANDALONE, ADR-003 custom
+residency, ADR-006 Go). Phase 1: read-only daemon + phone-first dashboard
+(nvidia-smi probe, engine detection w/ capability probing, inventory,
+REST/SSE/WS, embedded React UI). Phase 2: compatibility engine
+(gguf-parser-go wrapper + TQ3 fallback, GQA-aware safetensors estimator,
+verdicts w/ mandatory reasons, 21-model validation matrix, zero false
+'runs', measured-peak calibration). Phase 3: supply chain (immutable
+manifests, HF commit pinning + resumable sha256 downloads, ollama pull,
+local import, warn-not-block, reproduce export). Phase 4: run/stop
+(instance state machine + Job Objects + reconciliation, llama.cpp/
+Ollama/vLLM adapters, VRAM-delta-verified stops, real vLLM docker E2E).
+Phase 5: coarse residency (custom priority queue w/ aging + coalescing,
+admission control w/ per-eviction VRAM re-reads, idle-only eviction,
+load-storm testing).
+
+Engine behavior citations: Ollama api.md, docs.vllm.ai, gguf-parser-go
+v0.24.1 (all re-verified 2026-07-06; see docs/decisions.md revalidation
+log and research/ evidence files).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>

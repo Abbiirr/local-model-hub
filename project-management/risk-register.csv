@@ -1,0 +1,7 @@
+risk,severity,likelihood,mitigation,owner,status
+GPUStack/Xinference overlap,High,Medium,Phase 0 go/no-go; narrow wedge,Product,Open
+Estimator false-positive OOM,Critical,Medium,Conservative margins + 20-model validation,Backend,Open
+vLLM/CUDA churn,High,High,Version policy + containers + source revalidation,Backend,Open
+Public admin exposure,Critical,Low,localhost default + Tailscale + token,Security,Open
+Scheduler scope creep,Critical,Medium,ADR-001 + closing gates,Tech Lead,Open
+Artifact RCE,High,Medium,safetensors preference + warnings + strict mode,Security,Open

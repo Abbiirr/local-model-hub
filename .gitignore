@@ -1,0 +1,23 @@
+# build artifacts
+/localhub
+/localhub.exe
+*.db
+*.db-wal
+*.db-shm
+
+# frontend
+web/node_modules/
+# web/dist is committed deliberately: go:embed requires it at build time
+
+# workflow scratch (regenerable)
+temp-research/context-summary.md
+.planflow/
+
+# OS noise
+Thumbs.db
+Desktop.ini
+
+# logs
+*.log
+logs/
+.claude/

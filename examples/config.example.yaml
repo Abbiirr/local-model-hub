@@ -1,0 +1,57 @@
+server:
+  bind: "127.0.0.1"
+  port: 39876
+  admin_token: null
+  trust_tailscale_headers: true
+
+data:
+  db_path: "./localhub.db"
+  model_dirs:
+    - "~/models"
+    - "~/.cache/huggingface/hub"
+
+hardware:
+  nvidia: true
+  rocm: false
+  poll_interval_seconds: 1
+
+engines:
+  ollama:
+    enabled: true
+    base_url: "http://127.0.0.1:11434"
+  llamacpp:
+    enabled: true
+    binary_path: "llama-server"
+    port_range: [40100, 40200]
+  vllm:
+    enabled: true
+    binary_path: "vllm"
+    port_range: [40201, 40300]
+    default_gpu_memory_utilization: 0.90
+
+compatibility:
+  safety_factor: 0.92
+  default_context: 8192
+  default_batch: 4
+  vllm_overhead_mb: 2048
+
+residency:
+  enabled: true                  # P5 admission control + eviction + priority queue
+  safety_margin_mb: 1024         # additive admit margin: free >= footprint + this
+  default_ttl_seconds: 900
+  never_kill_active_by_default: true
+  drain_timeout_seconds: 300     # user-stop of a busy instance drains up to this, then stops
+  drain_interval_seconds: 10     # periodic re-admit tick: auto-start queued requests when room frees
+  vram_budget_mib: 0             # 0 = use real free VRAM; >0 caps VRAM our instances may occupy
+  queue:                         # custom priority-queue tuning (docs/residency-priority-queue.md)
+    age_promote_normal_seconds: 60
+    age_promote_background_seconds: 120
+    coalesce_max: 4
+    cap_interactive: 64
+    cap_normal: 256
+    cap_background: 512
+
+security:
+  strict_model_artifact_mode: false
+  warn_on_pickle: true
+  warn_on_trust_remote_code: true

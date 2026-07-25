@@ -1,0 +1,8 @@
+Gate,Phase,Entry Criteria,Exit Evidence,Non-waivable?,Close Decision
+G0,Phase 0 Existing Tool Validation,Real workstation; ten models selected,Friction log + go/contribute/stop decision,Yes,Do not code until closed
+G1,Phase 1 Read-only Observability,ADR-006 stack decision,Phone dashboard; correct hardware/engine/model inventory; no writes,Yes,Proceed to compatibility
+G2,Phase 2 Compatibility,Phase 1 pass; validation model set,20-model matrix; zero false-positive runs; estimator error recorded,Yes,Proceed to downloads
+G3,Phase 3 Supply Chain,Phase 2 pass,All downloads/imports write immutable manifests with hashes/warnings,Yes,Proceed to engine mutation
+G4,Phase 4 Run/Stop,Phase 3 pass,Start/stop three engines; VRAM reclaimed; restart reconciles,Yes,Proceed to residency
+G5,Phase 5 Coarse Residency,Phase 4 pass,"Load-storm: no OOM, no active kill, no crash, blocked reasons",Yes,Optional proxy allowed
+G6,Phase 6 Thin Proxy,Phase 5 pass; proxy need confirmed,OpenAI base URL routes through admission; streaming intact; 503 reason,No,MVP+ close

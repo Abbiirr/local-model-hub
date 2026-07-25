@@ -1,0 +1,62 @@
+.shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.main {
+  flex: 1;
+  width: 100%;
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 16px;
+  padding-bottom: max(16px, env(safe-area-inset-bottom));
+  display: grid;
+  gap: 16px;
+}
+
+/* Desktop: two columns — GPU + engines stacked on the left, inventory wide right.
+   Mobile: single column, order = GPU first (spec §mobile). */
+@media (min-width: 860px) {
+  .main {
+    grid-template-columns: 360px 1fr;
+    align-items: start;
+  }
+  .left {
+    display: grid;
+    gap: 16px;
+  }
+  .right {
+    display: grid;
+    gap: 16px;
+  }
+}
+
+.left,
+.right {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.connBanner {
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--warn-bg);
+  border: 1px solid rgba(232, 177, 58, 0.3);
+  color: var(--warn);
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+.connBannerCrit {
+  background: var(--crit-bg);
+  border-color: rgba(239, 95, 107, 0.3);
+  color: var(--crit);
+}
+
+.footer {
+  padding: 16px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-faint);
+}

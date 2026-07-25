@@ -1,0 +1,32 @@
+id,phase,workstream,task,owner_role,dependencies,deliverable,closing_gate
+LH-000,0,Validation,"Install and configure Ollama, llama.cpp, vLLM, llama-swap, Open WebUI, gguf-parser, Tailscale Serve",Tech Lead,None,phase-0-friction-log.md,G0
+LH-001,0,Validation,Run 10-model manual compatibility/residency trials,Tech Lead,LH-000,filled model attempts table,G0
+LH-002,0,Decision,Resolve ADR-003 llama-swap vs custom manager initial direction,Tech Lead,LH-001,ADR update,G0
+LH-003,0,Decision,Resolve ADR-006 Go vs Python control-plane language,Tech Lead,LH-001,ADR update,G0
+LH-101,1,Backend,"Create daemon skeleton, config loader, SQLite migration bootstrap",Backend,LH-003,running daemon,G1
+LH-102,1,Hardware,Implement NVIDIA/NVML hardware probe,Backend,LH-101,GET /api/hardware,G1
+LH-103,1,Engines,Implement Ollama detect/tags/ps read-only adapter,Backend,LH-101,engine inventory,G1
+LH-104,1,Engines,Implement llama.cpp and vLLM detect read-only adapters,Backend,LH-101,engine status,G1
+LH-105,1,Inventory,Scan configured GGUF and safetensors directories into normalized models table,Backend,LH-101,GET /api/models,G1
+LH-106,1,Frontend,Build mobile dashboard with live SSE metrics,Frontend,LH-102,phone dashboard,G1
+LH-201,2,Compatibility,Wrap gguf-parser-go for GGUF estimates,Backend,G1,GGUF verdicts,G2
+LH-202,2,Compatibility,Implement safetensors/vLLM estimator: weights + GQA-aware KV + overhead,Backend,G1,safetensors verdicts,G2
+LH-203,2,Compatibility,Implement rule engine and hardware gates,Backend,LH-201;LH-202,verdict contract,G2
+LH-204,2,API/UI,Implement POST /api/compat/preview and verdict UI,Full-stack,LH-203,pre-download preview,G2
+LH-205,2,Validation,Run 20-model estimator validation matrix,QA,LH-204,estimator-error report,G2
+LH-301,3,Supply Chain,Resolve HF refs to commit SHA and download pinned snapshots,Backend,G2,HF downloader,G3
+LH-302,3,Supply Chain,"Implement GGUF URL, Ollama pull, local import paths",Backend,LH-301,import/download jobs,G3
+LH-303,3,Manifest,"Compute SHA-256, license/security warnings, immutable manifest",Backend,LH-302,manifest rows,G3
+LH-304,3,UI,"Show commit, verdict, warnings before large download",Frontend,LH-303,download UX,G3
+LH-401,4,Adapters,Implement llama.cpp spawn/health/stop adapter,Backend,G3,llama-server instances,G4
+LH-402,4,Adapters,Implement vLLM spawn/health/stop adapter with STARTING UX,Backend,G3,vLLM instances,G4
+LH-403,4,Adapters,Implement Ollama warm/unload mirror adapter,Backend,G3,Ollama managed state,G4
+LH-404,4,State,Implement instance state machine and restart reconciliation,Backend,LH-401;LH-402;LH-403,state transitions,G4
+LH-405,4,Validation,Verify VRAM reclamation with live hardware after stop,QA,LH-404,adapter test report,G4
+LH-501,5,Residency,Implement admission control and victim selection,Backend,G4,admit() path,G5
+LH-502,5,Residency,"Implement draining, pinned protection, active request tracking",Backend,LH-501,safe eviction,G5
+LH-503,5,Queue,Implement WAITING/BLOCKED/ADMITTED queue with reasons,Backend,LH-501,queue API/UI,G5
+LH-504,5,Validation,Run load-storm test on reference 16GB GPU,QA,LH-503,load-storm report,G5
+LH-601,6,Proxy,Implement /v1/models and chat/completions passthrough,Backend,G5,thin proxy,G6
+LH-602,6,Proxy,Relay streaming unchanged and return 503 with blocked_reason,Backend,LH-601,streaming proxy,G6
+LH-603,6,Docs,Document LiteLLM integration rather than duplicating gateway features,Docs,LH-602,integration note,G6
