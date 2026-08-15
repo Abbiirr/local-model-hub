@@ -234,3 +234,135 @@ ALL expert layers (`N = expert-layer count`); a partial/tuned N to balance GPU/C
 (d) expert weight on CPU raises host-RAM pressure — the RAM floor guard (KNOWN-LIMITATIONS #… RAM
 floor) still applies. Validate against a real NVML-measured MoE load when the GPU is free
 (research §6). (internal/compat/gguf/moe.go; internal/compat/launchplan.go.)
+
+## 20. Observed-peak calibration is keyed by ONE canonical kv_type, not the (K,V) pair
+
+The `observed_peaks` table indexes measurements by `(model_key, ctx, kv_type)` — a single TEXT
+column predating independent K/V cache dtypes. With `-ctk`/`-ctv` now independent,
+`gguf.CanonicalKVKey(k, v)` collapses the pair into that one key: a **symmetric** pair renders as
+the bare type (`f16`, `q4_0`) so every row recorded before independent K/V still matches, and an
+**asymmetric** pair renders as `k/v` (e.g. `q8_0/q4_0`). An asymmetric profile therefore has **no
+calibration data until a peak is measured for that exact pair**, and falls back to the estimate —
+deliberately, because a peak measured with a q4_0 value cache must never justify a q8_0 one.
+
+**Regression worth remembering (found 2026-07-25):** when the (K,V) refactor first landed it
+populated only `KVCacheTypeK/V` and left the legacy `KVCacheType` empty, so the lookup key became
+`""`, **every** recorded measurement missed, and verdicts silently degraded from `exact` to
+`fallback` confidence. Caught by `TestVerdictUsesObservedPeak` /
+`TestVerdictTightensAfterRecording`. If either test fails again, suspect the calibration key
+before the estimator. (internal/compat/gguf/gguf.go `CanonicalKVKey`;
+internal/compat/gguf_path.go; migration 0003_observed_peaks.sql.)
+
+## 21. RESOLVED 2026-07-25 — the start API and the queue now carry the full launch profile
+
+**Both halves are fixed.** Kept for history because the second half was a live, reproduced data-loss
+bug and its regression tests are named after it.
+
+**Was (a):** `core.StartInstanceRequest` exposed only `kv_quant bool` → q4_0 on BOTH cache sides, so
+`-ctk q8_0 -ctv q4_0` (the validated Qwen3.6-27B MTP profile), the MTP draft maximum, and the slot
+count were unreachable from any API or UI caller. **Now:** `kv_type_k`, `kv_type_v`, `slots`, and
+`spec_draft_max` are first-class request fields (M2.1), exposed in the UI's advanced start form
+(M2.3), and validated before dispatch. `kv_quant` still works, documented as a shorthand for
+`q4_0/q4_0`; an explicit pair wins over it.
+
+**Was (b), the live bug:** the `queue` table persisted `req_ctx`/`req_batch`/`req_pin` but **not**
+`kv_quant`, `allow_cpu_offload`, or `speculative`, so a queued start replayed with **f16 KV** — which
+for the 27B prices at ~15602 MiB against ~14168 MiB usable, leaving the entry `WAITING` forever with
+`footprint 15602 + 1024 margin`. A request that WOULD have fit at q4_0 (~14107 MiB) could never
+drain: the queue silently rewrote it into an impossible one. **Now:** migration
+`0009_queue_launch_profile` persists the whole profile, `residency.ProfileSpec` threads it through
+admission/restore/drain, and `residencyStarter.StartQueued` — where the fields were actually being
+dropped — rebuilds the request through one audited translation. The legacy bool is resolved to the
+(K,V) pair ONCE at enqueue, so the queue never stores two representations that can disagree. Guarded
+by `TestQueueReplay_LegacyKVQuantSurvives`, `TestQueueReplay_FullProfileRoundTrip`, and
+`TestQueueReplay_NoFieldSilentlyDropped` (per-field, so a future profile field added without
+threading fails the suite).
+
+**Honest remainder:** the LIVE replay — queue a start, restart the daemon, prove the normalized plan
+is identical — has not been run, and migrations 0009–0011 have not yet been applied to the live
+`localhub.db`. See TODO.md M6.6 / TESTING.md#m2.
+
+## 22. LAN-open and token-enforced access cannot coexist (single global admin token)
+
+`server.admin_token` is one global switch: `authMiddleware` applies it to every `/api/*` and
+`/v1/*` request regardless of origin. The owner's intended two modes — **no password on the LAN,
+password required over Tailscale** — are therefore not expressible by config; enabling the token
+for tailnet clients also locks out passwordless LAN clients. Needs request-origin classification
+(loopback / LAN / tailnet, the last via the Tailscale identity headers `trust_tailscale_headers`
+already governs) plus a per-origin policy. See docs/security.md "Two operating modes" and
+TODO.md X8.
+
+**Current reference-box state is Mode A**: `bind: 0.0.0.0`, `allow_nonlocal: true`,
+`admin_token: null` — anyone who can reach port 39876 has full admin rights (start/stop GPU
+processes, trigger downloads), on **every** interface including the two ZeroTier overlays
+(10.147.19.x, 172.27.25.x), not just the Ethernet LAN.
+
+## 23. Post-HEALTHY health monitoring can kill an unresponsive instance, and its live gate is unrun
+
+The periodic monitor (M5, `internal/instances/monitor.go`, 15 s interval) closes a real hole — an
+engine that died after reaching HEALTHY used to keep reporting HEALTHY until the daemon restarted —
+but it is worth knowing exactly what it will and will not do.
+
+**It kills, under narrow conditions.** After **3 consecutive** failed `/health` probes
+(`DefaultReapAfterFailures`, ≈45 s of continuous unresponsiveness) against a still-alive PID, it kills
+the process tree and marks the instance `FAILED`. It will **never** do that to an instance that is
+pinned, has in-flight requests (never-kill-active), or is in any state other than `HEALTHY`. The
+PID-gone path is unconditional but risk-free — there is nothing left to kill. Set
+`MonitorConfig.ReapAfterFailures = 0` to disable killing entirely; the PID-gone → `FAILED` path keeps
+working either way. **The residual risk is a false positive:** llama-server's `/health` can stall
+under sustained load or during a very long prompt-eval, and a request that entered the engine
+*directly* (not through a LocalHub-mediated path) is invisible to the in-flight counter
+(KNOWN-LIMITATIONS #9), so such an instance is protected only by pinning.
+
+**The live gate is NOT closed.** Every behaviour above is proven by unit tests with injected
+process/health seams; **no disposable HEALTHY process has actually been killed on this box**, because
+the pinned 27B holds ~14.6 GiB of 16 GiB and the owner's constraint is to keep it up. Until that runs,
+treat post-HEALTHY detection as designed-and-unit-tested, not field-proven (TESTING.md#m5).
+
+**Monitor-detected deaths never claim a verified reclaim.** A death or reap sets
+`reclaim_verified = false`, because no NVML delta was measured — only a requested stop through
+`Runner.Stop` measures one. So a `FAILED` row from the monitor tells you the process is gone, NOT that
+its VRAM is back; re-read `/api/hardware` to confirm.
+
+## 24. The 64K MTP profile is still BLOCKED — the flags exist, the calibration does not
+
+Everything needed to *express* the validated Qwen3.6-27B MTP profile now exists end-to-end: the
+capability probe (`has_spec_mtp`), the model-side MTP tensor detection, both-sides gating, the exact
+flags (`-ctk q8_0 -ctv q4_0 -np 1 --spec-type draft-mtp --spec-draft-n-max 2`), independent K/V
+sizing, and the MTP head surcharge. **None of it has been run live.**
+
+Specifically still missing: an MTP-on/MTP-off sanity + determinism comparison (M6.5), the
+8K→16K→32K→64K admission calibration with predicted-vs-observed VRAM per tier (M4.4/M4.5), and any
+measured peak for an ASYMMETRIC (K,V) pair — the calibration store is keyed by the canonical pair
+(`q8_0/q4_0`), which correctly MISSES until measured, so an asymmetric profile currently runs on the
+conservative estimate rather than driver truth (see #20). No 64K default is persisted, and per
+TODO.md M6.1 none may be until those tiers pass. The standing classification for the MTP + 64K
+profile remains **BLOCKED**, not "runs".
+
+## 25. `always_available`/`available` do not proactively (re)load at daemon startup — DEFERRED
+
+Migration 0015's four-state `launch_state` policy (docs/api-spec.md) implements PINNING
+(`always_available` never selected by eviction) and idle-TTL EXEMPTION
+(`always_available`/`available` never idle-unloaded) — both wired into the mechanisms that already
+existed (`Instance.Pinned`, `Instance.TTLSeconds<=0`). What it deliberately does **NOT** do is
+proactively start a STOPPED `always_available`/`available` model — at daemon boot, after a crash, or
+after a manual stop. Today those states only take effect the next time an instance of that model is
+(re)started through the normal admission path (explicit `POST /api/instances`, or the OpenAI proxy
+auto-load for a request that happens to name it); nothing eagerly reaches out and loads it on its
+own.
+
+This was scoped out deliberately, not for lack of a plausible design. On 2026-08-06, this exact box
+(16 GB system RAM, 16 GB VRAM) hit an uncontrolled auto-start loop that repeatedly loaded a 13.5 GB
+model, exhausted system RAM, tripped the `ram_blocked` admission floor, and made the daemon
+unusable for hours (the incident migration 0014's decommission flag — and now `unavailable` — exists
+to prevent). A proactive-load-at-startup feature that does not (a) go through the SAME admission gate
+as every other start (never bypassing the RAM floor or VRAM check), (b) refuse to retry in a tight
+loop on failure, and (c) log a clear reason and give up gracefully, would be exactly that failure
+mode again, just triggered by a config flag instead of a remote client. Implementing it correctly
+needs its own admission-aware, single-attempt-per-boot startup pass with its own tests — a
+meaningfully separate unit of work from the pin/TTL wiring here. Per this repo's working instructions,
+a missing feature beats a resurrected thrash loop, so it is deferred rather than rushed.
+
+**Practical implication today:** flipping a model to `always_available`/`available` while it is
+STOPPED does not bring it up by itself — start it once (`POST /api/instances`) and it stays up
+(pinned, TTL-exempt) until something explicitly stops it or the daemon restarts.

@@ -46,12 +46,21 @@ func TestReadGGUFHeaderMetadata_MHA(t *testing.T) {
 	if hdr.headCountKV != 0 {
 		t.Errorf("headCountKV = %d, want 0 (absent)", hdr.headCountKV)
 	}
-	// kvCacheBytes must substitute head_count for the KV head count.
-	got := kvCacheBytes(hdr, 128, 1, 2)
-	// 2 * layers(2) * nKV(=head_count 4) * head_dim(32/4=8) * ctx(128) * par(1) * 2
-	want := uint64(2 * 2 * 4 * 8 * 128 * 1 * 2)
+	// kvCacheBytes must substitute head_count for the KV head count. K and V are sized
+	// independently (M4.1); a SYMMETRIC pair (2,2) must reproduce the historical
+	// `2 × … × bytes_per_elem` number exactly, so no previously-recorded estimate moves.
+	got := kvCacheBytes(hdr, 128, 1, 2, 2)
+	// layers(2) * nKV(=head_count 4) * head_dim(32/4=8) * ctx(128) * par(1) * (k 2 + v 2)
+	want := uint64(2 * 4 * 8 * 128 * 1 * (2 + 2))
 	if got != want {
 		t.Errorf("kvCacheBytes(MHA) = %d, want %d", got, want)
+	}
+	// ASYMMETRIC K/V: a 1-byte K with a 2-byte V must land strictly between the all-1 and all-2
+	// totals — the property the old single-dtype signature could not express at all.
+	asym := kvCacheBytes(hdr, 128, 1, 1, 2)
+	allQ8 := kvCacheBytes(hdr, 128, 1, 1, 1)
+	if !(allQ8 < asym && asym < got) {
+		t.Errorf("asymmetric K/V sizing: want %d < %d < %d (q8/q8 < q8/f16 < f16/f16)", allQ8, asym, got)
 	}
 }
 

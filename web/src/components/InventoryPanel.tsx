@@ -1,9 +1,10 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { isQueuedResponse } from '../api/client';
-import type { ModelSummary, Verdict } from '../api/types';
+import type { LaunchState, ModelSummary, Verdict } from '../api/types';
 import { api } from '../api/client';
 import { ApiError } from '../api/client';
-import { formatBytes } from '../lib/format';
+import { useCompatVerdicts, type CompatEntry } from '../api/useCompatVerdicts';
+import { formatBytes, formatMib } from '../lib/format';
 import {
   EmptyState,
   ErrorState,
@@ -28,6 +29,52 @@ function isPresent(m: ModelSummary): boolean {
 // refuse (with a numeric reason) or queue anything the UI lets through.
 function isRunnable(m: ModelSummary): boolean {
   return isPresent(m) && m.format === 'gguf';
+}
+
+// ── Launch state (residency) ────────────────────────────────────────────────────
+// The four-value vocabulary the daemon accepts on PUT /api/models/{id}/launch-state.
+// These describe RESIDENCY (whether the model stays loaded in VRAM) — NOT visibility in
+// any list. Order matches the "coldest to warmest" reading the operator expects in a
+// dropdown, with the daemon's own default (available_on_request) third.
+const LAUNCH_STATES: { value: LaunchState; label: string; hint: string }[] = [
+  {
+    value: 'always_available',
+    label: 'Always keep available',
+    hint: 'Kept loaded even when idle; never evicted, reloaded if it dies.',
+  },
+  {
+    value: 'available',
+    label: 'Available',
+    hint: 'Loaded now; may still be evicted if VRAM runs short.',
+  },
+  {
+    value: 'available_on_request',
+    label: 'Available on request',
+    hint: 'Cold until a request arrives, then unloads again when idle. (default)',
+  },
+  {
+    value: 'unavailable',
+    label: 'Unavailable',
+    hint: 'Never loads automatically — start it manually.',
+  },
+];
+
+const KNOWN_LAUNCH_STATES = new Set(LAUNCH_STATES.map((s) => s.value));
+
+// A missing/unrecognized value (older daemon, or a value this build doesn't know yet) MUST
+// degrade to the daemon's own default rather than being read as `unavailable` — silently
+// treating an unknown state as "never auto-load" would be a behavior claim the UI can't back up.
+function launchStateOf(m: ModelSummary): LaunchState {
+  return m.launch_state && KNOWN_LAUNCH_STATES.has(m.launch_state)
+    ? m.launch_state
+    : 'available_on_request';
+}
+
+// Per-model launch-state row state: an in-flight flag and a failure reason (the select reverts
+// to the model's actual state on error — nothing is assumed to have taken effect).
+interface LaunchStateRowState {
+  loading: boolean;
+  error?: string;
 }
 
 // Per-model preview state: the fetched verdict, an in-flight flag, and an error reason.
@@ -55,13 +102,26 @@ export function InventoryPanel(props: {
   // false = full GPU (never split to CPU). Run reads it; the ACTIONS-header annotation flips it.
   allowCpuOffload: boolean;
   onAllowCpuOffloadChange: (v: boolean) => void;
+  // Fires after a launch-state change is accepted by the daemon so the caller can refetch the
+  // models list (mirrors onRescanned — same "refresh the models query" trigger, App.tsx wires
+  // both to models.refresh()).
+  onLaunchStateChanged: () => void;
+  /** Bumped by App when free VRAM changed materially (a Free-GPU sweep) — the invalidation signal
+   *  for cached fit verdicts, which are only true for the VRAM they were computed against. */
+  compatEpoch?: number;
 }) {
   const [rescanning, setRescanning] = useState(false);
   const [rescanError, setRescanError] = useState<string | null>(null);
+  // Vanished models remain in the catalog for manifests and instance history, but the normal
+  // inventory is the set that exists now. Keep historical rows behind an explicit toggle so a
+  // rescan cannot leave the registry looking as though deleted model files are still available.
+  const [showMissing, setShowMissing] = useState(false);
   // Keyed by model id — the verdict shown inline after "Preview fit".
   const [previews, setPreviews] = useState<Record<string, PreviewState>>({});
   // Keyed by model id — the Run outcome shown inline beside the row's actions.
   const [runs, setRuns] = useState<Record<string, RunState>>({});
+  // Keyed by model id — in-flight/error state for the launch-state select.
+  const [launchStates, setLaunchStates] = useState<Record<string, LaunchStateRowState>>({});
 
   async function rescan() {
     setRescanning(true);
@@ -134,7 +194,37 @@ export function InventoryPanel(props: {
     }
   }
 
-  const models = props.models ?? [];
+  // Change a model's residency launch state. On success, refetch the models list (the daemon's
+  // response also carries the updated summary, but the list is the single source of truth other
+  // panels read from — refetching keeps them all consistent rather than patching one row locally).
+  async function changeLaunchState(id: string, state: LaunchState) {
+    setLaunchStates((s) => ({ ...s, [id]: { loading: true } }));
+    try {
+      await api.setModelLaunchState(id, state);
+      setLaunchStates((s) => ({ ...s, [id]: { loading: false } }));
+      props.onLaunchStateChanged();
+    } catch (e) {
+      setLaunchStates((s) => ({
+        ...s,
+        [id]: { loading: false, error: e instanceof ApiError ? e.reason : String(e) },
+      }));
+    }
+  }
+
+  const allModels = props.models ?? [];
+  const missingCount = allModels.filter((m) => !isPresent(m)).length;
+  const models = showMissing ? allModels : allModels.filter(isPresent);
+
+  // §3.3 — real verdicts inline, so the Compatibility column stops reading "unchecked" for every
+  // row. Only PRESENT models are fetched: a model whose file vanished cannot be measured, and
+  // asking would spend a request to learn nothing. Memoised on the id list so a parent re-render
+  // (or a models refetch returning identical rows) does not look like a new set of ids.
+  const presentIds = useMemo(
+    () => models.filter(isPresent).map((m) => m.id),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [models.filter(isPresent).map((m) => m.id).join('\n')],
+  );
+  const verdicts = useCompatVerdicts(presentIds, props.compatEpoch ?? 0);
 
   return (
     <Panel
@@ -147,6 +237,15 @@ export function InventoryPanel(props: {
       flush
       actions={
         <div className={styles.headerActions}>
+          {missingCount > 0 && (
+            <IconButton
+              onClick={() => setShowMissing((visible) => !visible)}
+              aria-pressed={showMissing}
+              title="Show or hide catalog history for model files that are no longer present"
+            >
+              {showMissing ? 'Hide missing' : `Show missing (${missingCount})`}
+            </IconButton>
+          )}
           {/* Shared GPU/CPU placement mode — reflects the Instances picker toggle; click to flip.
               Run uses this setting. Off = full GPU, never split to CPU. */}
           <button
@@ -172,11 +271,12 @@ export function InventoryPanel(props: {
         <Skeleton>Loading inventory…</Skeleton>
       ) : models.length === 0 && !props.error ? (
         <EmptyState>
-          No models found.
+          No present models found.
           <br />
           <Reason>
-            The scanner found no GGUF/safetensors/Ollama models in the configured
-            model directories. Try Rescan after adding models.
+            {missingCount > 0
+              ? `${missingCount} missing catalog ${missingCount === 1 ? 'record is' : 'records are'} hidden. Use Show missing to inspect history.`
+              : 'The scanner found no GGUF/safetensors/Ollama models in the configured model directories. Try Rescan after adding models.'}
           </Reason>
         </EmptyState>
       ) : (
@@ -184,16 +284,22 @@ export function InventoryPanel(props: {
           <Table
             models={models}
             previews={previews}
+            verdicts={verdicts}
             runs={runs}
+            launchStates={launchStates}
             onPreview={preview}
             onRun={run}
+            onLaunchStateChange={changeLaunchState}
           />
           <Cards
             models={models}
             previews={previews}
+            verdicts={verdicts}
             runs={runs}
+            launchStates={launchStates}
             onPreview={preview}
             onRun={run}
+            onLaunchStateChange={changeLaunchState}
           />
         </>
       )}
@@ -206,25 +312,58 @@ export function InventoryPanel(props: {
   );
 }
 
-// PreviewCell shows compatibility for a row: the full verdict view once "Preview fit" has been
-// run, otherwise the cached compat_status badge (or a muted "unchecked" hint). The button that
-// triggers a preview lives in RunCell (Actions column) so the primary Run action sits with it.
+// PreviewCell shows compatibility for a row, in decreasing order of authority:
+//   1. the full verdict view, once the operator explicitly ran "Preview fit" on this row;
+//   2. the AUTO-fetched verdict (§3.3) — a badge, its estimated VRAM, and the mandatory reason as
+//      a tooltip. This is what replaced a column of "unchecked" hints;
+//   3. the cached compat_status from the inventory row, while (2) is still in flight;
+//   4. "unchecked" — now only reachable for a MISSING model (never fetched) or a failed fetch.
+// A failed fetch must land on (3)/(4), never on a manufactured `wont_run`: not knowing whether a
+// model fits is not the same as knowing it does not.
 function PreviewCell({
   model,
   state,
+  entry,
 }: {
   model: ModelSummary;
   state: PreviewState | undefined;
+  entry: CompatEntry | undefined;
 }) {
+  const cached =
+    model.compat_status && model.compat_status !== 'unknown'
+      ? (model.compat_status as Verdict['status'])
+      : undefined;
+
+  let body;
+  if (state?.verdict) {
+    body = <CompatVerdictView verdict={state.verdict} />;
+  } else if (entry?.state === 'ready') {
+    body = (
+      <span className={styles.autoVerdict} title={entry.reason}>
+        <CompatBadge status={entry.status} />
+        {entry.estimatedVramMb != null && (
+          <span className={styles.autoEstimate}>~{formatMib(entry.estimatedVramMb)}</span>
+        )}
+      </span>
+    );
+  } else if (cached) {
+    body = <CompatBadge status={cached} />;
+  } else if (entry?.state === 'loading') {
+    body = <span className={styles.unchecked}>checking…</span>;
+  } else {
+    body = (
+      <span
+        className={styles.unchecked}
+        title={entry?.state === 'error' ? `Fit check failed: ${entry.reason}` : undefined}
+      >
+        unchecked
+      </span>
+    );
+  }
+
   return (
     <div className={styles.compatCell}>
-      {state?.verdict ? (
-        <CompatVerdictView verdict={state.verdict} />
-      ) : model.compat_status && model.compat_status !== 'unknown' ? (
-        <CompatBadge status={model.compat_status as Verdict['status']} />
-      ) : (
-        <span className={styles.unchecked}>unchecked</span>
-      )}
+      {body}
       {state?.error && <ErrorState>Preview failed: {state.error}</ErrorState>}
     </div>
   );
@@ -280,18 +419,63 @@ function RunCell({
   );
 }
 
+// LaunchStateCell — the residency control: a compact select showing the model's current
+// launch state (defaulting an absent/unknown value to available_on_request) with a terse
+// consequence line underneath. Disabled while a change is in flight; reverts visually the
+// moment the parent's models list refetches (or shows the failure reason on error).
+function LaunchStateCell({
+  model,
+  state,
+  onChange,
+}: {
+  model: ModelSummary;
+  state: LaunchStateRowState | undefined;
+  onChange: (id: string, state: LaunchState) => void;
+}) {
+  const current = launchStateOf(model);
+  const active = LAUNCH_STATES.find((s) => s.value === current) ?? LAUNCH_STATES[2];
+  return (
+    <div className={styles.launchCell}>
+      <select
+        className={styles.launchSelect}
+        aria-label={`Launch state for ${model.display_name}`}
+        value={current}
+        disabled={state?.loading}
+        title={active.hint}
+        onChange={(e) => onChange(model.id, e.target.value as LaunchState)}
+      >
+        {LAUNCH_STATES.map((s) => (
+          <option key={s.value} value={s.value}>
+            {s.label}
+          </option>
+        ))}
+      </select>
+      <span className={styles.launchHint} title={active.hint}>
+        {state?.loading ? 'Saving…' : active.hint}
+      </span>
+      {state?.error && <ErrorState>Launch state change failed: {state.error}</ErrorState>}
+    </div>
+  );
+}
+
 function Table({
   models,
   previews,
+  verdicts,
   runs,
+  launchStates,
   onPreview,
   onRun,
+  onLaunchStateChange,
 }: {
   models: ModelSummary[];
   previews: Record<string, PreviewState>;
+  verdicts: Record<string, CompatEntry>;
   runs: Record<string, RunState>;
+  launchStates: Record<string, LaunchStateRowState>;
   onPreview: (id: string) => void;
   onRun: (id: string) => void;
+  onLaunchStateChange: (id: string, state: LaunchState) => void;
 }) {
   return (
     <div className={styles.tableWrap}>
@@ -304,6 +488,7 @@ function Table({
             <th>Quant</th>
             <th>Size</th>
             <th>Presence</th>
+            <th>Launch state</th>
             <th>Compatibility</th>
             <th>Actions</th>
           </tr>
@@ -321,8 +506,19 @@ function Table({
               <td>
                 <PresenceBadge present={isPresent(m)} />
               </td>
+              <td className={styles.launchTd}>
+                <LaunchStateCell
+                  model={m}
+                  state={launchStates[m.id]}
+                  onChange={onLaunchStateChange}
+                />
+              </td>
               <td className={styles.compatTd}>
-                <PreviewCell model={m} state={previews[m.id]} />
+                <PreviewCell
+                  model={m}
+                  state={previews[m.id]}
+                  entry={verdicts[m.id]}
+                />
               </td>
               <td className={styles.actionTd}>
                 <RunCell
@@ -344,15 +540,21 @@ function Table({
 function Cards({
   models,
   previews,
+  verdicts,
   runs,
+  launchStates,
   onPreview,
   onRun,
+  onLaunchStateChange,
 }: {
   models: ModelSummary[];
   previews: Record<string, PreviewState>;
+  verdicts: Record<string, CompatEntry>;
   runs: Record<string, RunState>;
+  launchStates: Record<string, LaunchStateRowState>;
   onPreview: (id: string) => void;
   onRun: (id: string) => void;
+  onLaunchStateChange: (id: string, state: LaunchState) => void;
 }) {
   return (
     <div className={styles.cards}>
@@ -383,8 +585,19 @@ function Cards({
               {m.local_path ?? m.repo}
             </div>
           )}
+          <div className={styles.cardLaunch}>
+            <LaunchStateCell
+              model={m}
+              state={launchStates[m.id]}
+              onChange={onLaunchStateChange}
+            />
+          </div>
           <div className={styles.cardCompat}>
-            <PreviewCell model={m} state={previews[m.id]} />
+            <PreviewCell
+              model={m}
+              state={previews[m.id]}
+              entry={verdicts[m.id]}
+            />
             <RunCell
               model={m}
               preview={previews[m.id]}

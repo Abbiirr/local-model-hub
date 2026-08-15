@@ -2,9 +2,12 @@ import { describe, expect, it } from 'vitest';
 import {
   computeVramBar,
   formatBytes,
+  formatCurMax,
   formatMetric,
   formatMib,
+  formatNa,
   mibToGib,
+  ramFloorState,
   relativeTime,
 } from './format';
 
@@ -104,5 +107,78 @@ describe('relativeTime', () => {
   it('returns empty for unparseable', () => {
     expect(relativeTime(null)).toBe('');
     expect(relativeTime('not-a-date')).toBe('');
+  });
+});
+
+// ── Extended GPU telemetry: the -1 sentinel must never be confused with a real 0 ──────────────
+// This is the correctness bar for §3.1. On the reference box the fan genuinely reads 0 % and the
+// SM clock genuinely idles near 0 MHz, while nvidia-smi reports -1 for anything it cannot supply.
+// Collapsing those two into "0" would state something untrue about the hardware.
+describe('formatNa', () => {
+  it('renders a legitimate zero as 0, NOT as n/a', () => {
+    expect(formatNa(0, '%')).toBe('0%');
+    expect(formatNa(0, ' MHz')).toBe('0 MHz');
+  });
+
+  it('renders the -1 "not reported" sentinel as n/a, never as 0', () => {
+    expect(formatNa(-1, '%')).toBe('n/a');
+    expect(formatNa(-1, ' MiB')).toBe('n/a');
+    // Per-process VRAM on Windows is ALWAYS -1 (WDDM does not attribute it).
+    expect(formatNa(-1)).toBe('n/a');
+  });
+
+  it('treats an absent or non-finite value as n/a (older daemon, or a parse failure)', () => {
+    expect(formatNa(undefined, ' W')).toBe('n/a');
+    expect(formatNa(null, ' W')).toBe('n/a');
+    expect(formatNa(Number.NaN, ' W')).toBe('n/a');
+  });
+
+  it('formats with a unit and digits', () => {
+    expect(formatNa(165, ' W')).toBe('165 W');
+    expect(formatNa(14.76, ' W', 1)).toBe('14.8 W');
+  });
+});
+
+describe('formatCurMax', () => {
+  it('always shows both sides — PCIe downtrains to gen 1 at idle', () => {
+    expect(formatCurMax(1, 3)).toBe('1 / 3');
+    expect(formatCurMax(8, 8)).toBe('8 / 8');
+    expect(formatCurMax(210, 3105, ' MHz')).toBe('210 MHz / 3105 MHz');
+  });
+
+  it('degrades each side independently', () => {
+    expect(formatCurMax(-1, 3)).toBe('n/a / 3');
+    expect(formatCurMax(1, -1)).toBe('1 / n/a');
+  });
+
+  it('collapses to a single n/a when neither side is known', () => {
+    expect(formatCurMax(-1, -1)).toBe('n/a');
+    expect(formatCurMax(undefined, undefined)).toBe('n/a');
+  });
+});
+
+// RAM binds BEFORE VRAM on a 16 GB box: a start is refused while free RAM is under the floor,
+// however much VRAM is idle. The comparison must match the daemon's exactly (strict `<`).
+describe('ramFloorState', () => {
+  it('flags free RAM below the floor and names the shortfall', () => {
+    const s = ramFloorState(1720, 2048);
+    expect(s.hasFloor).toBe(true);
+    expect(s.belowFloor).toBe(true);
+    expect(s.shortMib).toBe(328);
+  });
+
+  it('is not below the floor when free RAM exactly equals it (strict <, like admission)', () => {
+    const s = ramFloorState(2048, 2048);
+    expect(s.belowFloor).toBe(false);
+    expect(s.shortMib).toBe(0);
+  });
+
+  it('claims nothing about admission when the daemon reports no floor', () => {
+    const s = ramFloorState(100, 0);
+    expect(s.hasFloor).toBe(false);
+    expect(s.belowFloor).toBe(false);
+    const absent = ramFloorState(100, undefined);
+    expect(absent.hasFloor).toBe(false);
+    expect(absent.belowFloor).toBe(false);
   });
 });

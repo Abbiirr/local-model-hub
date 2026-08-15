@@ -40,6 +40,10 @@ type Snapshot struct {
 	// §3 key is "disk"; we expose a list because a box may keep models on more than one
 	// volume.
 	Disks []Disk `json:"disk"`
+	// GPUProcesses lists processes currently holding a CUDA context, newest probe wins. Empty
+	// when nvidia-smi is absent or nothing has the GPU open. See GPUProcess: per-process VRAM
+	// is NOT available on Windows, so UsedMiB is -1 there and must render as "n/a".
+	GPUProcesses []GPUProcess `json:"gpu_processes,omitempty"`
 	// CapturedAt is when this snapshot was taken. Lets the SSE/dashboard show staleness and
 	// lets callers cache. RFC3339.
 	CapturedAt time.Time `json:"captured_at"`
@@ -65,6 +69,49 @@ type GPU struct {
 	// per-GPU CSV query does not expose it (it is a header field), so it is populated
 	// best-effort and may be empty. Spec key: "cuda".
 	CUDAVersion string `json:"cuda,omitempty"`
+
+	// --- Extended telemetry (all best-effort; -1 means "nvidia-smi reported N/A") ---
+	// These come from the same single nvidia-smi invocation as the fields above, so they cost
+	// nothing extra. They exist because a fits/does-not-fit verdict is not the whole story:
+	// PCIe width and throttle state explain SLOW, which VRAM numbers alone never do.
+	ClockSMMHz     int     `json:"clock_sm_mhz"`
+	ClockMemMHz    int     `json:"clock_mem_mhz"`
+	ClockSMMaxMHz  int     `json:"clock_sm_max_mhz"`
+	FanPct         int     `json:"fan_pct"`
+	PCIeGen        int     `json:"pcie_gen"`
+	PCIeGenMax     int     `json:"pcie_gen_max"`
+	PCIeWidth      int     `json:"pcie_width"`
+	PCIeWidthMax   int     `json:"pcie_width_max"`
+	PowerLimitW    float64 `json:"power_limit_w"`
+	PowerMaxLimitW float64 `json:"power_max_limit_w"`
+	// Throttle is the decoded clocks_throttle_reasons.active bitmask, e.g. "idle" or
+	// "sw_power_cap,hw_thermal_slowdown". Empty means running unthrottled.
+	Throttle string `json:"throttle,omitempty"`
+
+	// UsableVRAMMiB is the budget ADMISSION actually compares a model against:
+	// floor(VRAMFreeMiB × compat.SafetyFactor). It is deliberately smaller than VRAMFreeMiB.
+	//
+	// It exists so the dashboard and a refusal reason cannot disagree. Showing only raw free
+	// VRAM makes "needs 13290 MiB, you have 14784 free" look like it should fit when admission
+	// says otherwise. -1 means "not computed" (no probe / no GPU).
+	//
+	// The hardware package does not own the safety factor, so this is populated one layer up in
+	// core.Hardware rather than by the probe itself.
+	UsableVRAMMiB int `json:"usable_vram_mib"`
+}
+
+// GPUProcess is one process holding the GPU open, from `nvidia-smi --query-compute-apps`.
+//
+// IMPORTANT — UsedMiB is -1 on Windows consumer GPUs. In WDDM mode the driver does not
+// attribute VRAM per process, so nvidia-smi returns "[N/A]" for used_memory on every row
+// (verified on an RTX 4060 Ti, driver 576.40); some rows also return "[Insufficient
+// Permissions]" for the name. Per-process VRAM is only real on Linux or on datacenter cards in
+// TCC mode. The process LIST is still surfaced because knowing which processes hold the GPU is
+// actionable without per-process byte counts — callers MUST render -1 as "n/a", never as 0.
+type GPUProcess struct {
+	PID     int    `json:"pid"`
+	Name    string `json:"name"`
+	UsedMiB int    `json:"used_mib"`
 }
 
 // CPU describes the processor. UtilizationPct is -1 when not measured: computing CPU
@@ -83,6 +130,13 @@ type RAM struct {
 	TotalMiB int `json:"total"`
 	FreeMiB  int `json:"free"`
 	UsedMiB  int `json:"used"`
+	// FloorMiB is the residency RAM floor (config residency.min_free_ram_mib): a start is
+	// refused while FreeMiB is below it. Surfaced with the RAM numbers because on a 16 GB box
+	// RAM binds BEFORE VRAM — a start can be refused with 14 GiB of VRAM sitting free, and
+	// without this number on screen that refusal looks arbitrary. 0 means unset.
+	//
+	// Populated by core.Hardware (config lives a layer up), not by the probe.
+	FloorMiB int `json:"floor_mib,omitempty"`
 }
 
 // Disk is free/total space for one volume, keyed by the path probed.

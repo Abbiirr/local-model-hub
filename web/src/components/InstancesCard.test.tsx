@@ -20,11 +20,16 @@ vi.mock('../api/client', async () => {
       instances: vi.fn(),
       startInstance: vi.fn(),
       stopInstance: vi.fn(),
+      // §3.3: the picker now fetches a real verdict per startable row. Stubbed as "rejects" by
+      // default so these tests exercise the fallback path (cached status / "unchecked"); the
+      // verdict-specific tests below override it.
+      modelCompat: vi.fn(),
     },
   };
 });
 
 import { api } from '../api/client';
+import { resetCompatCache } from '../api/useCompatVerdicts';
 
 const healthyInstance: InstanceView = {
   id: 'i1',
@@ -74,9 +79,20 @@ const wontRunModel: ModelSummary = {
 // the checkbox controlled; allowCpuOffload defaults OFF (full GPU — never split to CPU).
 const offloadOff = { allowCpuOffload: false, onAllowCpuOffloadChange: () => {} };
 
+/** Open the collapsed "Launch options" disclosure (§3.4 moved the CPU-offload toggle, the
+ *  advanced profile and the attach form behind it so the model list leads the panel). */
+function openLaunchOptions() {
+  fireEvent.click(screen.getByRole('button', { name: /Launch options/ }));
+}
+
 describe('InstancesCard', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // The verdict cache is module-scoped; without this a verdict from one test leaks into the next.
+    resetCompatCache();
+    (api.modelCompat as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new ApiError('unavailable', 'compat unavailable', 'no compat in this test', 503),
+    );
   });
   afterEach(() => cleanup());
 
@@ -98,7 +114,11 @@ describe('InstancesCard', () => {
     render(<InstancesCard models={[]} instancesInvalidation={0} {...offloadOff} />);
     await waitFor(() => screen.getByRole('button', { name: /^Stop$/ }));
     fireEvent.click(screen.getByRole('button', { name: /^Stop$/ }));
-    await waitFor(() => expect(api.stopInstance).toHaveBeenCalledWith('i1'));
+    // force:false is the important half — a normal (LocalHub-spawned) instance is stopped WITHOUT the
+    // adopted-process override, so the server-side guard stays armed for anything LocalHub didn't start.
+    await waitFor(() =>
+      expect(api.stopInstance).toHaveBeenCalledWith('i1', { force: false }),
+    );
     await waitFor(() => screen.getByText(/VERIFIED: free VRAM rose/));
   });
 
@@ -136,13 +156,70 @@ describe('InstancesCard', () => {
     await waitFor(() => screen.getByText(/Refused: REFUSED: estimated 14000 MiB/));
   });
 
-  it('lists an unchecked model in the picker with an "unchecked" annotation', async () => {
+  it('falls back to "unchecked" when the live fit check fails, never to a manufactured verdict', async () => {
     (api.instances as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     render(<InstancesCard models={[uncheckedModel]} instancesInvalidation={0} {...offloadOff} />);
     await waitFor(() => screen.getByText('Mystery 7B Q4_K_M'));
-    // Annotated as unchecked (not filtered out for lacking a cached verdict).
-    expect(screen.getByText('unchecked')).toBeInTheDocument();
+    // The fetch rejects (see beforeEach). A check that could NOT be made must degrade to
+    // "unchecked" — inventing "won't fit" from a failed request would be a claim about the model
+    // that the daemon never made.
+    await waitFor(() => expect(screen.getByText('unchecked')).toBeInTheDocument());
+    expect(screen.queryByText("won't fit")).toBeNull();
     expect(screen.getByRole('button', { name: /^Start$/ })).toBeEnabled();
+  });
+
+  it('replaces "unchecked" with the live verdict, its estimate, and its reason as a tooltip', async () => {
+    (api.instances as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (api.modelCompat as ReturnType<typeof vi.fn>).mockResolvedValue({
+      model: 'Mystery 7B Q4_K_M',
+      status: 'runs',
+      reason: 'GGUF needs ~4123 MiB at 8K ctx and fits in 13647 MiB usable, with headroom.',
+      recommended_engine: 'llamacpp',
+      estimated_vram_mb: 4123,
+      confidence: 'exact',
+    });
+    render(<InstancesCard models={[uncheckedModel]} instancesInvalidation={0} {...offloadOff} />);
+    await waitFor(() => expect(screen.getByText('fits')).toBeInTheDocument());
+    // The estimate is rendered beside the badge…
+    expect(screen.getByText('~4.0 GiB')).toBeInTheDocument();
+    // …and the mandatory reason rides along as the tooltip (never dropped).
+    expect(
+      screen.getByTitle(/needs ~4123 MiB at 8K ctx and fits in 13647 MiB usable/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('unchecked')).toBeNull();
+  });
+
+  it('fetches one verdict per startable model and does not refetch on a poll tick', async () => {
+    (api.instances as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (api.modelCompat as ReturnType<typeof vi.fn>).mockResolvedValue({
+      model: 'x',
+      status: 'runs',
+      reason: 'fits',
+      recommended_engine: 'llamacpp',
+      estimated_vram_mb: 1000,
+      confidence: 'exact',
+    });
+    const { rerender } = render(
+      <InstancesCard
+        models={[runnableModel, uncheckedModel]}
+        instancesInvalidation={0}
+        {...offloadOff}
+      />,
+    );
+    await waitFor(() =>
+      expect(api.modelCompat).toHaveBeenCalledTimes(2),
+    );
+    // A re-render with an equal (but not identical) models array must NOT trigger new requests —
+    // this endpoint does GGUF header reads, so re-rendering it into a fetch loop is a real cost.
+    rerender(
+      <InstancesCard
+        models={[{ ...runnableModel }, { ...uncheckedModel }]}
+        instancesInvalidation={1}
+        {...offloadOff}
+      />,
+    );
+    await waitFor(() => screen.getByText('GLM OCR Q8_0'));
+    expect(api.modelCompat).toHaveBeenCalledTimes(2);
   });
 
   it("allows submitting a won't-fit model and surfaces the daemon's numeric refusal", async () => {
@@ -178,10 +255,40 @@ describe('InstancesCard', () => {
     expect(screen.getByText(/Downloads panel/)).toBeInTheDocument();
   });
 
+  it('leads with the model list and keeps launch options collapsed (§3.4)', async () => {
+    (api.instances as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    render(<InstancesCard models={[runnableModel]} instancesInvalidation={0} {...offloadOff} />);
+    await waitFor(() => screen.getByText('GLM OCR Q8_0'));
+    // The primary action is present without any disclosure being opened…
+    expect(screen.getByRole('button', { name: /^Start$/ })).toBeInTheDocument();
+    // …while the secondary settings are behind one collapsed disclosure.
+    expect(screen.queryByRole('checkbox')).toBeNull();
+    expect(screen.queryByLabelText('Attach port')).toBeNull();
+    expect(
+      screen.getByRole('button', { name: /Launch options/ }),
+    ).toHaveAttribute('aria-expanded', 'false');
+  });
+
+  it('names an armed non-default option in the collapsed summary so it is never silent', async () => {
+    (api.instances as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    render(
+      <InstancesCard
+        models={[runnableModel]}
+        instancesInvalidation={0}
+        allowCpuOffload
+        onAllowCpuOffloadChange={() => {}}
+      />,
+    );
+    await waitFor(() => screen.getByText('GLM OCR Q8_0'));
+    expect(screen.getByText(/CPU offload allowed/)).toBeInTheDocument();
+  });
+
   it('renders the CPU-offload toggle unchecked by default with the muted hint', async () => {
     (api.instances as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     render(<InstancesCard models={[runnableModel]} instancesInvalidation={0} {...offloadOff} />);
-    await waitFor(() => screen.getByText('Allow CPU offload'));
+    await waitFor(() => screen.getByText('GLM OCR Q8_0'));
+    openLaunchOptions();
+    expect(screen.getByText('Allow CPU offload')).toBeInTheDocument();
     expect(screen.getByRole('checkbox')).not.toBeChecked();
     expect(
       screen.getByText(/default: full GPU — never split to CPU/),
@@ -209,6 +316,7 @@ describe('InstancesCard', () => {
     }
     render(<Harness />);
     await waitFor(() => screen.getByText('GLM OCR Q8_0'));
+    openLaunchOptions();
     fireEvent.click(screen.getByRole('checkbox'));
     expect(screen.getByRole('checkbox')).toBeChecked();
     fireEvent.click(screen.getByRole('button', { name: /^Start$/ }));

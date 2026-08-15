@@ -1,0 +1,31 @@
+-- 0014_model_auto_load.sql
+-- ADDITIVE migration (data-model.md: additive only). Nullable/defaulted column only.
+--
+-- WHY: the daemon binds 0.0.0.0 unauthenticated (docs/security.md — a known, accepted risk on a
+-- trusted LAN) and a remote host on the network was repeatedly triggering OpenAI-proxy auto-starts
+-- of a 13.5 GB model against a 16 GB-RAM box, exhausting RAM and blocking every other model from
+-- loading. The owner needs to take that ONE model out of the auto-load rotation — advertised as
+-- unavailable to OpenAI clients, refused by every implicit/auto start path — while still being able
+-- to load it himself, deliberately, from the dashboard or a direct POST /api/instances.
+--
+-- This is DECOMMISSIONING, not deletion: the row, its manifest, and its compat verdict are
+-- untouched. The flag only changes who is allowed to trigger a load.
+--
+--   auto_load_disabled   0 (default) = normal — every path (proxy, jobs, queue drain, explicit
+--                        POST /api/instances) may load this model, exactly like every model before
+--                        this migration.
+--                        1 = decommissioned — enforced in code:
+--                          * GET /v1/models (OpenAI-facing) excludes it — advertised as unavailable.
+--                          * GET /api/models (admin inventory) STILL lists it with the flag set, so
+--                            the operator can see and un-decommission it.
+--                          * Every IMPLICIT/auto start path (the OpenAI proxy resolve, the residency
+--                            queue drain/promotion loop, the async jobs worker) REFUSES it with a
+--                            reason naming the model and saying how to load it manually.
+--                          * An EXPLICIT operator start (POST /api/instances, the API handler sets
+--                            StartInstanceRequest.Manual=true) is NOT refused by this flag — that is
+--                            the entire point: decommissioned means "never automatic", not "never
+--                            runnable".
+--
+-- Toggled via PUT /api/models/{id}/auto-load {"enabled": bool} (docs/api-spec.md).
+
+ALTER TABLE models ADD COLUMN auto_load_disabled INTEGER NOT NULL DEFAULT 0;

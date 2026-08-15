@@ -21,6 +21,7 @@ engines:
     enabled: true
     binary_path: "llama-server"
     port_range: [40100, 40200]
+    remote_models: []            # stable-id mappings for already-running LAN/tailnet llama.cpp servers
   vllm:
     enabled: true
     binary_path: "vllm"

@@ -48,6 +48,47 @@ const DegradedBoundaryFraction = 0.15
 // won't-run for real use. 2048 is the floor (matches the safetensors wiring note's example).
 const MinDegradedContext = 2048
 
+// CalibratedMarginMiB is the ADDITIVE headroom applied instead of SafetyFactor when a verdict's
+// footprint came from a MEASURED observed peak (Confidence "exact") rather than an estimate.
+//
+// WHY the multiplicative factor is wrong for a measurement: SafetyFactor (0.92) exists to absorb
+// ESTIMATOR ERROR, and it scales with the CARD, not with the uncertainty. On a 16380 MiB card it
+// reserves ~1310 MiB unconditionally — so a model deliberately sized to fill 16 GB can never be
+// admitted no matter how much VRAM is actually free, even when we hold driver-truth numbers for it.
+// That was blocking the Qwen3.6-27B MTP profile at 64K (~15687 MiB), which the owner has
+// demonstrably run on this box with headroom.
+//
+// A measured peak has no estimator error left to absorb. What it still needs is a cushion for
+// allocator jitter and run-to-run variation: CUDA context/workspace sizes shift slightly between
+// runs, and free VRAM itself moves by tens of MiB with ordinary desktop activity (see
+// AdmissionNoiseMiB). 320 MiB sits comfortably above the ~50 MiB of observed VRAM noise and above the
+// run-to-run spread seen in calibration on this box (13856 → 13370 → 13152 MiB for the same model at
+// different profiles), while leaving a model that genuinely fits able to start.
+//
+// This applies ONLY to Confidence "exact". Every estimate — approximate or fallback — keeps the full
+// multiplicative SafetyFactor, so the OOM guard is untouched for any model that has not actually been
+// measured on this hardware.
+const CalibratedMarginMiB = 320
+
+// AdmissionNoiseMiB is the width of the VRAM-noise band around the admission boundary (M4.6).
+//
+// MEASURED, not guessed: on this box the Qwen3.6-27B MTP model at 8K q4_0 estimates 14107 MiB
+// while usable VRAM was observed between 14153 and 14168 MiB across runs — a margin of only
+// ~46-61 MiB. Ordinary desktop VRAM churn (a browser tab, a compositor redraw) is larger than
+// that, so the SAME request flipped between HTTP 201 (admitted) and HTTP 409 (refused) with
+// nothing about the model or the profile changing. That instability was originally misread as a
+// standing refusal (PLAN-run-stop-monitor.md §2 corrections).
+//
+// 256 MiB sits above the observed spread with room to spare, and well below the estimator's own
+// measured pessimism at this profile (+570 MiB: predicted 14107, observed 13537).
+//
+// What LocalHub does with it: a fit INSIDE this band is reported as `runs_degraded` with a numeric
+// reason saying the decision is within VRAM noise, and naming what makes it deterministic (record a
+// measured peak for this exact (K,V) pair, free VRAM, or lower the context). It deliberately does
+// NOT change admission: no new refusals, and — critically — no `runs` that would OOM. The verdict
+// becomes HONEST about a coin-flip instead of presenting it as a solid yes.
+const AdmissionNoiseMiB = 256
+
 // ReducedContextThreshold is the context below which "fits only at a reduced ctx" triggers
 // runs_degraded even when the estimate is confident. Per the task spec: "runs_degraded
 // when: fits only at reduced ctx (< 4096)". A model whose max-fitting context is below this

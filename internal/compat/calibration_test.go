@@ -186,8 +186,12 @@ func TestVerdictTightensAfterRecording(t *testing.T) {
 	// fallback estimate. We simulate the fallback by intercepting AFTER the store misses.
 	e := NewWithCalibration(store)
 	fallback := gguf.Result{VRAMMiB: 9000, Confidence: gguf.ConfidenceFallback, ParserVersion: gguf.ParserVersion + "+fallback-heuristic"}
+	// The fake must derive the calibration key exactly as production does — via
+	// Options.CalibrationKey(), the single derivation point (Options.CalibKey when set, else
+	// CanonicalKVKey of the effective (K,V) pair). Reading opts.KVCacheType directly is what let
+	// this test drift from the code it guards: the calibration key is NOT a dtype field.
 	e.ggufEstimate = func(_ context.Context, _ gguf.Source, opts gguf.Options) (gguf.Result, error) {
-		if mib, ok := store.ObservedPeak(key, opts.ContextLen, opts.KVCacheType); ok {
+		if mib, ok := store.ObservedPeak(key, opts.ContextLen, opts.CalibrationKey()); ok {
 			return gguf.Result{VRAMMiB: mib, Confidence: gguf.ConfidenceExact, ParserVersion: "calibration/observed-peak"}, nil
 		}
 		return fallback, nil

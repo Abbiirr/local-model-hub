@@ -96,6 +96,15 @@ every value in [`configs/config.example.yaml`](configs/config.example.yaml) is a
 built-in default, so the daemon runs with no config file. Copy it to `configs/config.yaml` to
 override (model dirs, engine paths, port, `admin_token`, residency/queue tuning, jobs worker).
 
+To relaunch the tray or daemon from the Windows Start Menu instead of a terminal, run
+`scripts/install-start-menu.ps1` after building both binaries. It creates a "LocalHub" Start
+Menu folder with "LocalHub Tray" and "LocalHub Daemon" shortcuts. It's separate from the
+tray's own "Start with Windows" menu toggle (an HKCU `Run` key entry) — this script only adds
+an on-demand launch point. Re-running it overwrites the shortcuts in place (no duplicates).
+Flags: `-RepoRoot <path>` (defaults to the repo root), `-Startup` (also auto-launch the tray
+at login via the per-user Startup folder — off by default), `-Uninstall` (remove everything
+this script created).
+
 ## API surfaces
 
 All bind to `127.0.0.1` by default (see [Hardware safeguards](#hardware-safeguards--auth)).

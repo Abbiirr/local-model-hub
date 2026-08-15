@@ -58,6 +58,78 @@ func TestQueueStore_PersistsStartContext(t *testing.T) {
 	}
 }
 
+// TestQueueStore_PersistsLaunchMode is the migration-0013 regression gate: a queue row's
+// Embedding/Pooling/Reranking server-mode fields must round-trip through SQLite exactly like the
+// 0009 sizing fields, so a restart re-seeds the SAME launch profile the request was admitted with
+// (the 2026-08-06 bge-m3 crash-loop defect: replaying without --embedding).
+func TestQueueStore_PersistsLaunchMode(t *testing.T) {
+	d, err := db.Open(filepath.Join(t.TempDir(), "q.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if err := d.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(`INSERT INTO models (id, display_name, source, format) VALUES ('bge-m3','bge-m3','local_path','gguf')`); err != nil {
+		t.Fatal(err)
+	}
+	store := NewQueueStore(d.DB)
+	q := NewQueue(QueueConfig{}, newFakeClock())
+
+	req := Request{
+		ID: "q-embed", ModelID: "bge-m3", Engine: "llamacpp", Class: ClassNormal,
+		Ctx: 8192, Profile: ProfileSpec{Embedding: true, Pooling: "mean"},
+	}
+	stored, err := q.Enqueue(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertWaiting(context.Background(), stored, "ram_blocked: test", 1000); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.get(context.Background(), "q-embed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Profile.Embedding {
+		t.Error("REGRESSION: req_embedding did not round-trip through SQLite — a restart would restore a plain generation start")
+	}
+	if got.Profile.Pooling != "mean" {
+		t.Errorf("req_pooling = %q, want %q", got.Profile.Pooling, "mean")
+	}
+	if got.Profile.Reranking {
+		t.Error("req_reranking must be false when not requested")
+	}
+
+	// Reranking: true persists independently and survives ListWaiting too (the restart re-seed path).
+	rerank := Request{ID: "q-rerank", ModelID: "bge-m3", Engine: "llamacpp", Class: ClassNormal, Profile: ProfileSpec{Reranking: true}}
+	stored2, err := q.Enqueue(rerank)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertWaiting(context.Background(), stored2, "ram_blocked: test", 1000); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.ListWaiting(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var foundRerank bool
+	for _, r := range rows {
+		if r.ID == "q-rerank" {
+			foundRerank = true
+			if !r.Profile.Reranking {
+				t.Error("REGRESSION: req_reranking did not round-trip through ListWaiting (the restart re-seed path)")
+			}
+		}
+	}
+	if !foundRerank {
+		t.Fatal("q-rerank row not found in ListWaiting")
+	}
+}
+
 // TestQueueStore_PersistsAssignedSeq is the fix-3 regression gate: durable WAITING rows must carry
 // the SAME monotonic seq the in-memory queue assigned (not 0), so read/restart paths that ORDER BY
 // seq keep FIFO determinism. Before the fix, Enqueue assigned the seq on its internal copy while the

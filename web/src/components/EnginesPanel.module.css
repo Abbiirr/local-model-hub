@@ -50,14 +50,36 @@
   justify-content: flex-end;
 }
 
-/* Long binary path / base URL: mono, truncated to one line (full value in the
-   element title on the row). */
+/* Long binary path / base URL.
+   This used to be `white-space: nowrap` + ellipsis, which cut a path such as
+   K:\projects\ai\local-model-hub\tools\llama.cpp\llama-server.exe off mid-word at the
+   panel edge — the operator could not tell WHICH of three llama.cpp builds a row was.
+   The full value now WRAPS. `overflow-wrap: anywhere` is what actually does the work:
+   a Windows path has no spaces, so a normal wrap has nowhere to break and would still
+   overflow the panel. The title attribute is kept for hover. */
 .baseUrl {
   font-family: var(--mono);
   font-size: 11px;
   color: var(--text-dim);
   margin: var(--s1) 0 var(--s2);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.45;
+}
+
+/* Engine reasons are full sentences containing unbreakable technical tokens
+   (`-ctk/-ctv`, `vllm/vllm-openai:latest`, commit hashes). Without an anywhere-break
+   those tokens push past the panel's right edge and the sentence reads as truncated.
+   Every card is also allowed to shrink — a grid item defaults to min-width:auto, which
+   otherwise lets one long token widen the whole column. */
+.card,
+.head,
+.name {
+  min-width: 0;
+}
+.reasonWrap {
+  overflow-wrap: anywhere;
+  margin-top: var(--s1);
 }

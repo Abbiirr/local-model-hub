@@ -53,6 +53,77 @@ describe('EnginesPanel', () => {
     ).toBeInTheDocument();
   });
 
+  // §3.5 — three llama.cpp builds are detected on the reference box and, before this, nothing on
+  // screen said which one a start would actually use. Selection walks CONFIGURED order and takes
+  // the first detected build that satisfies the model (compat/input.go bestLlamaBinary).
+  it('marks which of several detected llama.cpp builds is used, and why the others are not', () => {
+    const threeBuilds: Engine[] = [
+      {
+        name: 'llamacpp',
+        installed: true,
+        version: '10106 (1425386fd)',
+        running: true,
+        base_url: '',
+        reason: 'llama-server detected',
+        details: {
+          resolved_path: 'K:\\tools\\llama.cpp\\llama-server.exe',
+          backends: ['CPU', 'CUDA', 'RPC'],
+          capabilities: { has_spec_mtp: true, has_flash_attn: true, has_tq3: false },
+        },
+      },
+      {
+        name: 'llamacpp',
+        installed: true,
+        version: '1 (1cfa891)',
+        running: true,
+        base_url: '',
+        reason: 'llama-server detected (fork)',
+        details: {
+          resolved_path: 'K:\\llama.cpp-tq3\\llama-server.exe',
+          backends: ['CUDA'],
+          capabilities: { has_tq3: true },
+        },
+      },
+      {
+        name: 'llamacpp',
+        installed: true,
+        version: '8833 (45cac7ca7)',
+        running: true,
+        base_url: '',
+        reason: 'winget llama-server on PATH',
+        details: { resolved_path: 'llama-server', backends: ['Vulkan'], capabilities: {} },
+      },
+    ];
+    render(<EnginesPanel engines={threeBuilds} loading={false} error={null} />);
+
+    // Exactly ONE build is marked as the default choice.
+    expect(screen.getAllByText('used by default')).toHaveLength(1);
+    // The TQ3 fork is reachable only for TQ3_* quants — say so rather than leaving it ambiguous.
+    expect(screen.getByText(/fallback: TQ3_\* quants/)).toBeInTheDocument();
+    // The third build has no capability the default lacks, so it gets no misleading role label.
+    expect(screen.queryByText(/fallback: draft-mtp/)).toBeNull();
+  });
+
+  it('derives capability chips from the daemon\'s boolean capability map', () => {
+    // The llama.cpp adapter reports `capabilities` (a bool map), not the `caps` string list the
+    // original projection assumed — so on a real box the chip row showed backends only.
+    const withCapMap: Engine[] = [
+      {
+        name: 'llamacpp',
+        installed: true,
+        running: true,
+        base_url: '',
+        reason: 'detected',
+        details: { capabilities: { has_flash_attn: true, has_tq3: false, has_spec_mtp: true } },
+      },
+    ];
+    render(<EnginesPanel engines={withCapMap} loading={false} error={null} />);
+    expect(screen.getByText('flash-attn')).toBeInTheDocument();
+    expect(screen.getByText('spec-mtp')).toBeInTheDocument();
+    // A false capability is NOT advertised.
+    expect(screen.queryByText('tq3')).toBeNull();
+  });
+
   it('surfaces a load error reason', () => {
     render(
       <EnginesPanel

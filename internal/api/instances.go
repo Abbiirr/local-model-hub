@@ -79,6 +79,11 @@ func (s *Server) handleInstanceCreate(w http.ResponseWriter, r *http.Request) {
 			"the request body must be JSON: {model_id, engine?, ctx?, batch?, priority?, pin?, kv_quant?, allow_cpu_offload?, speculative?}. "+err.Error())
 		return
 	}
+	// This is the EXPLICIT operator start: the decommission gate (migration 0014) never refuses it on
+	// that basis alone, even when the model has auto_load_disabled=1. Every implicit/auto path (the
+	// OpenAI proxy, the residency queue drain loop, the jobs worker) leaves Manual at its zero value
+	// (false) instead.
+	req.Manual = true
 	inst, err := s.svc.StartInstance(r.Context(), req)
 	if err != nil {
 		// A residency-QUEUED start is NOT an error: return 202 Accepted + the queue position and
@@ -99,6 +104,14 @@ func (s *Server) handleInstanceCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, inst)
+}
+
+// handleInstanceAttach permanently refuses the retired external-process adoption path.
+// LocalHub must own model admission, spawn, drain, and verified VRAM reclaim end to end.
+func (s *Server) handleInstanceAttach(w http.ResponseWriter, r *http.Request) {
+	writeError(w, http.StatusGone, "attach_disabled",
+		"external instance adoption is disabled",
+		"LocalHub must launch models through POST /api/instances so admission, process ownership, draining, and VRAM reclaim remain enforceable")
 }
 
 // QueuedResponse is the 202 body for a residency-queued start (POST /api/instances). It carries
@@ -155,10 +168,19 @@ func (s *Server) handleInstanceStop(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "missing instance id", "the path must include an instance id")
 		return
 	}
-	inst, err := s.svc.StopInstanceAsync(r.Context(), id)
+	// ?force=true is required to stop an ADOPTED instance — one LocalHub did not spawn. Without it the
+	// service refuses (409), because killing a process owned by an external launcher must be a
+	// deliberate act, not the default behaviour of a Stop button.
+	force := r.URL.Query().Get("force") == "true"
+	inst, err := s.svc.StopInstanceAsyncForce(r.Context(), id, force)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			writeError(w, http.StatusNotFound, "not_found", "instance not found", err.Error())
+			return
+		}
+		if strings.Contains(err.Error(), "was ADOPTED") {
+			writeError(w, http.StatusConflict, "adopted_stop_refused",
+				"refusing to stop an adopted instance without force", err.Error())
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "instance_stop_failed",

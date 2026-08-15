@@ -180,6 +180,13 @@ type Request struct {
 	Pin      bool // pin the started instance (never auto-evict)
 	Priority int  // raw priority int the caller supplied (0/1/2 → class); preserved verbatim
 
+	// Profile is the REST of the behaviour-affecting launch profile (migration 0009): the
+	// independent KV pair, slot count, speculative mode + draft max, and CPU-offload permission.
+	// It MUST round-trip enqueue → daemon restart → drain → start unchanged; dropping any field
+	// silently rewrote the user's request on replay (an f16-KV replay of a q4_0 request priced
+	// ~1.5 GiB higher and waited forever — KNOWN-LIMITATIONS #21).
+	Profile ProfileSpec
+
 	// seq is the monotonic arrival sequence assigned at Enqueue — the FIFO/total-order key.
 	seq int64
 	// enqueuedAt is the clock time at Enqueue — the aging anchor.

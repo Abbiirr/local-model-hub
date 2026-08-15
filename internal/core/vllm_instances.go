@@ -27,6 +27,11 @@ func (s *Service) startVLLMInstance(ctx context.Context, req StartInstanceReques
 		return InstanceView{}, fmt.Errorf("resolve model %q: %w", req.ModelID, derr)
 	}
 
+	// Four-state residency policy (migration 0015) — see instances.go's identical call site for the
+	// full explanation; the same pin/TTL derivation applies uniformly across engines.
+	launchState := s.launchStateFor(ctx, req.ModelID)
+	ttlSeconds, forcePin := residencyPolicyForLaunchState(launchState, s.deps.Cfg.Residency.DefaultTTLSeconds)
+
 	mode := s.deps.Cfg.Engines.VLLM.Mode
 	spec := vllm.StartSpec{
 		InstanceID:      uuid.NewString(),
@@ -36,8 +41,8 @@ func (s *Service) startVLLMInstance(ctx context.Context, req StartInstanceReques
 		ExtraArgs:       s.deps.Cfg.Engines.VLLM.ExtraArgs,
 		ExtraDockerArgs: s.deps.Cfg.Engines.VLLM.ExtraDockerArgs,
 		Priority:        req.Priority,
-		Pinned:          req.Pin,
-		TTLSeconds:      s.deps.Cfg.Residency.DefaultTTLSeconds,
+		Pinned:          req.Pin || forcePin,
+		TTLSeconds:      ttlSeconds,
 	}
 
 	if mode == "attach" {
@@ -70,7 +75,8 @@ func (s *Service) startVLLMInstance(ctx context.Context, req StartInstanceReques
 	}
 	avail := s.engineAvailability(ctx)
 	verdict := s.deps.Compat.Evaluate(ctx, compat.Request{
-		Descriptor: desc, RequestedCtx: reqCtx, Batch: req.Batch, KVQuant: req.KVQuant,
+		Descriptor: desc, RequestedCtx: reqCtx, Batch: req.Batch,
+		Profile: legacyKVProfile(reqCtx, req.Batch, req.KVQuant),
 	}, snap, avail)
 
 	// Unified admission (fix 2): the SAME residency gate llama.cpp/Ollama use — route_loaded /

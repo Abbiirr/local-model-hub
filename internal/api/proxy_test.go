@@ -225,6 +225,33 @@ func TestV1ChatCompletions_Fast503OnBlock(t *testing.T) {
 	}
 }
 
+func TestProxyBlockErrorPreservesRefusalCategory(t *testing.T) {
+	tests := []struct {
+		kind     core.ProxyBlockKind
+		wantType string
+		wantCode string
+	}{
+		{core.ProxyBlockVRAM, "insufficient_vram", "admission_blocked"},
+		{core.ProxyBlockRAM, "insufficient_ram", "ram_blocked"},
+		{core.ProxyBlockGPUHot, "gpu_hot", "gpu_hot"},
+		{core.ProxyBlockGPUBusy, "gpu_busy", "gpu_busy"},
+		{core.ProxyBlockQueueFull, "queue_full", "queue_full"},
+		{core.ProxyBlockDecommissioned, "model_decommissioned", "model_decommissioned"},
+		{core.ProxyBlockIncompatible, "model_incompatible", "model_incompatible"},
+		{core.ProxyBlockModeMismatch, "mode_mismatch", "mode_mismatch"},
+		{core.ProxyBlockStarting, "starting", "model_starting"},
+		{core.ProxyBlockKind("future_kind"), "insufficient_vram", "admission_blocked"},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.kind), func(t *testing.T) {
+			gotType, gotCode := proxyBlockError(tt.kind)
+			if gotType != tt.wantType || gotCode != tt.wantCode {
+				t.Fatalf("proxyBlockError(%q) = %q/%q, want %q/%q", tt.kind, gotType, gotCode, tt.wantType, tt.wantCode)
+			}
+		})
+	}
+}
+
 // TestV1ChatCompletions_404ModelNotFound is the #p61 model-not-found gate.
 func TestV1ChatCompletions_404ModelNotFound(t *testing.T) {
 	srv, _ := proxyResidencyService(t, "http://127.0.0.1:1", 15200, false, compat.Verdict{Status: compat.StatusRuns})

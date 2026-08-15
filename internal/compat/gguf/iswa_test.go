@@ -74,7 +74,7 @@ func fakeGemma4(extra ...ggufparser.GGUFMetadataKV) *ggufparser.GGUFFile {
 //	total  = 134,217,728 B = exactly 128 MiB
 func TestISWAKVFloorBytes_Gemma4(t *testing.T) {
 	f := fakeGemma4()
-	bytes, nSWA, nGlobal, _, ok := iswaKVFloorBytes(f, 4096, KVCacheF16)
+	bytes, nSWA, nGlobal, _, ok := iswaKVFloorBytes(f, 4096, KVCacheF16, KVCacheF16)
 	if !ok {
 		t.Fatal("iswaKVFloorBytes: expected ok=true for a gemma4 fixture")
 	}
@@ -92,8 +92,8 @@ func TestISWAKVFloorBytes_Gemma4(t *testing.T) {
 // layer's worth of KV, not the whole cache.
 func TestISWAKVFloorBytes_GlobalScalesWithCtx(t *testing.T) {
 	f := fakeGemma4()
-	at4k, _, _, _, _ := iswaKVFloorBytes(f, 4096, KVCacheF16)
-	at8k, _, _, _, _ := iswaKVFloorBytes(f, 8192, KVCacheF16)
+	at4k, _, _, _, _ := iswaKVFloorBytes(f, 4096, KVCacheF16, KVCacheF16)
+	at8k, _, _, _, _ := iswaKVFloorBytes(f, 8192, KVCacheF16, KVCacheF16)
 	// One global layer: (512+512)*1*2 = 2048 B/token; extra 4096 tokens = 8,388,608 B.
 	if got := at8k - at4k; got != 8_388_608 {
 		t.Errorf("ctx 4k->8k KV delta: got %d B, want 8,388,608 B (one global layer * 4096 tokens)", got)
@@ -111,7 +111,7 @@ func TestISWAKVFloorBytes_NonSWA(t *testing.T) {
 		scalarU32("llama.attention.head_count_kv", 8),
 	}
 	f := &ggufparser.GGUFFile{Header: ggufparser.GGUFHeader{MetadataKV: kvs}}
-	if _, _, _, _, ok := iswaKVFloorBytes(f, 4096, KVCacheF16); ok {
+	if _, _, _, _, ok := iswaKVFloorBytes(f, 4096, KVCacheF16, KVCacheF16); ok {
 		t.Error("iswaKVFloorBytes: non-SWA model must return ok=false")
 	}
 }
@@ -120,8 +120,8 @@ func TestISWAKVFloorBytes_NonSWA(t *testing.T) {
 // q4_0 cache floor must be well below the f16 floor (fewer bytes per element).
 func TestISWAKVFloorBytes_QuantizedIsSmaller(t *testing.T) {
 	f := fakeGemma4()
-	f16, _, _, _, _ := iswaKVFloorBytes(f, 4096, KVCacheF16)
-	q4, _, _, _, _ := iswaKVFloorBytes(f, 4096, KVCacheQ4_0)
+	f16, _, _, _, _ := iswaKVFloorBytes(f, 4096, KVCacheF16, KVCacheF16)
+	q4, _, _, _, _ := iswaKVFloorBytes(f, 4096, KVCacheQ4_0, KVCacheQ4_0)
 	if q4 >= f16 {
 		t.Errorf("q4_0 floor (%d) should be smaller than f16 floor (%d)", q4, f16)
 	}

@@ -1,0 +1,41 @@
+-- 0015_model_launch_state.sql
+-- ADDITIVE migration (data-model.md: additive only). Nullable/defaulted column only; the old
+-- auto_load_disabled column (migration 0014) is KEPT, untouched, and no longer treated as the
+-- source of truth (see model_launch_state.go).
+--
+-- WHY: migration 0014 gave the operator exactly one lever — "never auto-load this model" — because
+-- that was the one thing the RAM-exhaustion incident needed. In practice the operator needs FOUR
+-- distinct residency/eagerness policies per model, not a boolean:
+--
+--   launch_state           loaded   evictable   idle-TTL   auto-loads on
+--                          when idle? under      unload?    an incoming
+--                                    pressure?              request?
+--   -------------------- -------- ----------- ---------- --------------
+--   always_available        YES      NO (pinned)  NO         yes
+--   available                YES      yes          NO         yes
+--   available_on_request    NO       yes          YES        yes
+--   unavailable              NO       n/a          n/a        NEVER (operator must POST
+--                                                              /api/instances manually)
+--
+-- Only `unavailable` refuses an auto-load; the other three all auto-load on request and differ only
+-- in eagerness/eviction/TTL. `unavailable` is also the ONLY state that hides a model from
+-- GET /v1/models (identical to migration 0014's decommission visibility rule) — there is no other
+-- list-hiding tied to this column.
+--
+-- `available_on_request` is the DEFAULT for every existing and new model — it reproduces today's
+-- pre-0015 behavior (cold until requested, normal idle-TTL, normal eviction) for every model that
+-- was not decommissioned.
+--
+-- DATA MIGRATION: a row already decommissioned under 0014 (auto_load_disabled=1) MUST carry that
+-- forward as launch_state='unavailable' — the owner has a model decommissioned RIGHT NOW
+-- (Qwen3.6-27B, exhausted this box's 16 GB RAM when auto-started) and it must stay unavailable
+-- across this migration, not silently reset to the default.
+--
+-- Toggled via PUT /api/models/{id}/launch-state {"state": "..."} (docs/api-spec.md). The old
+-- PUT /api/models/{id}/auto-load {"enabled": bool} endpoint is kept as a DEPRECATED alias:
+-- enabled=false -> unavailable, enabled=true -> available_on_request (never grants
+-- always_available/available — it only ever restores the pre-0015 "normal" meaning).
+
+ALTER TABLE models ADD COLUMN launch_state TEXT NOT NULL DEFAULT 'available_on_request';
+
+UPDATE models SET launch_state = 'unavailable' WHERE auto_load_disabled = 1;

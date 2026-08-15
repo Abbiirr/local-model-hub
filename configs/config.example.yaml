@@ -7,10 +7,23 @@
 # Kept in sync with examples/config.example.yaml. Fields new to P1.1 (allow_nonlocal,
 # llamacpp.binary_paths, vllm.mode/attach_url, logging.*) are documented inline.
 
+# TWO OPERATING MODES (owner directive 2026-07-25; rationale in docs/security.md
+# "Two operating modes"). Other hosts always talk to THIS port (default 39876); engine ports
+# (40100+) stay loopback-only so all traffic passes admission + in-flight accounting.
+#
+#   Mode A — LAN-open, passwordless:  bind 0.0.0.0 + allow_nonlocal true + admin_token null
+#     Any host that can reach the port gets FULL ADMIN (start/stop GPU processes, download
+#     models). Trusted networks only. 0.0.0.0 publishes on every interface, including any
+#     ZeroTier/VPN overlay — not just the Ethernet LAN.
+#   Mode B — token enforced (e.g. behind Tailscale Serve): bind 127.0.0.1 + admin_token set
+#     Requires `Authorization: Bearer <token>` on every /api/* and /v1/* request.
+#
+# LIMITATION: admin_token is a SINGLE GLOBAL switch — it cannot be "off for LAN, on for
+# Tailscale". Origin-aware auth is unbuilt work (docs/security.md). Pick one mode at a time.
 server:
   bind: "127.0.0.1"          # loopback only. Non-loopback binds hard-fail unless allow_nonlocal.
-  port: 39876
-  admin_token: null          # optional single bearer token for LAN/headless use
+  port: 39876                # the ONLY port other hosts need
+  admin_token: null          # optional single bearer token for LAN/headless use (Mode B)
   trust_tailscale_headers: true
   # DANGEROUS: allow binding off 127.0.0.1. LocalHub can free/allocate GPU memory and stop
   # model processes; off-loopback exposes admin controls with no auth by default. Leave false.
@@ -48,6 +61,12 @@ engines:
     # Seconds to wait for a spawned model's /health to answer before FAILED (P4.2). Big
     # models load slowly; default 120.
     health_timeout_seconds: 120
+    # Optional already-running single-model llama.cpp servers on this LAN/tailnet.
+    # Clients use only the stable id through LocalHub; upstream_model stays upstream-only.
+    remote_models: []
+    #  - id: "kat"
+    #    base_url: "http://192.168.0.157:8080"
+    #    upstream_model: "/home/user/models/kat-coder-v2.5.gguf"
   vllm:
     enabled: true
     # vLLM has no native Windows support (PLAN.md resolution 4): use "docker" (spawn

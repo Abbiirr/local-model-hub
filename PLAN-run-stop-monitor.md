@@ -4,6 +4,86 @@
 > monitor, drain, stop, and recover it with the validated llama.cpp MTP profile. Supervised
 > external-process integration only (ADR-005), single box (ADR-007), no preemption (ADR-001).
 
+## 0-B. Revision 5 (2026-07-25, evening) — M2/M3/M4/M5 landed; two gates remain
+
+Build, vet, full Go suite (**19/19 packages**), web (**101/101**, was 80), typecheck and production
+build are all green. The daemon was rebuilt and restarted; **the pinned Qwen3.6-27B was never stopped**
+— it orphaned across the restart and startup reconcile re-attached it at the same pid (13884).
+
+**Landed this session:**
+- **M3.1 capability probe (LIVE).** `has_spec_mtp`, `has_spec_draft_max`, `has_kv_cache_types`,
+  `has_parallel_slots` added and published. Re-verified against all three binaries' real `--help`
+  BEFORE relying on them; `/api/engines` now discriminates live — only b10106 has `has_spec_mtp`, the
+  fork keeps `has_tq3`. `SupportsKVQuant` is probed instead of hardcoded true.
+- **M3.2–M3.5.** MTP tensor detection (`.nextn.`, no model load), both-sides gating, exact pinned flags
+  (`-ctk q8_0 -ctv q4_0 -np 1 --spec-type draft-mtp --spec-draft-n-max 2`), the capability-bit
+  `-ctv tq3_0` REPLACED, and a reason on every refusal naming which side failed.
+- **M2.1/M2.3/M2.4/M2.5.** `kv_type_k`/`kv_type_v`/`slots`/`spec_draft_max` on the API (kv_quant kept as
+  a documented shorthand), a UI advanced start form, migration **0009** persisting the whole profile in
+  the queue, and **0011** + `/api/models/{id}/launch-default` for advisory per-model defaults.
+- **M4.1/M4.2/M4.6.** Independent K/V sizing — which uncovered a real defect: the canonical calibration
+  key was being smuggled through `Options.KVCacheType`, a field the TQ3 fallback and the iSWA floor
+  consume as a real dtype, so an asymmetric profile was silently priced as f16/f16 with a note
+  contradicting the emitted flags. Split into an explicit `CalibKey`. Plus the MTP head surcharge and
+  the knife-edge (`AdmissionNoiseMiB = 256`) reported honestly as `runs_degraded`.
+- **M5.1/M5.2/M5.5.** A post-HEALTHY monitor (15 s), migrations **0010** (`last_health_at`,
+  `health_failures`, `reclaim_verified`), FAILED-not-STOPPED on an unobserved death, and reap-after-3
+  that never touches a pinned or busy instance. **Live:** `last_health_at` advances on the real engine.
+
+**The two gates that remain OPEN, and why (do not close them on unit evidence):**
+1. **M6.6 live queue replay** — needs a start that passes the verdict but does not fit. In the current
+   VRAM state everything that passes fits in the free ~1.6 GiB (and would start a second model), and
+   everything larger is refused `wont_run` before a queue row exists.
+2. **M5.GATE live kill** — needs a disposable HEALTHY process; there is no VRAM headroom for one while
+   the 27B is up.
+
+Both need either a window with the 27B down or a deliberate config nudge (e.g. temporarily raising
+`residency.min_free_ram_mib` above free RAM so a start queues on the RAM floor). Everything else in
+M2–M5 is unit/table-proven, and migrations 0009–0011 are live-applied to the production DB.
+
+## 0-A. Revision 4 (2026-07-25, later same day) — what has since LANDED
+
+A builder session plus this session implemented the front of the work order. **Build, vet, and the
+full Go suite are green (19/19 packages); the daemon was rebuilt and swapped WITHOUT interrupting
+the running model** — it survived as an orphan and startup reconcile reattached it.
+
+**Landed and live-verified:**
+- **M3.7 (A)+(B) + M3.6 — binary selection.** `HasCUDA` is no longer a selection criterion;
+  `bestLlamaBinary` takes a `BinaryRequirements` capability filter and returns the first *detected*
+  binary in **configured order**. Backend detection now infers backends from the co-located
+  `ggml-*` libraries when `--version` advertises none (`backendsFromDir`).
+  **Live:** `/api/engines` reports b10106 as `backends: [CPU, CUDA, RPC]` (was `null`).
+- **M1.GATE closed, both directions.** With the TQ3 fork and winget build restored as fallbacks,
+  the Qwen3.6 MTP model resolves to engine choice **"CUDA build"** (b10106, by configured order —
+  nothing deleted), and TQ3_4S still resolves to **"CUDA fork (has_tq3)"**. The
+  `binary_paths: []` workaround described in §3 is **gone**.
+- **M2.2 (partial) — one profile per launch.** `compat.Request.KVQuant` (bool) is replaced by
+  `Request.Profile compat.LaunchProfile`, and `PlanLlamaLaunch(d, avail, profile)` takes the same
+  profile. `internal/core` now builds **one** profile per start (`startProfile` /
+  `legacyKVProfile` in `core/compat.go`) feeding *both* the verdict and the launch plan, so the
+  admitted footprint and the spawned flags cannot diverge.
+- **New defect found and fixed — calibration key.** The (K,V) refactor populated only
+  `KVCacheTypeK/V` and left the legacy `KVCacheType` empty. That field is the observed-peak
+  **calibration key**, so every recorded measurement missed and verdicts silently degraded from
+  `exact` to `fallback` confidence (caught by two failing tests). Fixed with
+  `gguf.CanonicalKVKey`: symmetric pairs render as today's values so no stored row is invalidated;
+  asymmetric renders `q8_0/q4_0` and correctly misses until measured. See KNOWN-LIMITATIONS #20.
+- **Access mode.** The box now runs **Mode A** (LAN-open, unauthenticated) per owner decision:
+  `bind: 0.0.0.0`, `allow_nonlocal: true`, `admin_token: null`, reachable on **port 39876** over
+  Ethernet and both ZeroTier overlays. Engine ports stay loopback-only. The two-mode design and
+  its blocker are documented in docs/security.md and KNOWN-LIMITATIONS #22.
+
+**Still open — the model runs at 8K, q4_0/q4_0, NO MTP:** M3.1-M3.5 (`has_spec_mtp` probe, MTP
+tensor detection, emitting `--spec-type draft-mtp --spec-draft-n-max 2 -np 1`), M2.1/M2.3/M2.4
+(profile fields on the REST API + UI, and the additive queue migration), M4 (independent K/V
+sizing, MTP head, the ~50 MiB knife-edge), M5 (post-HEALTHY reconciliation, reclaim-timeout), and
+**TESTING.md `#m0..#m6` criteria still do not exist.**
+
+Everything below is Revision 3 and remains accurate except where superseded above — notably §3's
+`binary_paths: []` workaround and §4 B-3 / D2 / D6, now delivered.
+
+---
+
 ## 0. Method and status of this revision
 
 **Revision 3 (2026-07-25).** Every claim below was re-executed on this box in this session.

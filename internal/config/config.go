@@ -9,6 +9,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -21,6 +22,7 @@ import (
 type Config struct {
 	Server        ServerConfig        `yaml:"server"`
 	Data          DataConfig          `yaml:"data"`
+	Downloads     DownloadsConfig     `yaml:"downloads"`
 	Hardware      HardwareConfig      `yaml:"hardware"`
 	Engines       EnginesConfig       `yaml:"engines"`
 	Compatibility CompatibilityConfig `yaml:"compatibility"`
@@ -92,6 +94,24 @@ type DataConfig struct {
 	DataDir string `yaml:"data_dir"`
 }
 
+// DownloadsConfig tunes the download safeguards in internal/manifest/guards.go. Both fields
+// are byte counts; 0 means "use the built-in constant" so an existing config.yaml that omits
+// this block keeps today's behavior exactly.
+//
+// These were hardcoded constants (HardCapBytes 8 GiB, DiskHeadroomBytes 5 GiB) whose comment
+// read "K: has only ~24 GB free". That premise goes stale: the guard kept refusing 10 GiB 27B
+// quants long after the disk had 72 GiB free. The headroom check below is the safeguard that
+// actually tracks reality — it is measured against live free disk at request time — so MaxBytes
+// is a coarse sanity ceiling, not the primary protection.
+type DownloadsConfig struct {
+	// MaxBytes is the absolute per-download ceiling. A download whose total exceeds this is
+	// refused regardless of free disk. 0 => manifest.HardCapBytes.
+	MaxBytes int64 `yaml:"max_bytes"`
+	// DiskHeadroomBytes is the free space that must REMAIN after a download completes. This is
+	// the guard that adapts to actual conditions. 0 => manifest.DiskHeadroomBytes.
+	DiskHeadroomBytes int64 `yaml:"disk_headroom_bytes"`
+}
+
 type HardwareConfig struct {
 	NVIDIA              bool `yaml:"nvidia"`
 	ROCm                bool `yaml:"rocm"`
@@ -133,6 +153,20 @@ type LlamaCPPConfig struct {
 	// applied ONLY to absolute-path candidates (via llamacpp.NewFromPaths); the bare-name
 	// winget build on PATH is unaffected.
 	ExtraPath []string `yaml:"extra_path"`
+	// RemoteModels are already-running single-model llama.cpp servers on this LAN/tailnet.
+	// LocalHub does not start, stop, admit, or account their GPU: it verifies /health plus
+	// /v1/models identity and relays inference through the same LocalHub /v1 surface.
+	// This is deliberately llama.cpp-specific static configuration, not provider routing.
+	RemoteModels []RemoteLlamaCPPModelConfig `yaml:"remote_models"`
+}
+
+// RemoteLlamaCPPModelConfig gives a remote single-model llama.cpp server a stable LocalHub ID.
+// UpstreamModel is the exact model identifier advertised by that server; LocalHub rewrites the
+// client's stable ID to it before relay so clients never need the remote filesystem path.
+type RemoteLlamaCPPModelConfig struct {
+	ID            string `yaml:"id"`
+	BaseURL       string `yaml:"base_url"`
+	UpstreamModel string `yaml:"upstream_model"`
 }
 
 type VLLMConfig struct {
@@ -231,6 +265,15 @@ type LoggingConfig struct {
 	Level string `yaml:"level"`
 	// Format is "text" or "json". Default text.
 	Format string `yaml:"format"`
+	// File, when non-empty, is a path the daemon appends logs to IN ADDITION to stderr.
+	// Relative paths resolve against the process working directory.
+	//
+	// This exists because localhub.exe is built for the Windows GUI subsystem
+	// (-H=windowsgui) so it never opens a console window. With no console, writes to
+	// stderr go to an invalid handle and are silently discarded — without a file sink the
+	// daemon would run completely mute. Empty is still valid (tests and non-Windows builds
+	// use it); it just means "stderr only".
+	File string `yaml:"file"`
 }
 
 // Default returns a Config populated with the reference-box defaults. These match
@@ -245,6 +288,13 @@ func Default() Config {
 			AllowNonlocal:         false,
 		},
 		Data: defaultDataConfig(),
+		Downloads: DownloadsConfig{
+			// 24 GiB: comfortably clears the largest single-file quant of a 27B (Q8_0 ~26.7 GB
+			// is still refused, which is intentional on a 16 GB box), while the disk-headroom
+			// check does the real work of protecting free space.
+			MaxBytes:          24 << 30,
+			DiskHeadroomBytes: 5 << 30,
+		},
 		Hardware: HardwareConfig{
 			NVIDIA:              true,
 			ROCm:                false,
@@ -394,6 +444,11 @@ func (c *Config) normalize() {
 		}
 		lc.BinaryPaths = merged
 	}
+	for i := range lc.RemoteModels {
+		lc.RemoteModels[i].ID = strings.TrimSpace(lc.RemoteModels[i].ID)
+		lc.RemoteModels[i].BaseURL = strings.TrimRight(strings.TrimSpace(lc.RemoteModels[i].BaseURL), "/")
+		lc.RemoteModels[i].UpstreamModel = strings.TrimSpace(lc.RemoteModels[i].UpstreamModel)
+	}
 	c.Logging.Level = strings.ToLower(strings.TrimSpace(c.Logging.Level))
 	c.Logging.Format = strings.ToLower(strings.TrimSpace(c.Logging.Format))
 	c.Engines.VLLM.Mode = strings.ToLower(strings.TrimSpace(c.Engines.VLLM.Mode))
@@ -429,6 +484,12 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.Server.Bind) == "" {
 		return fmt.Errorf("server.bind must not be empty")
 	}
+	if c.Downloads.MaxBytes < 0 {
+		return fmt.Errorf("downloads.max_bytes must not be negative (got %d); use 0 for the built-in default", c.Downloads.MaxBytes)
+	}
+	if c.Downloads.DiskHeadroomBytes < 0 {
+		return fmt.Errorf("downloads.disk_headroom_bytes must not be negative (got %d); use 0 for the built-in default", c.Downloads.DiskHeadroomBytes)
+	}
 	if err := validateBind(c.Server.Bind, c.Server.AllowNonlocal); err != nil {
 		return err
 	}
@@ -448,6 +509,9 @@ func (c *Config) Validate() error {
 		if len(c.Engines.LlamaCPP.BinaryPaths) == 0 {
 			return fmt.Errorf("engines.llamacpp: no binary_path/binary_paths configured")
 		}
+	}
+	if err := validateRemoteLlamaCPPModels(c.Engines.LlamaCPP.Enabled, c.Engines.LlamaCPP.RemoteModels); err != nil {
+		return err
 	}
 	if c.Engines.VLLM.Enabled {
 		if !validVLLMModes[c.Engines.VLLM.Mode] {
@@ -480,6 +544,34 @@ func (c *Config) Validate() error {
 	}
 	if err := c.validateCluster(); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateRemoteLlamaCPPModels(enabled bool, models []RemoteLlamaCPPModelConfig) error {
+	if len(models) > 0 && !enabled {
+		return fmt.Errorf("engines.llamacpp.remote_models requires engines.llamacpp.enabled=true")
+	}
+	seen := make(map[string]bool, len(models))
+	for i, model := range models {
+		field := fmt.Sprintf("engines.llamacpp.remote_models[%d]", i)
+		if model.ID == "" {
+			return fmt.Errorf("%s.id must not be empty", field)
+		}
+		if seen[model.ID] {
+			return fmt.Errorf("%s.id %q is duplicated; remote model IDs must be unique", field, model.ID)
+		}
+		seen[model.ID] = true
+		if model.UpstreamModel == "" {
+			return fmt.Errorf("%s.upstream_model must not be empty", field)
+		}
+		u, err := url.Parse(model.BaseURL)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return fmt.Errorf("%s.base_url %q must be an absolute http(s) URL", field, model.BaseURL)
+		}
+		if u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+			return fmt.Errorf("%s.base_url %q must contain only scheme and host (no credentials, path, query, or fragment)", field, model.BaseURL)
+		}
 	}
 	return nil
 }

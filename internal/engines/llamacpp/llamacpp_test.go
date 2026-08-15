@@ -35,6 +35,22 @@ built with MSVC 19.44.35224.0 for Windows AMD64`
 --sleep-idle-seconds SECONDS        number of seconds of idleness after which the server will sleep`
 )
 
+// modernVersionOut reproduces the verified b10106 `--version` shape (2026-07-25): build number
+// + commit + a "built with" line, and NO backend banner at all — modern llama.cpp loads its
+// backends (ggml-cuda.dll etc.) as dynamic sibling libraries. This is the defect M3.7/B fixes.
+const modernVersionOut = `version: 10106 (1425386fd)
+built with Clang 20.1.8 for Windows x86_64`
+
+// modernHelpOut carries the capability flags the b10106 build exposes (verified from its real
+// --help). Only the tokens parseCapabilities greps need to be present.
+const modernHelpOut = `-fa,   --flash-attn [on|off|auto]   set Flash Attention use
+-fit,  --fit [on|off]               whether to adjust unset arguments to fit in device memory
+--sleep-idle-seconds SECONDS        number of seconds of idleness after which the server will sleep
+-ctk,  --cache-type-k TYPE          KV cache data type for K
+-ctv,  --cache-type-v TYPE          KV cache data type for V
+--spec-draft-n-max N                number of tokens to draft for speculative decoding
+--spec-type none,draft-simple,draft-eagle3,draft-mtp,ngram-cache`
+
 // writeFakeLlama writes a fake llama-server that prints versionOut on --version and helpOut
 // on --help (both to stderr, matching real llama.cpp which writes there).
 func writeFakeLlama(t *testing.T, name, versionOut, helpOut string) string {
@@ -192,6 +208,88 @@ func TestParseVersion(t *testing.T) {
 	}
 	if v, _ := parseVersion("no version here"); v != "" {
 		t.Errorf("parseVersion on garbage should be empty, got %q", v)
+	}
+}
+
+// --- M3.7/B: co-located DLL inference for builds that advertise no backends -----------------
+
+// writeDLLs writes empty files named after the given ggml backend libraries into dir.
+func writeDLLs(t *testing.T, dir string, names ...string) {
+	t.Helper()
+	for _, n := range names {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte{}, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestBackendsFromDir_InfersCUDAFromColocatedDLL(t *testing.T) {
+	dir := t.TempDir()
+	writeDLLs(t, dir, "ggml-base.dll", "ggml-cuda.dll", "ggml-cpu-haswell.dll", "ggml-rpc.dll")
+	got := backendsFromDir(filepath.Join(dir, "llama-server.exe"))
+	if !containsStr(got, "CUDA") {
+		t.Errorf("co-located ggml-cuda.dll must infer CUDA, got %v", got)
+	}
+	if !containsStr(got, "CPU") {
+		t.Errorf("co-located ggml-cpu-*.dll must infer CPU, got %v", got)
+	}
+	if containsStr(got, "base") { // ggml-base.dll is NOT a backend
+		t.Errorf("ggml-base.dll must not be reported as a backend, got %v", got)
+	}
+}
+
+func TestBackendsFromDir_NoGGMLFiles(t *testing.T) {
+	dir := t.TempDir()
+	writeDLLs(t, dir, "unrelated.dll", "llama-server.exe")
+	if got := backendsFromDir(filepath.Join(dir, "llama-server.exe")); len(got) != 0 {
+		t.Errorf("dir with no ggml-* libs must yield no backends, got %v", got)
+	}
+}
+
+func TestBackendsFromDir_NormalizesVulkanRPC(t *testing.T) {
+	dir := t.TempDir()
+	writeDLLs(t, dir, "ggml-vulkan.dll", "ggml-rpc.dll")
+	got := backendsFromDir(filepath.Join(dir, "llama-server.exe"))
+	if !containsStr(got, "Vulkan") || !containsStr(got, "RPC") {
+		t.Errorf("expected normalized Vulkan+RPC, got %v", got)
+	}
+}
+
+// TestDetect_ModernBuildNoBackendBanner_InfersCUDA is the core M3.7/B regression: a modern
+// llama.cpp build whose `--version` prints NO backend line is still detected as CUDA via its
+// co-located ggml-cuda.dll, so it stops being misread as backend-less / has_cuda=false. Without
+// the fix, parseBackends returns [] and HasCUDA is false — which used to make b10106 lose
+// selection to the fork. The co-located DLL is the verified primary-source signal.
+func TestDetect_ModernBuildNoBackendBanner_InfersCUDA(t *testing.T) {
+	bin := writeFakeLlama(t, "llama-server", modernVersionOut, modernHelpOut)
+	// Place a co-located ggml-cuda.dll beside the fake binary, exactly as b10106 ships.
+	writeDLLs(t, filepath.Dir(bin), "ggml-cuda.dll", "ggml-base.dll", "ggml-cpu-haswell.dll")
+	a := New([]BinarySpec{{Path: bin}})
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	sts := a.Detect(ctx)
+
+	st := sts[0]
+	if !st.Detected {
+		t.Fatalf("want detected, got %+v", st)
+	}
+	if !strings.Contains(st.Version, "10106") || !strings.Contains(st.Version, "1425386fd") {
+		t.Errorf("version: got %q want 10106 (1425386fd)", st.Version)
+	}
+	backends, _ := st.Details["backends"].([]string)
+	if !containsStr(backends, "CUDA") {
+		t.Errorf("modern build with co-located ggml-cuda.dll MUST report CUDA, got %v", backends)
+	}
+	// The reason must NOT say "backends: none reported" (the pre-fix symptom).
+	if strings.Contains(st.Reason, "none reported") {
+		t.Errorf("reason must not report 'none reported' for a CUDA build, got %q", st.Reason)
+	}
+	caps, _ := st.Details["capabilities"].(map[string]bool)
+	if !caps["has_flash_attn"] || !caps["has_fit"] {
+		t.Errorf("modern build caps wrong: %v", caps)
+	}
+	if caps["has_tq3"] {
+		t.Errorf("modern build must NOT report tq3, got %v", caps)
 	}
 }
 

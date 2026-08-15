@@ -23,7 +23,7 @@
    ┌────────────────▼─────────────────┐
    │  Web UI (bundled static assets)  │   GPU • models • queue • engines • logs
    └────────────────┬─────────────────┘
-                    │  REST + SSE + WebSocket + JSON-RPC + OpenAI proxy (/v1/*)
+                    │  REST + SSE + WebSocket + JSON-RPC + inference APIs (/v1/*)
    ┌────────────────▼─────────────────┐
    │        Control Plane (daemon)    │
    │  ┌────────────┬────────────────┐ │
@@ -48,10 +48,11 @@
 ### Control plane
 
 Long-running daemon. Owns SQLite, exposes the API over four thin transports (REST + SSE +
-WebSocket + JSON-RPC 2.0) plus the Phase-6 OpenAI proxy (`/v1/*`) — all sitting over **one**
-service core, no business logic duplicated per transport (PLAN.md decision 7). Runs the
-hardware/metrics loop, supervises engine processes it launched (llama.cpp, vLLM), and talks
-to the shared Ollama daemon over HTTP.
+WebSocket + JSON-RPC 2.0), the Phase-6 OpenAI proxy, and a shipped experimental Anthropic
+Messages compatibility adapter (`/v1/messages`) — all sitting over **one** service core,
+with no admission, residency, or lifecycle logic duplicated per transport (PLAN.md
+decision 7). Runs the hardware/metrics loop, supervises engine processes it launched
+(llama.cpp, vLLM), and talks to the shared Ollama daemon over HTTP.
 
 ### Engine adapters
 
@@ -153,8 +154,39 @@ client → /v1/chat/completions (thin proxy)
       → record tokens/s, TTFT, latency, memory delta
 ```
 
-The Phase-6 proxy is shipped: `/v1/chat/completions` and `/v1/completions` route by model
+The Phase-6 proxy is shipped: `/v1/chat/completions`, `/v1/completions`, and
+`/v1/responses` route by model
 name through admission and stream tokens back with byte-passthrough. Because every proxied
 request goes through the counted relay, a non-pinned instance serving a proxied stream is
 visible to the never-kill-active gate — the active-stream safety story is only complete when
 clients enter through LocalHub (proxy/relay), not when they hit an engine `base_url` directly.
+The Responses route performs narrow compatibility normalization for Codex local subagents.
+It canonicalizes role-typed input and flattens Codex namespace tools before the local engine,
+then restores namespace metadata only on matching function-call output so Codex can dispatch
+the call. Other streamed events remain byte-preserved. This is a protocol-shape bridge, not
+tool execution: Codex/MCP still owns approval, execution, and tool results.
+
+## Data flow: Anthropic Messages adapter (experimental)
+
+```
+Claude Code / Anthropic-format client
+      -> POST /v1/messages
+      -> authenticate + validate anthropic-version
+      -> translate Messages/text/tool blocks to OpenAI chat-completions
+      -> existing model resolution + residency admission + counted relay
+      -> local engine's OpenAI-compatible endpoint
+      -> translate message/tool calls/usage/errors to Anthropic objects
+      -> re-frame streaming deltas as Anthropic named SSE events
+```
+
+Unlike the OpenAI routes, the Anthropic route cannot be byte-passthrough: the two protocols
+use different request objects, content/tool blocks, error envelopes, stop reasons, and SSE
+event sequences. The translator is therefore an edge adapter over the existing service core
+and relay, not a new inference service or scheduler. Client-side tools are described to the
+model and returned as `tool_use`; LocalHub does not execute Claude Code's tools.
+
+The adapter boundary is intentionally narrow (ADR-010). It does not own keys, budgets,
+rate limits, billing, multi-provider routing or fallback, load balancing, or caching.
+Those remain the responsibility of LiteLLM or another gateway placed in front. A local
+model reached through this adapter is explicitly non-Claude and receives no claim of
+Anthropic support or behavioral equivalence.

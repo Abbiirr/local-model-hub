@@ -54,7 +54,7 @@ func (g GuardConfig) headroom() int64 {
 func (g GuardConfig) CheckDownloadSize(sizeBytes int64) error {
 	if sizeBytes > g.hardCap() {
 		return fmt.Errorf(
-			"refusing download of %s: exceeds the %s hard cap for this box (PLAN.md safeguard — disk is nearly full)",
+			"refusing download of %s: exceeds the %s per-download hard cap (raise downloads.max_bytes in config.yaml to allow larger models)",
 			humanBytes(sizeBytes), humanBytes(g.hardCap()))
 	}
 	if g.FreeDiskBytes > 0 {

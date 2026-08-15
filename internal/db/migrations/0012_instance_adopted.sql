@@ -1,0 +1,32 @@
+-- 0012_instance_adopted.sql
+-- ADDITIVE migration (data-model.md: additive only). Nullable/defaulted columns only.
+--
+-- WHY: until now LocalHub could only manage a process it SPAWNED itself. The reference box runs the
+-- proven Qwen3.6-27B 64K MTP profile from scripts/run-qwen-64k-q4q4.ps1 on port 8080 — a real,
+-- healthy, serving llama-server that LocalHub was blind to. Worse, LocalHub's own estimator REFUSED
+-- that same profile (`wont_run`, ~15.7 GiB estimated) even though it demonstrably runs, because
+-- gguf-parser over-prices a hybrid SSM model's KV cache. An honest control plane must not argue with
+-- a process that is already serving traffic.
+--
+-- Adoption inverts the relationship for these instances: instead of PREDICTING whether a model fits,
+-- LocalHub READS what is actually running — the PID, the real command line (hence the real context,
+-- KV types, speculative mode and slot count), and the process's ACTUAL per-process VRAM from
+-- nvidia-smi. That measurement is then recorded as an observed peak, which is precisely what the
+-- estimator needs in order to stop guessing about this profile.
+--
+--   adopted            1 = LocalHub did NOT spawn this process; it attached to one already running.
+--                      Consequences, all enforced in code:
+--                        * NEVER auto-evicted by residency. LocalHub did not create it and cannot
+--                          know what depends on it, so reclaiming its VRAM is not LocalHub's call.
+--                        * Stop requires an explicit force, because "stop" here means killing a
+--                          process someone else started (typically a script with its own lifecycle).
+--                        * Its VRAM is real and already reflected in every NVML free-VRAM read, so
+--                          admission accounts for it automatically with no extra bookkeeping.
+--   adopted_source     free text describing WHERE it came from (e.g. 'attach: port 8080'), so an
+--                      operator can tell an adopted row from a spawned one at a glance in the UI.
+--
+-- NOTE there is deliberately no new instance STATE. An adopted instance is HEALTHY like any other;
+-- adoption is a fact about PROVENANCE, not about lifecycle position.
+
+ALTER TABLE instances ADD COLUMN adopted        INTEGER NOT NULL DEFAULT 0; -- 1 = attached, not spawned
+ALTER TABLE instances ADD COLUMN adopted_source TEXT;                       -- how it was discovered

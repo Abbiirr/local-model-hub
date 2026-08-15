@@ -86,6 +86,38 @@ const (
 	KVCacheQ4_0 KVCacheType = "q4_0"
 )
 
+// CanonicalKVKey renders an independent (K,V) pair as the SINGLE key the observed-peak
+// calibration store is indexed by (model_key, ctx, kv_type). A symmetric pair renders as the
+// bare type — "f16", "q4_0" — so every peak recorded before independent K/V existed still
+// matches and calibration is not silently lost. An asymmetric pair renders as "k/v"
+// (e.g. "q8_0/q4_0"), which correctly MISSES until a peak is measured for that exact pair:
+// a measurement taken with a q4_0 value cache must never be reused to justify a q8_0 one.
+// Empty sides resolve to f16, matching the estimator default.
+func CanonicalKVKey(k, v KVCacheType) KVCacheType {
+	if k == "" {
+		k = KVCacheF16
+	}
+	if v == "" {
+		v = KVCacheF16
+	}
+	if k == v {
+		return k
+	}
+	return KVCacheType(string(k) + "/" + string(v))
+}
+
+// CalibrationKey returns the observed-peak lookup key for these options: the explicit
+// Options.CalibKey when set, else CanonicalKVKey of the EFFECTIVE (K,V) pair. This is the ONLY
+// place the calibration key is derived, so the estimator, the verdict, and the recording side
+// cannot drift apart (the bug that silently degraded every verdict from `exact` to `fallback`).
+func (o Options) CalibrationKey() KVCacheType {
+	if o.CalibKey != "" {
+		return o.CalibKey
+	}
+	k, v := resolveKVPair(o)
+	return CanonicalKVKey(k, v)
+}
+
 // Options are the inputs P2.3's rule engine passes per (model, candidate-config).
 type Options struct {
 	// ContextLen is the context size in tokens to estimate at. 0 => the model's
@@ -94,8 +126,30 @@ type Options struct {
 	// FlashAttention toggles flash-attention accounting (the reference box's
 	// llama.cpp profiles run -fa on).
 	FlashAttention bool
-	// KVCacheType selects the KV cache dtype. Empty => f16 (gguf-parser default).
+	// KVCacheType selects the KV cache dtype for BOTH key and value when the independent K/V
+	// fields below are unset. Empty => f16 (gguf-parser default).
 	KVCacheType KVCacheType
+	// KVCacheTypeK / KVCacheTypeV select INDEPENDENT key/value cache dtypes (llama.cpp's
+	// separate -ctk/-ctv). The profile PROVEN at 64K on the reference box is SYMMETRIC
+	// -ctk q4_0 -ctv q4_0 (scripts/run-qwen-64k-q4q4.ps1); an asymmetric pair such as
+	// -ctk q8_0 -ctv q4_0 is equally expressible and is what these independent fields exist for.
+	// When set, each overrides KVCacheType for its side; when empty, that side falls back to
+	// KVCacheType (then f16). Verified supported by b10106 --help (M2.x/M4.1).
+	KVCacheTypeK KVCacheType
+	KVCacheTypeV KVCacheType
+	// CalibKey overrides the observed-peak calibration lookup key (the `kv_type` column of
+	// observed_peaks). Leave EMPTY in normal use: the key is then derived as
+	// CanonicalKVKey(effective K, effective V), which renders a symmetric pair as the bare type
+	// ("q4_0") so rows recorded before independent K/V still match, and an asymmetric pair as
+	// "q8_0/q4_0" — which correctly MISSES until measured for that exact pair.
+	//
+	// WHY this field exists (regression guard, KNOWN-LIMITATIONS #20): the calibration key used
+	// to be smuggled through KVCacheType, which is ALSO a dtype consumed by the TQ3 file-size
+	// fallback (kvBytesForType) and the iSWA floor (kvBytesPerElemX8). Writing "q8_0/q4_0" into a
+	// dtype field made both fall through to their default branch and mis-price the KV cache while
+	// printing a note that disagreed with the emitted -ctk/-ctv flags. Keeping the calibration KEY
+	// and the DTYPES in separate fields makes that class of bug impossible.
+	CalibKey KVCacheType
 	// NGL is the number of layers to offload to GPU. -1 (or 0) => offload all
 	// layers (full GPU offload, the reference-box policy). A positive value
 	// offloads exactly that many.
@@ -260,9 +314,11 @@ func estimateWith(ctx context.Context, source Source, opts Options, store Calibr
 		return Result{}, ErrEmptySource
 	}
 
-	// (1) Calibration override — measured VRAM beats any estimate.
+	// (1) Calibration override — measured VRAM beats any estimate. The lookup key is the
+	// CANONICAL (K,V) key, never a raw dtype: a peak measured with a q4_0 value cache must not
+	// justify a q8_0 one (KNOWN-LIMITATIONS #20).
 	if store != nil {
-		if mib, ok := store.ObservedPeak(source.modelKey, opts.ContextLen, opts.KVCacheType); ok {
+		if mib, ok := store.ObservedPeak(source.modelKey, opts.ContextLen, opts.CalibrationKey()); ok {
 			return Result{
 				VRAMMiB:    mib,
 				Confidence: ConfidenceExact,

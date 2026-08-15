@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api, isQueuedResponse } from './client';
-import type { InstanceView, QueuedResponse } from './types';
+import type { InstanceView, LaunchState, ModelSummary, QueuedResponse } from './types';
 
 // FINDING-5 gate: POST /api/instances can answer 202 {status:'queued', queue_id, position,
 // blocked_reason} when residency queues a start on VRAM. startInstance must surface that shape (NOT
@@ -96,5 +96,73 @@ describe('startInstance allow_cpu_offload wire', () => {
     const spy = captureFetch();
     await api.startInstance({ model_id: 'm1' }, { allowCpuOffload: true });
     expect(bodyOf(spy)).toMatchObject({ model_id: 'm1', allow_cpu_offload: true });
+  });
+});
+
+// PUT /api/models/{id}/launch-state — the residency control the Inventory panel exposes.
+describe('setModelLaunchState', () => {
+  it('PUTs {state} to the launch-state endpoint and returns the updated summary', async () => {
+    const updated: ModelSummary = {
+      id: 'm1',
+      display_name: 'Model One',
+      source: 'local_path',
+      format: 'gguf',
+      presence: 'present',
+      launch_state: 'unavailable',
+      auto_load_disabled: true,
+    };
+    const spy = vi.fn(async (_path: string, _init?: RequestInit) =>
+      new Response(JSON.stringify(updated), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', spy);
+
+    const res = await api.setModelLaunchState('m1', 'unavailable');
+
+    expect(spy).toHaveBeenCalledWith(
+      '/api/models/m1/launch-state',
+      expect.objectContaining({ method: 'PUT' }),
+    );
+    const init = spy.mock.calls[0]?.[1];
+    expect(JSON.parse(String(init?.body ?? '{}'))).toEqual({ state: 'unavailable' });
+    expect(res).toEqual(updated);
+  });
+
+  it('URL-encodes the model id', async () => {
+    const spy = vi.fn(async () =>
+      new Response(JSON.stringify({}), { status: 200 }),
+    );
+    vi.stubGlobal('fetch', spy);
+    await api.setModelLaunchState('weird id/slash', 'available');
+    expect(spy).toHaveBeenCalledWith(
+      '/api/models/weird%20id%2Fslash/launch-state',
+      expect.anything(),
+    );
+  });
+
+  it('rejects with an ApiError carrying the daemon reason on a non-2xx response', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              code: 'launch_state_invalid',
+              message: 'bad state',
+              reason: "REFUSED: 'bogus' is not a recognized launch state",
+            },
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    );
+    await expect(
+      api.setModelLaunchState('m1', 'bogus' as unknown as LaunchState),
+    ).rejects.toMatchObject({
+      reason: "REFUSED: 'bogus' is not a recognized launch state",
+      status: 400,
+    });
   });
 });

@@ -21,6 +21,18 @@ var ErrNvidiaSmiNotFound = errors.New("nvidia-smi not found on PATH")
 // is unambiguous. Order MUST match parseNvidiaSmiCSV's 10-column layout.
 const nvidiaSmiQueryFields = "index,name,memory.total,memory.free,memory.used,driver_version,compute_cap,utilization.gpu,temperature.gpu,power.draw"
 
+// nvidiaSmiExtendedFields is the PREFERRED query: the 10 base columns above plus 11 extended
+// telemetry columns (clocks, fan, PCIe link, power limits, throttle reasons). It is tried
+// first; execNvidiaSmi falls back to the base field sets if a driver rejects any of these.
+//
+// The extra fields cost nothing — same single invocation — and answer "why is it SLOW", which
+// VRAM numbers alone cannot. Column ORDER here must match parseNvidiaSmiCSV's 21-column
+// branch; change the two together or the parse silently misaligns.
+const nvidiaSmiExtendedFields = nvidiaSmiQueryFields +
+	",clocks.sm,clocks.mem,clocks.max.sm,fan.speed" +
+	",pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max" +
+	",power.limit,power.max_limit,clocks_throttle_reasons.active"
+
 // defaultSmiTimeout bounds the nvidia-smi exec. On a healthy box it returns in tens of ms;
 // a hung driver must not wedge the metrics loop or an HTTP handler.
 const defaultSmiTimeout = 2 * time.Second
@@ -110,7 +122,13 @@ func execNvidiaSmi(ctx context.Context, binary string, timeout time.Duration) ([
 		hideWindow(cmd)
 		return cmd.Output()
 	}
-	out, err := run(nvidiaSmiQueryFields)
+	// Degrade one step at a time: extended → base(+compute_cap) → minimal. Each fallback drops
+	// only the fields a given driver refused, so an old driver loses telemetry detail but never
+	// the core VRAM numbers the fit verdict depends on.
+	out, err := run(nvidiaSmiExtendedFields)
+	if err != nil && cctx.Err() == nil {
+		out, err = run(nvidiaSmiQueryFields)
+	}
 	if err != nil && cctx.Err() == nil {
 		// compute_cap is absent on older supported drivers. A missing optional
 		// capability must not make a healthy NVIDIA box look like it has no GPU.
@@ -123,6 +141,90 @@ func execNvidiaSmi(ctx context.Context, binary string, timeout time.Duration) ([
 		return nil, fmt.Errorf("nvidia-smi failed: %w", err)
 	}
 	return out, nil
+}
+
+// Processes lists processes currently holding a CUDA context on this box.
+//
+// Returns (nil, err) when nvidia-smi is missing or the query fails; callers should treat that
+// as "unknown", not as "nothing is using the GPU". Note UsedMiB is -1 on Windows regardless of
+// success — see GPUProcess.
+func (p *NvidiaSmiProbe) Processes(ctx context.Context) ([]GPUProcess, error) {
+	binary := p.binary
+	if binary == "" {
+		binary = "nvidia-smi"
+	}
+	timeout := p.timeout
+	if timeout == 0 {
+		timeout = defaultSmiTimeout
+	}
+	raw, err := execNvidiaSmiComputeApps(ctx, binary, timeout)
+	if err != nil {
+		return nil, err
+	}
+	return parseComputeApps(raw), nil
+}
+
+// execNvidiaSmiComputeApps lists processes holding a CUDA context. Separate invocation from
+// the --query-gpu call because nvidia-smi cannot combine the two query modes.
+//
+// Failure is deliberately soft: the caller drops the list and keeps the rest of the snapshot.
+// Knowing GPU memory is 12 GiB used is useful even when we cannot say who is using it.
+func execNvidiaSmiComputeApps(ctx context.Context, binary string, timeout time.Duration) ([]byte, error) {
+	if _, err := exec.LookPath(binary); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrNvidiaSmiNotFound, err)
+	}
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, binary,
+		"--query-compute-apps=pid,used_memory,name",
+		"--format=csv,noheader,nounits",
+	)
+	hideWindow(cmd)
+	out, err := cmd.Output()
+	if cctx.Err() == context.DeadlineExceeded {
+		return nil, fmt.Errorf("nvidia-smi compute-apps timed out after %s", timeout)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("nvidia-smi compute-apps failed: %w", err)
+	}
+	return out, nil
+}
+
+// parseComputeApps parses `--query-compute-apps=pid,used_memory,name` CSV into GPUProcess.
+// Pure function, unit-testable without a GPU.
+//
+// used_memory is "[N/A]" on every row under Windows WDDM (see GPUProcess), so UsedMiB is -1
+// far more often than not. Rows whose pid will not parse are skipped; a row with a valid pid
+// but an unreadable name (Windows returns "[Insufficient Permissions]" for other users'
+// processes) is KEPT with an empty name, because the pid alone is still actionable.
+func parseComputeApps(raw []byte) []GPUProcess {
+	var procs []GPUProcess
+	sc := bufio.NewScanner(bytes.NewReader(raw))
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		cols := splitCSV(line)
+		if len(cols) < 3 {
+			continue
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(cols[0]))
+		if err != nil {
+			continue
+		}
+		name := strings.TrimSpace(cols[2])
+		if isNA(name) {
+			name = ""
+		}
+		procs = append(procs, GPUProcess{
+			PID:     pid,
+			Name:    name,
+			UsedMiB: atoiOr(cols[1], -1),
+		})
+	}
+	return procs
 }
 
 // parseNvidiaSmiCSV parses `nvidia-smi --query-gpu=... --format=csv,noheader,nounits` output
@@ -152,10 +254,20 @@ func parseNvidiaSmiCSV(raw []byte) []GPU {
 		}
 		cols := splitCSV(line)
 		var (
-			g      GPU
-			hasIdx bool
+			g        GPU
+			hasIdx   bool
+			extended bool
 		)
+		// Extended telemetry defaults to -1 ("nvidia-smi did not report this"), NOT 0. A 0 fan
+		// speed or 0 MHz clock is a legitimate reading; conflating "unknown" with "zero" would
+		// make the UI state things that are not true.
+		g.ClockSMMHz, g.ClockMemMHz, g.ClockSMMaxMHz = -1, -1, -1
+		g.FanPct = -1
+		g.PCIeGen, g.PCIeGenMax, g.PCIeWidth, g.PCIeWidthMax = -1, -1, -1, -1
+		g.PowerLimitW, g.PowerMaxLimitW = -1, -1
 		switch len(cols) {
+		case 21: // base 10 + 11 extended telemetry columns
+			hasIdx, extended = true, true
 		case 10:
 			hasIdx = true
 		case 9:
@@ -196,6 +308,21 @@ func parseNvidiaSmiCSV(raw []byte) []GPU {
 			g.PowerDrawW = atofOrNA(cols[off+8], 0)
 		}
 
+		if extended {
+			// Columns 10..20, in nvidiaSmiExtendedFields order.
+			g.ClockSMMHz = atoiOr(cols[off+9], -1)
+			g.ClockMemMHz = atoiOr(cols[off+10], -1)
+			g.ClockSMMaxMHz = atoiOr(cols[off+11], -1)
+			g.FanPct = atoiOr(cols[off+12], -1)
+			g.PCIeGen = atoiOr(cols[off+13], -1)
+			g.PCIeGenMax = atoiOr(cols[off+14], -1)
+			g.PCIeWidth = atoiOr(cols[off+15], -1)
+			g.PCIeWidthMax = atoiOr(cols[off+16], -1)
+			g.PowerLimitW = atofOrNA(cols[off+17], -1)
+			g.PowerMaxLimitW = atofOrNA(cols[off+18], -1)
+			g.Throttle = decodeThrottleReasons(cols[off+19])
+		}
+
 		gpus = append(gpus, g)
 		rowIdx++
 	}
@@ -213,10 +340,61 @@ func splitCSV(line string) []string {
 	return parts
 }
 
-// isNA reports whether a nvidia-smi field is the "not available" sentinel.
+// isNA reports whether a nvidia-smi field is a "no value here" sentinel.
+//
+// nvidia-smi has several of these, not just N/A: consumer cards return "[Not Supported]" for
+// fields the SKU lacks (e.g. temperature.memory on a 4060 Ti), and Windows returns
+// "[Insufficient Permissions]" for process fields it will not attribute. All must degrade to
+// the caller's sentinel rather than parse as 0.
 func isNA(s string) bool {
 	s = strings.TrimSpace(s)
-	return s == "" || strings.EqualFold(s, "[N/A]") || strings.EqualFold(s, "N/A")
+	return s == "" ||
+		strings.EqualFold(s, "[N/A]") || strings.EqualFold(s, "N/A") ||
+		strings.EqualFold(s, "[Not Supported]") || strings.EqualFold(s, "Not Supported") ||
+		strings.EqualFold(s, "[Insufficient Permissions]")
+}
+
+// throttleReasonNames maps clocks_throttle_reasons.active bits to short readable labels.
+// Source: nvidia-smi --help-query-gpu (bitmask semantics are stable across driver branches).
+var throttleReasonNames = []struct {
+	bit  uint64
+	name string
+}{
+	{0x0000000000000001, "idle"},
+	{0x0000000000000002, "app_clocks_setting"},
+	{0x0000000000000004, "sw_power_cap"},
+	{0x0000000000000008, "hw_slowdown"},
+	{0x0000000000000010, "sync_boost"},
+	{0x0000000000000020, "sw_thermal_slowdown"},
+	{0x0000000000000040, "hw_thermal_slowdown"},
+	{0x0000000000000080, "hw_power_brake_slowdown"},
+	{0x0000000000000100, "display_clock_setting"},
+}
+
+// decodeThrottleReasons turns the hex bitmask nvidia-smi reports (e.g. "0x0000000000000001")
+// into comma-joined labels. It exists so the UI can say WHY the GPU is slow instead of showing
+// an opaque hex value. Returns "" for N/A, zero, or an unparseable value — meaning
+// "unthrottled", which is also the correct display when nothing is limiting clocks.
+func decodeThrottleReasons(raw string) string {
+	if isNA(raw) {
+		return ""
+	}
+	s := strings.TrimSpace(raw)
+	s = strings.TrimPrefix(strings.TrimPrefix(s, "0x"), "0X")
+	mask, err := strconv.ParseUint(s, 16, 64)
+	if err != nil || mask == 0 {
+		return ""
+	}
+	var out []string
+	for _, r := range throttleReasonNames {
+		if mask&r.bit != 0 {
+			out = append(out, r.name)
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return strings.Join(out, ",")
 }
 
 // atoiOr parses an int, returning def on failure or N/A.

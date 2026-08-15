@@ -47,6 +47,32 @@ type Instance struct {
 	// Reason is the latest human-readable state reason (mandatory on every transition).
 	Reason string `json:"reason,omitempty"`
 
+	// --- Post-HEALTHY health tracking (migration 0010, M5). ---
+
+	// LastHealthAt is the last SUCCESSFUL health probe. A bare State of HEALTHY says nothing about
+	// staleness; this is what makes "healthy as of when?" answerable.
+	LastHealthAt time.Time `json:"last_health_at,omitempty"`
+	// HealthFailures counts CONSECUTIVE failed health probes (reset to 0 on any success). A
+	// non-zero value on a HEALTHY row means the monitor is seeing failures but has not yet reached
+	// the reap threshold — surfaced so the UI/API can show "degraded" rather than a confident
+	// "healthy".
+	HealthFailures int `json:"health_failures,omitempty"`
+
+	// Adopted is true when LocalHub ATTACHED to a process it did not spawn (migration 0012). Such an
+	// instance is never auto-evicted and needs an explicit force to stop: LocalHub did not create it,
+	// so reclaiming its VRAM or killing it is not LocalHub's call to make unilaterally.
+	Adopted bool `json:"adopted,omitempty"`
+	// AdoptedSource records HOW it was discovered (e.g. "attach: port 8080"), so an adopted row is
+	// distinguishable from a spawned one at a glance.
+	AdoptedSource string `json:"adopted_source,omitempty"`
+
+	// ReclaimVerified records whether the VRAM reclaim on stop was PROVEN by an NVML delta.
+	// nil = no stop attempted yet; false = signalled/killed but reclamation unproven (timeout, or
+	// the baseline probe failed); true = free VRAM measurably rose past the bar. This is the
+	// machine-readable form of what the Reason string already says, so a reclaim-TIMEOUT can never
+	// be mistaken for a clean STOPPED by a programmatic consumer (M5.5).
+	ReclaimVerified *bool `json:"reclaim_verified,omitempty"`
+
 	CreatedAt  time.Time `json:"created_at,omitempty"`
 	StartedAt  time.Time `json:"started_at,omitempty"` // when it went HEALTHY
 	LastUsedAt time.Time `json:"last_used_at,omitempty"`

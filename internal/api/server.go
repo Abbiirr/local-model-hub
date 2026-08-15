@@ -19,13 +19,14 @@ import (
 
 // Server wraps the http.Server plus its listener and the service core.
 type Server struct {
-	svc        *core.Service
-	logger     *slog.Logger
-	http       *http.Server
-	ln         net.Listener
-	addr       string
-	adminToken string
-	rpc        *jsonrpc.Dispatcher // shared JSON-RPC 2.0 dispatcher (P6.3), used by POST /api/rpc + /api/ws
+	svc         *core.Service
+	logger      *slog.Logger
+	http        *http.Server
+	ln          net.Listener
+	addr        string
+	adminToken  string
+	startupRoot string
+	rpc         *jsonrpc.Dispatcher // shared JSON-RPC 2.0 dispatcher (P6.3), used by POST /api/rpc + /api/ws
 
 	// Cluster plane (P7.1, ADR-008). All three are the zero value for cluster.role=off, in which
 	// case NO cluster routes are registered and the daemon is byte-identical to 1.0 (cluster-plan
@@ -60,6 +61,15 @@ func WithCluster(role, token, nodeID, nodeName string, reg *cluster.Registry) Op
 		if role == "coordinator" && reg != nil {
 			s.clusterAgg = s.newClusterAggregator(nodeID, nodeName, token, reg)
 		}
+	}
+}
+
+// WithStartupConfig enables the local startup-policy API backed by configs/startup.json under
+// repoRoot. Keeping this an injected option leaves tests and non-desktop deployments explicit and
+// avoids making the HTTP package guess a process working directory.
+func WithStartupConfig(repoRoot string) Option {
+	return func(s *Server) {
+		s.startupRoot = repoRoot
 	}
 }
 
@@ -119,9 +129,18 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/auth/dashboard", s.handleDashboardAuthStatus)
 	mux.HandleFunc("POST /api/auth/dashboard", s.handleDashboardAuthLogin)
 	mux.HandleFunc("DELETE /api/auth/dashboard", s.handleDashboardAuthLogout)
+	if s.startupRoot != "" {
+		mux.HandleFunc("GET /api/startup", s.handleStartupGet)
+		mux.HandleFunc("PUT /api/startup", s.handleStartupPut)
+	}
 
 	// Hardware (P1.2).
 	mux.HandleFunc("GET /api/hardware", s.handleHardware)
+	// POST /api/gpu/free: stop everything holding the GPU in one action and report the MEASURED
+	// VRAM delta. Pinned instances are skipped unless include_pinned=true.
+	mux.HandleFunc("POST /api/gpu/free", s.handleGPUFree)
+	// GET /api/gpu/history: in-memory telemetry ring buffer for sparklines. Lost on restart.
+	mux.HandleFunc("GET /api/gpu/history", s.handleGPUHistory)
 	mux.HandleFunc("GET /api/hardware/live", s.handleHardwareLive) // SSE
 
 	// Engines (P1.3) — detection is read-only; /detect POST re-probes, mutates nothing.
@@ -144,13 +163,31 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/downloads", s.handleDownloadList)
 	mux.HandleFunc("GET /api/downloads/{id}", s.handleDownloadStatus)
 	mux.HandleFunc("GET /api/manifests/{id}", s.handleManifestGet)
+	// Saved per-model launch default (M2.3). Advisory only: the start path never consults it — the
+	// UI pre-fills the advanced form from it and the operator confirms (M6.1).
+	mux.HandleFunc("GET /api/models/{id}/launch-default", s.handleModelLaunchDefaultGet)
+	mux.HandleFunc("PUT /api/models/{id}/launch-default", s.handleModelLaunchDefaultPut)
+	mux.HandleFunc("DELETE /api/models/{id}/launch-default", s.handleModelLaunchDefaultDelete)
 	mux.HandleFunc("GET /api/models/{id}/manifest", s.handleModelManifest)
 	mux.HandleFunc("GET /api/models/{id}/reproduce", s.handleReproduce)
+	// Four-state residency policy (migration 0015): always_available | available |
+	// available_on_request (default) | unavailable. Governs eagerness/eviction/idle-TTL; only
+	// unavailable also bars every AUTO-load path (OpenAI proxy, residency queue drain, jobs worker)
+	// and hides the model from GET /v1/models — an explicit POST /api/instances still works regardless
+	// of state. See docs/api-spec.md.
+	mux.HandleFunc("PUT /api/models/{id}/launch-state", s.handleModelLaunchStatePut)
+	// DEPRECATED (migration 0014, superseded by launch-state above): enabled=false is now an alias for
+	// launch_state=unavailable, enabled=true for launch_state=available_on_request. Kept working
+	// because it shipped recently.
+	mux.HandleFunc("PUT /api/models/{id}/auto-load", s.handleModelAutoLoadPut)
 
 	// Instances (P4.1/P4.2): start/stop/list spawned model instances (llama.cpp). ADMIN
 	// actions — they spawn/kill GPU processes; localhost-bound + token-gated by middleware.
 	mux.HandleFunc("GET /api/instances", s.handleInstancesList)
 	mux.HandleFunc("POST /api/instances", s.handleInstanceCreate)
+	// Retired external-process adoption endpoint. It remains registered only to return a durable 410
+	// refusal to old clients; all model lifecycles must enter through POST /api/instances.
+	mux.HandleFunc("POST /api/instances/attach", s.handleInstanceAttach)
 	mux.HandleFunc("GET /api/instances/{id}", s.handleInstanceGet)
 	mux.HandleFunc("DELETE /api/instances/{id}", s.handleInstanceStop)
 	// Completion pass-through (P5 fix 3): relays to the engine, counting in-flight requests so
@@ -169,6 +206,14 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/models", s.handleV1Models)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleV1ChatCompletions)
 	mux.HandleFunc("POST /v1/completions", s.handleV1Completions)
+	mux.HandleFunc("POST /v1/embeddings", s.handleV1Embeddings)
+	// Reranking (llama.cpp --reranking, which itself requires --embedding --pooling rank). Only the
+	// /v1/-prefixed alias is registered: the auth middleware protects the "/api/" and "/v1/" prefixes,
+	// so llama.cpp's bare "/rerank" alias would be an UNAUTHENTICATED route on a token-gated daemon.
+	// Clients that default to "/rerank" must be pointed at "/v1/rerank".
+	mux.HandleFunc("POST /v1/rerank", s.handleV1Rerank)
+	mux.HandleFunc("POST /v1/responses", s.handleV1Responses)
+	mux.HandleFunc("POST /v1/messages", s.handleV1Messages)
 
 	// P6.2 async inference jobs (internal/api/jobs.go). Submit → id immediately; poll or watch
 	// jobs.updated over /api/ws; cancel; survive a daemon restart. The /api/ catch-all below still

@@ -1,0 +1,41 @@
+-- 0010_instance_health_reclaim.sql
+-- ADDITIVE migration (data-model.md: additive only). Every column is nullable or defaulted.
+--
+-- WHY (M5 — truthful monitoring after startup, PLAN-run-stop-monitor.md §4 F/G):
+--
+-- (1) POST-HEALTHY MONITORING. Reconciliation ran only at daemon STARTUP, so a llama-server that
+--     died AFTER reaching HEALTHY left its row reading HEALTHY until someone restarted LocalHub.
+--     Only a START-time crash had ever been observed becoming FAILED; a post-HEALTHY death was
+--     untested and, in fact, invisible. The periodic monitor needs somewhere durable to record what
+--     it saw, so a restart does not lose the evidence:
+--
+--       last_health_at   Timestamp of the last SUCCESSFUL health probe ('YYYY-MM-DD HH:MM:SS' UTC,
+--                        matching every other time column). NULL => never probed since the row was
+--                        written. This is what makes "healthy as of when?" answerable — a bare
+--                        state of HEALTHY says nothing about staleness.
+--       health_failures  Count of CONSECUTIVE failed health probes; reset to 0 on every success.
+--                        Persisted rather than kept only in memory so a daemon restart cannot
+--                        silently reset a model that has been failing for a while.
+--
+-- (2) HONEST RECLAIM. Stop already verifies VRAM reclamation by NVML delta and writes a truthful
+--     REASON string ("stopped and VERIFIED …" / "did not reach the expected … within …" /
+--     "UNVERIFIED because the baseline probe failed"). But the only machine-readable fields were
+--     state=STOPPED and vram_freed_mib, so a caller (or the UI) could not DISTINGUISH a verified
+--     reclaim from a timed-out or inconclusive one without parsing prose. That made a
+--     reclaim-timeout look like a clean STOPPED to any programmatic consumer — exactly what
+--     TODO.md M5.5 forbids.
+--
+--       reclaim_verified 1 = free VRAM measurably rose by at least (footprint − slack), proven by an
+--                        NVML delta; 0 = the process was signalled/killed but reclamation was NOT
+--                        proven (timed out, or the baseline probe failed so no delta is meaningful).
+--                        NULL = no stop has been attempted for this row yet. Deliberately THREE
+--                        states: "not attempted" must not read as "failed".
+--
+-- Note there is intentionally NO new instance state. The state machine
+-- (REQUESTED→STARTING→HEALTHY→DRAINING→STOPPED/FAILED) is unchanged; these columns add
+-- OBSERVABILITY to existing states rather than inventing an "UNHEALTHY" state whose transitions
+-- would have to be threaded through every transport.
+
+ALTER TABLE instances ADD COLUMN last_health_at   TEXT;                       -- last OK health probe (UTC)
+ALTER TABLE instances ADD COLUMN health_failures  INTEGER NOT NULL DEFAULT 0; -- consecutive failed probes
+ALTER TABLE instances ADD COLUMN reclaim_verified INTEGER;                     -- 1 verified / 0 unproven / NULL not attempted

@@ -13,6 +13,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/localhub/localhub/internal/winproc"
 )
 
 // DockerClient runs docker subcommands. Run executes an argv (without the leading "docker") and
@@ -41,6 +43,10 @@ func NewExecDocker(path string) DockerClient {
 
 func (d *execDocker) Run(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, d.Path, args...)
+	// No console window: this is the single choke point for every docker CLI call, and the
+	// engines probe runs `docker images` on each poll. The daemon has no console of its own
+	// (-H=windowsgui), so an unhidden child gets a brand new visible window.
+	winproc.Hide(cmd)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf

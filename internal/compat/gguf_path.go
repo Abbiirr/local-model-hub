@@ -13,12 +13,15 @@ import (
 //     Ollama (only ollama-source models — spec §4 engine recommendation).
 //   - TQ3_* models REQUIRE a has_tq3 binary: if none is available -> wont_run naming the fork.
 //   - Never GGUF -> vLLM (ADR-004).
-func (e *Engine) evaluateGGUF(ctx context.Context, model string, d ModelDescriptor, reqCtx, batch int, kvQuant bool, free, total int, avail EngineAvailability) Verdict {
-	requireTQ3 := d.IsTQ3()
+func (e *Engine) evaluateGGUF(ctx context.Context, model string, d ModelDescriptor, reqCtx, batch int, profile LaunchProfile, free, total int, avail EngineAvailability) Verdict {
+	profile = profile.Normalize()
+	profile.Ctx = reqCtx
+	profile.Batch = batch
+	reqs := requirementsForProfile(d, profile)
 
 	// --- TQ3 hard gate (checked FIRST, before any estimate). ---
-	bin, haveBin := avail.bestLlamaBinary(requireTQ3)
-	if requireTQ3 && !haveBin {
+	bin, haveBin := avail.bestLlamaBinary(reqs)
+	if reqs.TQ3 && !haveBin {
 		return newVerdict(model, StatusWontRun,
 			fmt.Sprintf("model is a TQ3_* quant (%s), which needs the CUDA TQ3 fork of llama-server "+
 				"(a binary reporting has_tq3). Only %s is available, and it cannot load TQ3 tensors "+
@@ -43,21 +46,48 @@ func (e *Engine) evaluateGGUF(ctx context.Context, model string, d ModelDescript
 			})
 	}
 
-	// KV cache type: default f16; use q4_0 when kvQuant requested AND the binary supports it.
-	kvType := gguf.KVCacheF16
-	kvQuantUsed := false
-	if kvQuant && bin.SupportsKVQuant {
-		kvType = gguf.KVCacheQ4_0
-		kvQuantUsed = true
+	// Independent K/V cache types from the profile (M2.x/M3.4), gated on the binary supporting
+	// KV quantization. A binary without SupportsKVQuant forces f16 for both (the flags/estimate
+	// then omit -ctk/-ctv).
+	kvK, kvV := profile.EffectiveKVTypeK(), profile.EffectiveKVTypeV()
+	if !bin.SupportsKVQuant {
+		kvK, kvV = gguf.KVCacheF16, gguf.KVCacheF16
+	}
+	profile.KVTypeK, profile.KVTypeV = kvK, kvV
+
+	// --- MTP model-side gate (M3.2/M3.3): draft-mtp needs the model to embed an MTP head. ---
+	mtpHeadMiB := 0
+	if profile.SpecMode == SpeculativeDraftMTP {
+		hasMTP, mtpBytes, _ := modelMTP(d)
+		if !hasMTP {
+			return newVerdict(model, StatusWontRun,
+				fmt.Sprintf("the launch profile requests draft-mtp (--spec-type draft-mtp), but model %q does not "+
+					"embed an MTP / next-n draft head (no %q tensors found in the GGUF). draft-mtp needs a model "+
+					"built with an embedded multi-token-prediction head; use a GGUF that has one, or pick a different "+
+					"speculative mode (\"\" or \"ngram-cache\").", d.ID, ".nextn.")).
+				with(func(v *Verdict) {
+					v.RequestedContext = reqCtx
+					v.VRAMFreeMiB = free
+					v.VRAMTotalMiB = total
+				})
+		}
+		mtpHeadMiB = mtpBytes
 	}
 
-	// --- Estimate at the requested context. ---
+	// --- Estimate at the requested context (independent K/V via the profile, M4.1). ---
 	estReq, err := e.ggufEstimate(ctx, d.GGUFSource, gguf.Options{
 		ContextLen:     reqCtx,
 		FlashAttention: bin.HasFlashAttn,
-		KVCacheType:    kvType,
-		NGL:            -1, // full offload (reference-box policy: GPU-only-or-fail)
-		ParallelSeq:    batch,
+		KVCacheTypeK:   kvK,
+		KVCacheTypeV:   kvV,
+		// CalibKey is the CANONICAL key for the (K,V) pair: observed_peaks is indexed by a single
+		// kv_type column, so leaving it unset would lose every recorded measurement and drop the
+		// verdict from `exact` back to a fallback estimate (the 2026-07-25 regression,
+		// KNOWN-LIMITATIONS #20). It is a KEY, not a dtype — deliberately kept OUT of KVCacheType,
+		// which the TQ3 fallback and the iSWA floor consume as a real dtype.
+		CalibKey:    gguf.CanonicalKVKey(kvK, kvV),
+		NGL:         -1, // full offload (reference-box policy: GPU-only-or-fail)
+		ParallelSeq: profile.Slots,
 	})
 	if err != nil {
 		// The estimator only errors when even the fallback cannot produce a number (a remote
@@ -73,9 +103,20 @@ func (e *Engine) evaluateGGUF(ctx context.Context, model string, d ModelDescript
 				v.Confidence = ConfidenceFallback
 			})
 	}
+	// Include the embedded MTP head cost when draft-mtp is on (M4.2): gguf-parser prices the
+	// main weights + KV but the nextn head is an honest additive surcharge (~53 MiB on the
+	// Qwen3.6 target). Conservative (over-estimate), never a false `runs`.
+	if mtpHeadMiB > 0 {
+		estReq.VRAMMiB += mtpHeadMiB
+		estReq.Notes = append(estReq.Notes, fmt.Sprintf("added %d MiB embedded MTP/nextn head overhead for --spec-type draft-mtp (M4.2)", mtpHeadMiB))
+	}
 
 	conf := normalizeGGUFConfidence(estReq.Confidence)
-	usable := usableVRAM(free)
+	// A MEASURED peak gets an additive cushion instead of the multiplicative SafetyFactor: the 8%
+	// exists to absorb estimator error, and a measurement has none. On a 16 GB card the
+	// multiplicative form reserves ~1310 MiB unconditionally, which permanently excludes a model
+	// sized to fill the card even with driver-truth numbers in hand. See CalibratedMarginMiB.
+	usable := usableVRAMFor(free, conf)
 	required := float64(estReq.VRAMMiB)
 
 	// When the estimate is a MEASURED observed peak from the calibration store (Confidence
@@ -85,14 +126,13 @@ func (e *Engine) evaluateGGUF(ctx context.Context, model string, d ModelDescript
 	calibrated := conf == ConfidenceExact
 
 	// --- Max context that fits: probe candidate contexts (don't over-call remote). ---
-	maxCtx := e.ggufMaxContext(ctx, d, bin, kvType, batch, usable, reqCtx, estReq.VRAMMiB)
+	maxCtx := e.ggufMaxContext(ctx, d, bin, kvK, kvV, profile.Slots, mtpHeadMiB, usable, reqCtx, estReq.VRAMMiB)
 
-	// --- Run flags for the chosen binary. ---
-	// The verdict advertises the DEFAULT full-GPU flags (-ngl all). allow_cpu_offload and speculative
-	// are per-start launch options (StartInstanceRequest), not verdict inputs — the verdict describes
-	// fit under the full-GPU default with no speculative decoding, so it passes allowCPUOffload=false
-	// and SpeculativeOff here. (--spec-type ngram-cache adds ~zero VRAM, so it never changes the fit.)
-	flags := ggufRunFlags(d, bin, reqCtx, kvType, kvQuantUsed, false, SpeculativeOff)
+	// --- Run flags for the chosen binary, from the profile (M2.x/M3.4). ---
+	// The verdict advertises the profile's flags (independent K/V, -np, spec mode). For the
+	// DEFAULT preview (no profile knobs) this is -ngl all -c CTX --fit off [-fa on] -np 1 — the
+	// full-GPU baseline. CPU offload / ngram-cache are profile knobs applied on top at start.
+	flags := ggufRunFlags(d, bin, profile)
 
 	// --- Build the recommended (llama.cpp) alternative + decide status. ---
 	engineLabel := "llamacpp"
@@ -115,11 +155,27 @@ func (e *Engine) evaluateGGUF(ctx context.Context, model string, d ModelDescript
 		reason = fmt.Sprintf("fits at the requested %s ctx (~%d MiB in %.0f MiB usable) but only below %s tokens; "+
 			"a reduced context is a degraded experience for long-context use.",
 			ctxLabel(reqCtx), estReq.VRAMMiB, usable, ctxLabel(ReducedContextThreshold))
-	case fits && kvQuantUsed:
+	case fits && profile.KVQuantized():
 		status = StatusRunsDegraded
-		reason = fmt.Sprintf("fits at %s ctx (~%d MiB in %.0f MiB usable) ONLY with a quantized KV cache (-ctk/-ctv %s); "+
-			"KV quantization trades a little quality for memory — acceptable but degraded.",
-			ctxLabel(reqCtx), estReq.VRAMMiB, usable, kvTypeName(kvType))
+		reason = fmt.Sprintf("fits at %s ctx (~%d MiB in %.0f MiB usable) ONLY with a quantized KV cache "+
+			"(-ctk %s -ctv %s); KV quantization trades a little quality for memory — acceptable but degraded.",
+			ctxLabel(reqCtx), estReq.VRAMMiB, usable, kvTypeName(kvK), kvTypeName(kvV))
+	case fits && !calibrated && withinAdmissionNoise(required, usable):
+		// M4.6 — the knife-edge. The estimate fits, but by less than ordinary desktop VRAM churn,
+		// so admission is genuinely a coin-flip: the SAME request flipped between 201 and 409 on
+		// this box at 8K (margin ~46-61 MiB). Reporting that as a plain `runs` would be a
+		// confident answer to an unstable question, so it degrades WITH the numbers and the fix.
+		//
+		// Ordered AFTER the `calibrated` guard below cannot happen (this case is !calibrated), so a
+		// MEASURED peak is never downgraded: a measurement IS the resolution of the knife-edge —
+		// on this profile it moves the margin from ~50 MiB to ~600 MiB.
+		status = StatusRunsDegraded
+		reason = fmt.Sprintf("fits at %s ctx, but only just: ~%d MiB estimated against %.0f MiB usable leaves ~%.0f MiB — "+
+			"less than the %d MiB of ordinary VRAM noise on a desktop GPU, so the same request can be admitted one "+
+			"minute and refused the next. Start it once to record a measured peak for this exact KV pair (that "+
+			"replaces the estimate with driver truth and typically widens the margin substantially), free VRAM, or "+
+			"lower the context for a decision that does not depend on noise.",
+			ctxLabel(reqCtx), estReq.VRAMMiB, usable, usable-required, AdmissionNoiseMiB)
 	case fits && calibrated:
 		// Measured observed peak (calibration store) fits — the tightest, highest-confidence
 		// "runs": the number is driver-truth from a real load, not an estimate.
@@ -133,7 +189,7 @@ func (e *Engine) evaluateGGUF(ctx context.Context, model string, d ModelDescript
 			estReq.VRAMMiB, ctxLabel(reqCtx), usable, total, SafetyFactor, total-free)
 	default:
 		// Does not fit at requested ctx. Try to fit at a reduced context (or with KV quant).
-		degraded, dReason, dFlags, dCtx := e.tryGGUFDegrade(ctx, d, bin, batch, usable, maxCtx, estReq.VRAMMiB, total, free, kvQuantUsed)
+		degraded, dReason, dFlags, dCtx := e.tryGGUFDegrade(ctx, d, bin, profile.Slots, usable, maxCtx, estReq.VRAMMiB, total, free, profile.KVQuantized())
 		if degraded {
 			status = StatusRunsDegraded
 			reason = dReason
@@ -161,8 +217,9 @@ func (e *Engine) evaluateGGUF(ctx context.Context, model string, d ModelDescript
 		}
 	}
 
-	if kvQuantUsed && status == StatusRuns {
-		warnings = append(warnings, "KV cache is quantized ("+kvTypeName(kvType)+") to fit — slight quality impact.")
+	if profile.KVQuantized() && status == StatusRuns {
+		warnings = append(warnings, fmt.Sprintf("KV cache is quantized (-ctk %s -ctv %s) — slight quality impact.",
+			kvTypeName(kvK), kvTypeName(kvV)))
 	}
 
 	choice := newAlternative(engineLabel, bin.Detail, status, reason).with(func(a *AlternativeVerdict) {
@@ -204,11 +261,28 @@ func (e *Engine) evaluateGGUF(ctx context.Context, model string, d ModelDescript
 // pickOllamaStatus mirrors the llama.cpp status for the Ollama alternative (same VRAM math).
 func pickOllamaStatus(s Status) Status { return s }
 
+// modelMTP reports whether the descriptor's GGUF embeds an MTP/next-n draft head and its weight
+// cost (MiB). It trusts a caller-set ModelDescriptor.HasMTP (manifest cache) for presence and
+// otherwise reads the GGUF header + tensor-info (NO model load). A remote/unparseable source
+// returns (flag, 0, nil) — the launch path then re-checks / refuses conservatively (M3.2).
+func modelMTP(d ModelDescriptor) (bool, int, error) {
+	if d.GGUFSource == (gguf.Source{}) {
+		return d.HasMTP, 0, nil
+	}
+	info, err := gguf.InspectMTP(context.Background(), d.GGUFSource)
+	if err != nil {
+		return d.HasMTP, 0, nil
+	}
+	return d.HasMTP || info.IsMTP, info.HeadBytesMiB(), nil
+}
+
 // ggufMaxContext finds the largest candidate context (from ctxCandidates) whose estimate
 // fits in usable VRAM. It probes at most len(ctxCandidates) contexts to avoid over-calling a
 // remote source (task spec: "3-4 candidate ctx points — don't over-call remote"). It reuses
-// the already-computed requested-ctx estimate when a candidate equals reqCtx.
-func (e *Engine) ggufMaxContext(ctx context.Context, d ModelDescriptor, bin LlamaBinary, kvType gguf.KVCacheType, batch int, usable float64, reqCtx, reqVRAM int) int {
+// the already-computed requested-ctx estimate when a candidate equals reqCtx. Independent K/V
+// types (kvK/kvV), the parallel slot count, and the MTP head overhead are applied consistently
+// with the requested-ctx estimate (M4.1/M4.2).
+func (e *Engine) ggufMaxContext(ctx context.Context, d ModelDescriptor, bin LlamaBinary, kvK, kvV gguf.KVCacheType, slots, mtpHeadMiB int, usable float64, reqCtx, reqVRAM int) int {
 	best := 0
 	for _, c := range ctxCandidates {
 		var vram int
@@ -218,14 +292,16 @@ func (e *Engine) ggufMaxContext(ctx context.Context, d ModelDescriptor, bin Llam
 			est, err := e.ggufEstimate(ctx, d.GGUFSource, gguf.Options{
 				ContextLen:     c,
 				FlashAttention: bin.HasFlashAttn,
-				KVCacheType:    kvType,
+				KVCacheTypeK:   kvK,
+				KVCacheTypeV:   kvV,
+				CalibKey:       gguf.CanonicalKVKey(kvK, kvV), // calibration KEY, not a dtype
 				NGL:            -1,
-				ParallelSeq:    batch,
+				ParallelSeq:    slots,
 			})
 			if err != nil {
 				continue
 			}
-			vram = est.VRAMMiB
+			vram = est.VRAMMiB + mtpHeadMiB
 		}
 		if float64(vram) <= usable {
 			if c > best {
@@ -238,11 +314,13 @@ func (e *Engine) ggufMaxContext(ctx context.Context, d ModelDescriptor, bin Llam
 
 // tryGGUFDegrade attempts to salvage a wont-fit into runs_degraded by (a) using the max
 // context that fits if it is >= MinDegradedContext, or (b) enabling KV quantization if not
-// already used and the binary supports it. Returns (degraded, reason, flags, maxCtx).
-func (e *Engine) tryGGUFDegrade(ctx context.Context, d ModelDescriptor, bin LlamaBinary, batch int, usable float64, maxCtx, reqVRAM, total, free int, kvQuantUsed bool) (bool, string, []string, int) {
+// already used and the binary supports it. Returns (degraded, reason, flags, maxCtx). Flags
+// are built from LaunchProfiles so the advertised flags match the launch path (M2.x).
+func (e *Engine) tryGGUFDegrade(ctx context.Context, d ModelDescriptor, bin LlamaBinary, slots int, usable float64, maxCtx, reqVRAM, total, free int, kvQuantUsed bool) (bool, string, []string, int) {
 	// (a) reduced context.
 	if maxCtx >= MinDegradedContext {
-		flags := ggufRunFlags(d, bin, maxCtx, gguf.KVCacheF16, false, false, SpeculativeOff)
+		p := LaunchProfile{Ctx: maxCtx, Slots: slots}
+		flags := ggufRunFlags(d, bin, p)
 		reason := fmt.Sprintf("does not fit at the requested context in %.0f MiB usable (%d total × %.2f safety − %d in use), "+
 			"but fits at a reduced %s ctx — runs degraded at the smaller context.",
 			usable, total, SafetyFactor, total-free, ctxLabel(maxCtx))
@@ -253,12 +331,15 @@ func (e *Engine) tryGGUFDegrade(ctx context.Context, d ModelDescriptor, bin Llam
 		est, err := e.ggufEstimate(ctx, d.GGUFSource, gguf.Options{
 			ContextLen:     defaultRequestedContext,
 			FlashAttention: bin.HasFlashAttn,
-			KVCacheType:    gguf.KVCacheQ4_0,
+			KVCacheTypeK:   gguf.KVCacheQ4_0,
+			KVCacheTypeV:   gguf.KVCacheQ4_0,
+			CalibKey:       gguf.CanonicalKVKey(gguf.KVCacheQ4_0, gguf.KVCacheQ4_0), // calibration KEY, not a dtype
 			NGL:            -1,
-			ParallelSeq:    batch,
+			ParallelSeq:    slots,
 		})
 		if err == nil && float64(est.VRAMMiB) <= usable {
-			flags := ggufRunFlags(d, bin, defaultRequestedContext, gguf.KVCacheQ4_0, true, false, SpeculativeOff)
+			p := LaunchProfile{Ctx: defaultRequestedContext, Slots: slots, KVTypeK: gguf.KVCacheQ4_0, KVTypeV: gguf.KVCacheQ4_0}
+			flags := ggufRunFlags(d, bin, p)
 			reason := fmt.Sprintf("does not fit with an f16 KV cache, but fits at %s ctx with a quantized KV cache "+
 				"(-ctk/-ctv q4_0, ~%d MiB in %.0f MiB usable) — runs degraded (KV quantization trades a little quality for memory).",
 				ctxLabel(defaultRequestedContext), est.VRAMMiB, usable)

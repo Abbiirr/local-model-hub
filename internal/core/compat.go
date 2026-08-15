@@ -17,6 +17,125 @@ import (
 	"github.com/localhub/localhub/internal/hardware"
 )
 
+// legacyKVProfile builds a minimal compat.LaunchProfile for callers that still describe the KV
+// cache with the legacy `kv_quant` bool: true maps to q4_0 on BOTH cache sides, which is exactly
+// what the pre-profile code did when it passed kvQuant=true to the estimator and the flag builder.
+// false leaves both sides empty => f16 (the estimator default). Used by the Ollama and vLLM
+// verdict paths, which take no llama.cpp speculative/slot flags.
+//
+// M2.2: the profile is the ONE description of a launch. Building it here — rather than passing
+// loose bools to Evaluate and again to PlanLlamaLaunch — is what keeps the admission footprint
+// and the spawned flags from disagreeing.
+func legacyKVProfile(reqCtx, batch int, kvQuant bool) compat.LaunchProfile {
+	p := compat.LaunchProfile{Ctx: reqCtx, Batch: batch}
+	if kvQuant {
+		p.KVTypeK = gguf.KVCacheQ4_0
+		p.KVTypeV = gguf.KVCacheQ4_0
+	}
+	return p
+}
+
+// startProfile builds the full launch profile for a llama.cpp StartInstance request (M2.1/M2.2):
+// the KV cache pair, speculative mode + MTP draft maximum, slot count, CPU-offload permission,
+// pin and priority. ONE profile feeds both the verdict and PlanLlamaLaunch, so the admitted
+// footprint and the spawned flags cannot diverge.
+//
+// KV precedence (back-compat contract): an EXPLICIT kv_type_k/kv_type_v wins; if neither is set,
+// the legacy `kv_quant` bool applies its historical meaning (true => q4_0 on both sides). Setting
+// only ONE side leaves the other at f16 — that is genuinely asymmetric and intended, not a
+// mistake, which is exactly what `-ctk q8_0 -ctv f16` means to llama.cpp.
+//
+// The caller MUST have validated the request first (validateStartProfile); this function assumes
+// well-formed values and does no error reporting.
+func startProfile(req StartInstanceRequest, reqCtx int) compat.LaunchProfile {
+	p := legacyKVProfile(reqCtx, req.Batch, req.KVQuant)
+	if req.KVTypeK != "" || req.KVTypeV != "" {
+		p.KVTypeK = gguf.KVCacheType(req.KVTypeK)
+		p.KVTypeV = gguf.KVCacheType(req.KVTypeV)
+	}
+	p.Slots = req.Slots
+	p.SpecMode = req.Speculative
+	p.SpecDraftMax = req.SpecDraftMax
+	p.AllowCPUOffload = req.AllowCPUOffload
+	p.Embedding = req.Embedding
+	p.Pooling = req.Pooling
+	p.Reranking = req.Reranking
+	p.Pin = req.Pin
+	p.Priority = req.Priority
+	return p
+}
+
+// validateStartProfile validates every profile-bearing field of a start request and returns the
+// request with normalized values. Each refusal carries a human-readable reason naming the valid
+// set (CLAUDE.md). Validation happens BEFORE any engine dispatch so an invalid value is refused
+// identically for llama.cpp, Ollama and vLLM, and before anything is spawned or queued.
+func validateStartProfile(req StartInstanceRequest) (StartInstanceRequest, error) {
+	spec, err := compat.ValidateSpeculative(req.Speculative)
+	if err != nil {
+		return req, err
+	}
+	req.Speculative = spec
+
+	kK, err := compat.ValidateKVCacheType(req.KVTypeK, "k")
+	if err != nil {
+		return req, err
+	}
+	kV, err := compat.ValidateKVCacheType(req.KVTypeV, "v")
+	if err != nil {
+		return req, err
+	}
+	req.KVTypeK, req.KVTypeV = string(kK), string(kV)
+
+	if req.Slots, err = compat.ValidateSlots(req.Slots); err != nil {
+		return req, err
+	}
+	if req.SpecDraftMax, err = compat.ValidateSpecDraftMax(req.SpecDraftMax); err != nil {
+		return req, err
+	}
+	// A draft maximum without a speculative mode is a contradiction, not a harmless extra: the
+	// flag would never be emitted, so silently accepting it would let a caller believe MTP was on.
+	if req.SpecDraftMax > 0 && req.Speculative == compat.SpeculativeOff {
+		return req, fmt.Errorf("spec_draft_max=%d was requested but speculative is off: --spec-draft-n-max only applies to a "+
+			"speculative mode. Set speculative to %q (embedded MTP head) or %q, or drop spec_draft_max",
+			req.SpecDraftMax, compat.SpeculativeDraftMTP, compat.SpeculativeNgramCache)
+	}
+
+	pooling, err := compat.ValidatePooling(req.Pooling)
+	if err != nil {
+		return req, err
+	}
+	req.Pooling = pooling
+
+	// Reranking (`--reranking`) REQUIRES `--embedding --pooling rank` together
+	// (tools/server/README.md: "Requires a reranker model ... and the --embedding --pooling rank
+	// options"), and compat.LaunchProfile.Normalize enforces that coupling on the profile that
+	// actually gets launched — so a reranking request is accepted whether or not the caller also
+	// passed embedding/pooling; those are simply overridden to true/"rank". The ONLY thing refused
+	// here is an EXPLICIT pooling value that contradicts rank (e.g. reranking:true with
+	// pooling:"mean"): silently overriding a caller's explicit, incompatible choice would hide a
+	// real mistake, so it is a refusal, not a silent coercion.
+	if req.Reranking {
+		if req.Pooling != "" && req.Pooling != compat.PoolingRank {
+			return req, fmt.Errorf("reranking=true was requested with pooling=%q, but llama.cpp's --reranking requires "+
+				"--pooling rank (tools/server/README.md: \"Requires a reranker model ... and the --embedding --pooling "+
+				"rank options\"). Set pooling to %q, or drop pooling to let reranking set it automatically",
+				req.Pooling, compat.PoolingRank)
+		}
+		return req, nil
+	}
+
+	// A pooling override without embedding mode is a contradiction, not a harmless extra: --pooling
+	// only affects an embedding-only server, so silently accepting it here would let a caller
+	// believe it changed a generation start's behavior when it changes nothing at all. This check is
+	// skipped above when Reranking is set, since Reranking implies embedding regardless of what the
+	// caller passed for it.
+	if req.Pooling != "" && !req.Embedding {
+		return req, fmt.Errorf("pooling=%q was requested but embedding is off: --pooling only affects an embedding-only "+
+			"server. Set embedding to true, or drop pooling", req.Pooling)
+	}
+	return req, nil
+}
+
 // CompatEvaluator is the compat rule-engine seam the core depends on (satisfied by
 // *compat.Engine). Injected as an interface so core tests can use a fake evaluator without
 // the real estimators / network.
@@ -161,6 +280,13 @@ func (s *Service) engineAvailability(ctx context.Context) compat.EngineAvailabil
 
 // llamaBinaryFromView extracts a compat.LlamaBinary from an engine status view's details
 // (backends + capabilities recorded by the llama.cpp detector).
+//
+// M3.1: the spec/MTP and independent-K/V bits are carried through here so binary SELECTION
+// (compat.bestLlamaBinary) and the MTP gate (PlanLlamaLaunch) decide on DETECTED capabilities
+// rather than assumptions. SupportsKVQuant was previously hardcoded true for every binary; it
+// now reflects the probed `has_kv_cache_types` (both -ctk and -ctv present), and stays true only
+// when the detector reported no such key at all (an older status row, or a fake in tests) so no
+// existing caller regresses.
 func llamaBinaryFromView(v EngineStatusView) compat.LlamaBinary {
 	b := compat.LlamaBinary{Detail: v.Reason, Detected: v.Installed, SupportsKVQuant: true}
 	if p, ok := v.Details["resolved_path"].(string); ok {
@@ -169,12 +295,24 @@ func llamaBinaryFromView(v EngineStatusView) compat.LlamaBinary {
 		b.Path = p
 	}
 	// A concise detail label from backends (e.g. "CUDA fork" vs "winget (Vulkan/CPU)").
+	// The details map is map[string]bool in-process and map[string]any after a JSON round-trip
+	// (the cluster/aggregated path), so both shapes are decoded.
 	if caps, ok := v.Details["capabilities"].(map[string]bool); ok {
 		b.HasTQ3 = caps["has_tq3"]
 		b.HasFlashAttn = caps["has_flash_attn"]
+		b.HasSpecMTP = caps["has_spec_mtp"]
+		b.HasSpecDraftMax = caps["has_spec_draft_max"]
+		if kv, present := caps["has_kv_cache_types"]; present {
+			b.SupportsKVQuant = kv
+		}
 	} else if caps, ok := v.Details["capabilities"].(map[string]any); ok {
 		b.HasTQ3 = boolOf(caps["has_tq3"])
 		b.HasFlashAttn = boolOf(caps["has_flash_attn"])
+		b.HasSpecMTP = boolOf(caps["has_spec_mtp"])
+		b.HasSpecDraftMax = boolOf(caps["has_spec_draft_max"])
+		if kv, present := caps["has_kv_cache_types"]; present {
+			b.SupportsKVQuant = boolOf(kv)
+		}
 	}
 	if backends, ok := v.Details["backends"].([]string); ok {
 		b.HasCUDA = containsStr(backends, "CUDA")

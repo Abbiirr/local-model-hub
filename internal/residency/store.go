@@ -50,6 +50,11 @@ type QueueRow struct {
 	ReqCtx   int  `json:"-"`
 	ReqBatch int  `json:"-"`
 	ReqPin   bool `json:"-"`
+
+	// Profile is the rest of the persisted launch profile (0009 migration): independent KV pair,
+	// slots, speculative mode + draft max, CPU-offload permission. Internal to draining/restore,
+	// like the 0006 fields above, so the public /api/queue body is unchanged.
+	Profile ProfileSpec `json:"-"`
 }
 
 // QueueStore is the SQLite-backed durable queue mirror.
@@ -86,12 +91,25 @@ func (s *QueueStore) InsertWaiting(ctx context.Context, r Request, blockedReason
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO queue
 		    (id, model_id, engine, priority, status, blocked_reason, vram_bytes_est,
-		     priority_class, seq, footprint_mib, req_ctx, req_batch, req_pin, enqueued_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		     priority_class, seq, footprint_mib, req_ctx, req_batch, req_pin,
+		     req_kv_type_k, req_kv_type_v, req_slots, req_spec_mode, req_spec_draft_max,
+		     req_allow_cpu_offload, req_embedding, req_pooling, req_reranking,
+		     enqueued_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.ID, r.ModelID, nullString(r.Engine), r.Priority, string(QueueWaiting),
 		nullString(blockedReason), nullZeroInt(footprintMiB),
 		int(r.Class), r.Seq(), nullZeroInt(footprintMiB),
-		nullZeroInt(r.Ctx), nullZeroInt(r.Batch), boolToIntQ(r.Pin), qFmtTime(now), qFmtTime(now))
+		nullZeroInt(r.Ctx), nullZeroInt(r.Batch), boolToIntQ(r.Pin),
+		// Launch profile (0009): persisted so the drain loop replays the profile admission priced,
+		// not a default-shaped guess (KNOWN-LIMITATIONS #21).
+		nullString(r.Profile.KVTypeK), nullString(r.Profile.KVTypeV),
+		nullZeroInt(r.Profile.Slots), nullString(r.Profile.SpecMode),
+		nullZeroInt(r.Profile.SpecDraftMax), boolToIntQ(r.Profile.AllowCPUOffload),
+		// Launch MODE (0013): --embedding/--pooling/--reranking. Dropping these on replay silently
+		// turns a queued embedding/reranking start into a plain generation start (2026-08-06 bge-m3
+		// crash-loop defect — the mode-field twin of the 0009 sizing-field bug).
+		boolToIntQ(r.Profile.Embedding), nullString(r.Profile.Pooling), boolToIntQ(r.Profile.Reranking),
+		qFmtTime(now), qFmtTime(now))
 	if err != nil {
 		return fmt.Errorf("queue insert %s: %w", r.ID, err)
 	}
@@ -165,11 +183,16 @@ func (s *QueueStore) List(ctx context.Context, limit int) ([]QueueRow, error) {
 }
 
 func (s *QueueStore) query(ctx context.Context, tail string, args ...any) ([]QueueRow, error) {
+	// Every 0009 column is COALESCEd to a zero value so rows written before the migration (and by
+	// an older daemon) read back as "no advanced knobs" rather than failing the scan.
 	const cols = `SELECT id, model_id, COALESCE(engine,''), COALESCE(priority_class,priority),
 		COALESCE(priority,priority_class), status, COALESCE(blocked_reason,''),
 		COALESCE(footprint_mib, COALESCE(vram_bytes_est,0)),
 		COALESCE(seq,0), COALESCE(coalesce_of,''),
 		COALESCE(req_ctx,0), COALESCE(req_batch,0), COALESCE(req_pin,0),
+		COALESCE(req_kv_type_k,''), COALESCE(req_kv_type_v,''), COALESCE(req_slots,0),
+		COALESCE(req_spec_mode,''), COALESCE(req_spec_draft_max,0), COALESCE(req_allow_cpu_offload,0),
+		COALESCE(req_embedding,0), COALESCE(req_pooling,''), COALESCE(req_reranking,0),
 		COALESCE(enqueued_at,''), COALESCE(updated_at,'')
 		FROM queue `
 	rows, err := s.db.QueryContext(ctx, cols+tail, args...)
@@ -181,14 +204,24 @@ func (s *QueueStore) query(ctx context.Context, tail string, args ...any) ([]Que
 	for rows.Next() {
 		var r QueueRow
 		var status, enq, upd string
-		var reqPin int
+		var reqPin, reqOffload, reqEmbedding, reqReranking int
 		if err := rows.Scan(&r.ID, &r.ModelID, &r.Engine, &r.PriorityClass, &r.Priority,
 			&status, &r.BlockedReason, &r.FootprintMiB, &r.Seq, &r.CoalesceOf,
-			&r.ReqCtx, &r.ReqBatch, &reqPin, &enq, &upd); err != nil {
+			&r.ReqCtx, &r.ReqBatch, &reqPin,
+			&r.Profile.KVTypeK, &r.Profile.KVTypeV, &r.Profile.Slots,
+			&r.Profile.SpecMode, &r.Profile.SpecDraftMax, &reqOffload,
+			&reqEmbedding, &r.Profile.Pooling, &reqReranking,
+			&enq, &upd); err != nil {
 			return nil, err
 		}
 		r.Status = QueueStatus(status)
 		r.ReqPin = reqPin != 0
+		r.Profile.AllowCPUOffload = reqOffload != 0
+		// Launch MODE (0013): restore --embedding/--reranking alongside the sizing fields above, so a
+		// replayed start rebuilds the SAME LaunchProfile it was queued with (KNOWN-LIMITATIONS #21's
+		// mode-field twin — the 2026-08-06 bge-m3 crash-loop defect).
+		r.Profile.Embedding = reqEmbedding != 0
+		r.Profile.Reranking = reqReranking != 0
 		r.EnqueuedAt = qParseTime(enq)
 		r.UpdatedAt = qParseTime(upd)
 		out = append(out, r)

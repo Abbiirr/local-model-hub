@@ -58,6 +58,14 @@ type CreateParams struct {
 	Priority   int
 	TTLSeconds int
 	Reason     string // why this instance was requested (mandatory)
+	// Adopted marks an ATTACHED process (migration 0012): LocalHub did not spawn it.
+	Adopted       bool
+	AdoptedSource string
+	// BaseURL/PID/Port may be known up front for an adopted process (they are discovered, not
+	// allocated). A spawned instance leaves these zero and fills them on the STARTING transition.
+	BaseURL string
+	PID     int
+	Port    int
 }
 
 // Create inserts a new instance in REQUESTED state and records the first transition
@@ -83,11 +91,14 @@ func (s *Store) Create(ctx context.Context, p CreateParams) (Instance, error) {
 	_, err = tx.ExecContext(ctx, `
 		INSERT INTO instances
 		    (id, model_id, engine, state, model_path, binary_path, ctx, vram_bytes_est,
-		     pinned, priority, ttl_seconds, reason, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		     pinned, priority, ttl_seconds, reason, adopted, adopted_source,
+		     base_url, pid, port, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ID, p.ModelID, string(p.Engine), string(StateRequested),
 		nullStr(p.ModelPath), nullStr(p.BinaryPath), nullInt(p.Ctx), nullInt(p.VRAMEstMiB),
-		boolToInt(p.Pinned), p.Priority, nullInt(p.TTLSeconds), p.Reason, fmtTime(now))
+		boolToInt(p.Pinned), p.Priority, nullInt(p.TTLSeconds), p.Reason,
+		boolToInt(p.Adopted), nullStr(p.AdoptedSource),
+		nullStr(p.BaseURL), nullInt(p.PID), nullInt(p.Port), fmtTime(now))
 	if err != nil {
 		return Instance{}, fmt.Errorf("insert instance %s: %w", p.ID, err)
 	}
@@ -101,6 +112,8 @@ func (s *Store) Create(ctx context.Context, p CreateParams) (Instance, error) {
 		ID: p.ID, ModelID: p.ModelID, Engine: p.Engine, State: StateRequested,
 		ModelPath: p.ModelPath, BinaryPath: p.BinaryPath, Ctx: p.Ctx, VRAMEstMiB: p.VRAMEstMiB,
 		Pinned: p.Pinned, Priority: p.Priority, TTLSeconds: p.TTLSeconds,
+		Adopted: p.Adopted, AdoptedSource: p.AdoptedSource,
+		BaseURL: p.BaseURL, PID: p.PID, Port: p.Port,
 		Reason: p.Reason, CreatedAt: now,
 	}, nil
 }
@@ -120,6 +133,10 @@ type TransitionParams struct {
 	VRAMObsMiB   *int
 	VRAMFreedMiB *int
 	LastUsedAt   *time.Time
+	// ReclaimVerified records whether the VRAM reclaim was PROVEN by an NVML delta (migration
+	// 0010). Set it on every terminal transition that followed a stop attempt so a reclaim-timeout
+	// or an inconclusive baseline can never read as a clean STOPPED (M5.5).
+	ReclaimVerified *bool
 }
 
 // Transition moves an instance to a new state, enforcing legality. It reads the current state,
@@ -187,6 +204,10 @@ func (s *Store) Transition(ctx context.Context, id string, p TransitionParams) (
 		set = append(set, "last_used_at = ?")
 		args = append(args, fmtTime(*p.LastUsedAt))
 	}
+	if p.ReclaimVerified != nil {
+		set = append(set, "reclaim_verified = ?")
+		args = append(args, boolToInt(*p.ReclaimVerified))
+	}
 	// State-derived timestamps.
 	if p.To == StateHealthy && cur.StartedAt.IsZero() {
 		set = append(set, "started_at = ?")
@@ -219,6 +240,40 @@ func (s *Store) SetObservedPeak(ctx context.Context, id string, peakMiB int) err
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE instances SET vram_bytes_obs = ? WHERE id = ?`, nullInt(peakMiB), id)
 	return err
+}
+
+// RecordHealthOK stamps a SUCCESSFUL health probe and clears the consecutive-failure counter
+// (migration 0010, M5). No state change: a healthy instance stays HEALTHY; this only records WHEN
+// it was last proven healthy, so "HEALTHY" can be distinguished from "HEALTHY, last confirmed 40
+// minutes ago".
+func (s *Store) RecordHealthOK(ctx context.Context, id string, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE instances SET last_health_at = ?, health_failures = 0 WHERE id = ?`, fmtTime(at), id)
+	if err != nil {
+		return fmt.Errorf("record health ok for %s: %w", id, err)
+	}
+	return nil
+}
+
+// RecordHealthFailure increments the consecutive-failure counter and returns the NEW count, without
+// changing state. The count is persisted (not held in memory) so a daemon restart cannot silently
+// forgive an instance that has been failing probes — and so the reap threshold means the same thing
+// across restarts. last_health_at is deliberately left alone: it records the last SUCCESS.
+func (s *Store) RecordHealthFailure(ctx context.Context, id string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE instances SET health_failures = COALESCE(health_failures,0) + 1 WHERE id = ?`, id); err != nil {
+		return 0, fmt.Errorf("record health failure for %s: %w", id, err)
+	}
+	var n int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(health_failures,0) FROM instances WHERE id = ?`, id).Scan(&n); err != nil {
+		return 0, fmt.Errorf("read health failures for %s: %w", id, err)
+	}
+	return n, nil
 }
 
 // TouchLastUsed stamps last_used_at on an instance WITHOUT a state change (the completion-proxy
@@ -310,7 +365,9 @@ const instanceSelect = `SELECT id, model_id, engine, state,
 	COALESCE(vram_bytes_est,0), COALESCE(vram_bytes_obs,0), COALESCE(vram_freed_mib,0),
 	pinned, priority, COALESCE(ttl_seconds,0), COALESCE(launch_flags_json,''),
 	COALESCE(reason,''), COALESCE(created_at,''), COALESCE(started_at,''),
-	COALESCE(last_used_at,''), COALESCE(stopped_at,'')
+	COALESCE(last_used_at,''), COALESCE(stopped_at,''),
+	COALESCE(last_health_at,''), COALESCE(health_failures,0), reclaim_verified,
+	COALESCE(adopted,0), COALESCE(adopted_source,'')
 	FROM instances`
 
 // rowScanner is satisfied by both *sql.Row and *sql.Rows.
@@ -324,7 +381,12 @@ func scanInto(sc rowScanner) (Instance, error) {
 		engine, state                                      string
 		baseURL, binaryPath, modelPath, launchJSON, reason string
 		createdAt, startedAt, lastUsedAt, stoppedAt        string
-		pinnedInt                                          int
+		lastHealthAt                                       string
+		pinnedInt, adoptedInt                              int
+		// reclaim_verified is genuinely THREE-valued (1 verified / 0 unproven / NULL never
+		// attempted), so it is scanned as a nullable int — collapsing NULL to 0 would report an
+		// un-stopped instance as having failed to reclaim.
+		reclaimVerified sql.NullInt64
 	)
 	err := sc.Scan(
 		&inst.ID, &inst.ModelID, &engine, &state,
@@ -333,9 +395,16 @@ func scanInto(sc rowScanner) (Instance, error) {
 		&inst.VRAMEstMiB, &inst.VRAMObsMiB, &inst.VRAMFreedMiB,
 		&pinnedInt, &inst.Priority, &inst.TTLSeconds, &launchJSON,
 		&reason, &createdAt, &startedAt, &lastUsedAt, &stoppedAt,
+		&lastHealthAt, &inst.HealthFailures, &reclaimVerified,
+		&adoptedInt, &inst.AdoptedSource,
 	)
 	if err != nil {
 		return Instance{}, err
+	}
+	inst.LastHealthAt = parseTime(lastHealthAt)
+	if reclaimVerified.Valid {
+		v := reclaimVerified.Int64 != 0
+		inst.ReclaimVerified = &v
 	}
 	inst.Engine = Engine(engine)
 	inst.State = normalizeState(state)
@@ -345,6 +414,7 @@ func scanInto(sc rowScanner) (Instance, error) {
 	inst.LaunchFlags = parseLaunchFlags(launchJSON)
 	inst.Reason = reason
 	inst.Pinned = pinnedInt != 0
+	inst.Adopted = adoptedInt != 0
 	inst.CreatedAt = parseTime(createdAt)
 	inst.StartedAt = parseTime(startedAt)
 	inst.LastUsedAt = parseTime(lastUsedAt)

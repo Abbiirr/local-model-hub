@@ -56,6 +56,19 @@ Prefer the authoritative size, in this order:
 
 ### 2. KV cache (get this right — the common formula is wrong)
 
+> **Independent K/V dtypes + the calibration key (2026-07-25).** `-ctk` and `-ctv` are sized
+> **independently**: `compat.LaunchProfile.KVTypeK`/`KVTypeV` flow into
+> `gguf.Options.KVCacheTypeK`/`KVCacheTypeV`, each falling back to the shared `KVCacheType`, then
+> f16. The validated Qwen3.6-27B MTP profile is `-ctk q8_0 -ctv q4_0`.
+>
+> **Always populate the legacy `KVCacheType` too.** The observed-peak calibration store is indexed
+> by a *single* `kv_type` column, and `gguf.CanonicalKVKey(k, v)` renders the pair into it
+> (symmetric → `"f16"`/`"q4_0"`, preserving every pre-existing row; asymmetric → `"q8_0/q4_0"`).
+> Leaving it empty makes the key `""`, so every recorded measurement misses and the verdict
+> silently degrades from `exact` to `fallback` confidence — a real regression once shipped, now
+> pinned by `TestVerdictUsesObservedPeak` / `TestVerdictTightensAfterRecording`.
+> See KNOWN-LIMITATIONS #20.
+
 Most online calculators use `bytes_per_value × hidden_size × n_layers × ctx`. That is
 **wrong for modern models**, which use Grouped-Query Attention (GQA): the KV cache scales
 with `n_kv_heads`, not `n_attention_heads`. Using `hidden_size` over-estimates KV by the

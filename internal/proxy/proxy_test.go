@@ -143,6 +143,105 @@ func TestSetJSONField(t *testing.T) {
 	}
 }
 
+func TestNormalizeResponsesInput_RoleTypedItems(t *testing.T) {
+	in := []byte(`{"model":"m","input":[
+		{"type":"user","content":"task"},
+		{"type":"assistant","content":[{"type":"text","text":"answer"}]},
+		{"type":"message","role":"assistant","content":[
+			{"type":"input_text","text":"prior answer"},
+			{"type":"encrypted_content","encrypted_content":"opaque"}
+		]},
+		{"type":"message","role":"assistant","content":[
+			{"type":"output_text","text":"Message Type: NEW_TASK\nPayload:\nRead README.md"}
+		]},
+		{"type":"function_call_output","call_id":"c1","output":"ok"}
+	]}`)
+	out := NormalizeResponsesInput(in)
+	var root map[string]any
+	if err := json.Unmarshal(out, &root); err != nil {
+		t.Fatalf("normalized body: %v", err)
+	}
+	items := root["input"].([]any)
+	user := items[0].(map[string]any)
+	if user["type"] != "message" || user["role"] != "user" {
+		t.Errorf("user item not normalized: %#v", user)
+	}
+	assistant := items[1].(map[string]any)
+	assistantContent := assistant["content"].([]any)[0].(map[string]any)
+	if assistantContent["type"] != "output_text" {
+		t.Errorf("assistant content not normalized: %#v", assistantContent)
+	}
+	canonical := items[2].(map[string]any)
+	canonicalContent := canonical["content"].([]any)[0].(map[string]any)
+	if canonicalContent["type"] != "output_text" {
+		t.Errorf("canonical assistant content not normalized: %#v", canonicalContent)
+	}
+	if len(canonical["content"].([]any)) != 1 {
+		t.Errorf("opaque encrypted content was not removed: %#v", canonical["content"])
+	}
+	delegated := items[3].(map[string]any)
+	if delegated["role"] != "user" {
+		t.Errorf("NEW_TASK envelope was not changed to a user turn: %#v", delegated)
+	}
+	delegatedContent := delegated["content"].([]any)[0].(map[string]any)
+	if delegatedContent["type"] != "input_text" {
+		t.Errorf("NEW_TASK content was not changed to input_text: %#v", delegatedContent)
+	}
+	output := items[4].(map[string]any)
+	if output["type"] != "function_call_output" {
+		t.Errorf("non-message item was changed: %#v", output)
+	}
+}
+
+func TestNormalizeResponsesInput_MovesSystemAndDeveloperMessagesToLeadingInstructions(t *testing.T) {
+	in := []byte(`{"model":"m","instructions":"base rules","input":[
+		{"type":"user","content":"prior task"},
+		{"type":"developer","content":[{"type":"text","text":"repo rules"}]},
+		{"type":"message","role":"system","content":"safety rules"},
+		{"type":"user","content":"current task"}
+	]}`)
+
+	out := NormalizeResponsesInput(in)
+	var root map[string]any
+	if err := json.Unmarshal(out, &root); err != nil {
+		t.Fatalf("normalized body: %v", err)
+	}
+	if got, want := root["instructions"], "base rules\n\nrepo rules\n\nsafety rules"; got != want {
+		t.Fatalf("instructions = %#v, want %#v", got, want)
+	}
+	items := root["input"].([]any)
+	if len(items) != 2 {
+		t.Fatalf("input length = %d, want 2: %#v", len(items), items)
+	}
+	for _, raw := range items {
+		item := raw.(map[string]any)
+		if role, _ := item["role"].(string); role == "system" || role == "developer" {
+			t.Errorf("late instruction message remained in input: %#v", item)
+		}
+	}
+}
+
+func TestNormalizeResponsesInput_PreservesNonTextDeveloperMessage(t *testing.T) {
+	in := []byte(`{"model":"m","input":[
+		{"type":"developer","content":[{"type":"input_image","image_url":"data:image/png;base64,AA=="}]},
+		{"type":"user","content":"task"}
+	]}`)
+
+	out := NormalizeResponsesInput(in)
+	var root map[string]any
+	if err := json.Unmarshal(out, &root); err != nil {
+		t.Fatalf("normalized body: %v", err)
+	}
+	items := root["input"].([]any)
+	if len(items) != 2 {
+		t.Fatalf("input length = %d, want 2: %#v", len(items), items)
+	}
+	developer := items[0].(map[string]any)
+	if developer["type"] != "message" || developer["role"] != "developer" {
+		t.Errorf("non-text developer message was not preserved canonically: %#v", developer)
+	}
+}
+
 // TestWriteOpenAIError emits the OpenAI-dialect envelope with the reason in message.
 func TestWriteOpenAIError(t *testing.T) {
 	rec := httptest.NewRecorder()

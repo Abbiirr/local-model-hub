@@ -50,6 +50,30 @@ func newFakeHardwareTestService(t *testing.T) *core.Service {
 	return core.New(core.Deps{Cfg: config.Default(), DB: d, Hardware: &hardware.FakeProbe{}})
 }
 
+func TestInstanceAttachIsPermanentlyDisabled(t *testing.T) {
+	srv := &Server{logger: quietLogger()}
+	req := httptest.NewRequest(http.MethodPost, "/api/instances/attach",
+		strings.NewReader(`{"port":8080,"host":"127.0.0.1","pin":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.handleInstanceAttach(rec, req)
+
+	if rec.Code != http.StatusGone {
+		t.Fatalf("status = %d, want 410; body=%s", rec.Code, rec.Body.String())
+	}
+	var env ErrorEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if env.Error.Code != "attach_disabled" {
+		t.Fatalf("error code = %q, want attach_disabled", env.Error.Code)
+	}
+	if !strings.Contains(env.Error.Reason, "POST /api/instances") {
+		t.Fatalf("reason must direct callers to the owned launch path: %q", env.Error.Reason)
+	}
+}
+
 // TestStartInstanceRequest_AllowCPUOffloadDecodes verifies the transport contract handleInstanceCreate
 // relies on: the POST /api/instances body decodes allow_cpu_offload into StartInstanceRequest, and an
 // omitted field defaults to false (full GPU — backward compatible). This is the exact json.Decode the
@@ -160,6 +184,9 @@ func TestHealthHandlerOK(t *testing.T) {
 	}
 	if res.Version == "" {
 		t.Error("version empty")
+	}
+	if res.PID <= 0 {
+		t.Errorf("pid = %d, want current daemon pid", res.PID)
 	}
 }
 

@@ -3,7 +3,9 @@ module github.com/localhub/localhub
 go 1.23
 
 require (
+	fyne.io/systray v1.12.2
 	github.com/coder/websocket v1.8.15
+	github.com/google/uuid v1.6.0
 	github.com/gpustack/gguf-parser-go v0.24.1
 	golang.org/x/sys v0.27.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -12,7 +14,7 @@ require (
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/google/uuid v1.6.0 // indirect
+	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/henvic/httpretty v0.1.4 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect

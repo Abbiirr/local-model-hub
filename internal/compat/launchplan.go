@@ -13,11 +13,15 @@ import (
 // building — it reuses the SAME logic the verdict uses (bestLlamaBinary + ggufRunFlags), per the
 // task rule "reuse compat's bestLlamaBinary logic via a shared helper, don't fork logic".
 type LaunchPlan struct {
-	Binary  LlamaBinary // the chosen llama-server binary (Path, Detail, caps)
-	Flags   []string    // exact run flags (compat ggufRunFlags: -ngl/-c/-fa/-ctk/-ctv/--mmproj [+ -ncmoe])
-	KVType  gguf.KVCacheType
-	KVQuant bool
-	Reason  string // human-readable why this plan (which binary + why)
+	Binary LlamaBinary // the chosen llama-server binary (Path, Detail, caps)
+	Flags  []string    // exact run flags (compat ggufRunFlags: -ngl/-c/-fa/-ctk/-ctv/-np/--spec-type/--mmproj [+ -ncmoe])
+	// KVTypeK/KVTypeV are the effective independent cache types (f16 when unset/unsupported).
+	KVTypeK gguf.KVCacheType
+	KVTypeV gguf.KVCacheType
+	KVType  gguf.KVCacheType // kept = KVTypeK for back-compat (calib record key)
+	KVQuant bool             // either side non-f16
+	Reason  string           // human-readable why this plan (which binary + why)
+	Profile LaunchProfile    // the normalized profile that produced this plan (reproducibility, M2.2)
 
 	// MoEExpertOffloadMiB is the expert weight (MiB) this plan moves to CPU RAM via `-ncmoe N`
 	// (0 when no MoE offload). It is DERIVED from tensor metadata, never guessed — admission may
@@ -28,53 +32,71 @@ type LaunchPlan struct {
 }
 
 // PlanLlamaLaunch selects the llama-server binary and builds the run flags for a GGUF model at
-// the given context, reusing bestLlamaBinary (TQ3 → CUDA fork; else prefer CUDA) and
-// ggufRunFlags. kvQuant requests a quantized KV cache when the binary supports it. It returns an
-// error (not a verdict) when no suitable binary is available — the caller has already gated on a
-// runs/runs_degraded verdict, so this only fails on a genuine "no binary" or "TQ3 needs fork"
-// case, which the caller surfaces with the returned reason.
+// the profile's context, reusing bestLlamaBinary (capability-requirements + configured order,
+// M3.6) and ggufRunFlags (profile-driven, M3.4). It returns an error (not a verdict) when no
+// suitable binary is available or a requested capability cannot be satisfied — the caller has
+// already gated on a runs/runs_degraded verdict, so this surfaces genuine "no binary" /
+// "TQ3 needs fork" / "draft-mtp needs model+binary agreement" cases with a reason.
 //
-// allowCPUOffload opts into a GPU/CPU split (-ngl auto) instead of the full-GPU default (-ngl all).
-// It only changes the launch FLAGS; it does NOT relax admission — the caller still gates the start
-// on the full-GPU VRAM verdict (docs/api-spec.md instances §allow_cpu_offload).
-//
-// speculative opts into draft-free self-speculative decoding: "" (SpeculativeOff) = today's flags;
-// "ngram-cache" (SpeculativeNgramCache) appends `--spec-type ngram-cache`. The caller has already
-// validated it (ValidateSpeculative). It adds ~zero VRAM (a hash pool), so it does NOT relax or
-// tighten admission (docs/api-spec.md instances §speculative).
-//
-// This is the SHARED helper P4.2 uses to avoid forking binary/flag logic out of the rule engine.
-func PlanLlamaLaunch(d ModelDescriptor, avail EngineAvailability, ctx int, kvQuant bool, allowCPUOffload bool, speculative string) (LaunchPlan, error) {
+// The profile (M2.x) carries independent K/V types, spec mode (incl. draft-mtp), MTP draft max,
+// parallel slots, and CPU-offload permission. draft-mtp is gated on BOTH the model embedding an
+// MTP head (M3.2) AND the selected binary reporting has_spec_mtp (M3.3); it forces -np 1.
+func PlanLlamaLaunch(d ModelDescriptor, avail EngineAvailability, profile LaunchProfile) (LaunchPlan, error) {
 	if d.Format != FormatGGUF && d.Format != FormatOllama {
 		return LaunchPlan{}, fmt.Errorf("PlanLlamaLaunch: model %q is %s, not GGUF — llama.cpp launch requires a GGUF", d.ID, d.Format)
 	}
-	requireTQ3 := d.IsTQ3()
-	bin, ok := avail.bestLlamaBinary(requireTQ3)
+	profile = profile.Normalize()
+	reqs := requirementsForProfile(d, profile)
+	bin, ok := avail.bestLlamaBinary(reqs)
 	if !ok {
-		if requireTQ3 {
+		if reqs.TQ3 {
 			return LaunchPlan{}, fmt.Errorf("model %q is a TQ3_* quant and needs a has_tq3 llama-server (CUDA fork); only %s is available",
 				d.ID, avail.tq3ForkName())
+		}
+		if reqs.SpecMTP {
+			return LaunchPlan{}, fmt.Errorf("the launch profile requests draft-mtp, which needs a has_spec_mtp llama-server binary "+
+				"(one whose --spec-type advertises draft-mtp); none of the detected binaries (%s) support it. "+
+				"Use a build with draft-mtp or pick a different speculative mode",
+				avail.listBinaryDetails())
 		}
 		return LaunchPlan{}, fmt.Errorf("no llama-server binary detected to launch GGUF model %q", d.ID)
 	}
 
-	kvType := gguf.KVCacheF16
-	kvQuantUsed := false
-	if kvQuant && bin.SupportsKVQuant {
-		kvType = gguf.KVCacheQ4_0
-		kvQuantUsed = true
+	// --- MTP model-side gate (M3.3): draft-mtp needs the model to embed an MTP head. ---
+	if profile.SpecMode == SpeculativeDraftMTP {
+		hasMTP, _, _ := modelMTP(d)
+		if !hasMTP {
+			return LaunchPlan{}, fmt.Errorf("the launch profile requests draft-mtp (--spec-type draft-mtp), but model %q does not "+
+				"embed an MTP / next-n draft head (no %q tensors in the GGUF). Use a GGUF built with an embedded MTP head, "+
+				"or pick a different speculative mode (\"\" or \"ngram-cache\")", d.ID, ".nextn.")
+		}
 	}
-	flags := ggufRunFlags(d, bin, ctx, kvType, kvQuantUsed, allowCPUOffload, speculative)
 
-	reason := fmt.Sprintf("selected %s (%s) for %s at %s ctx", bin.Path, bin.Detail, d.ID, ctxLabel(ctx))
-	if requireTQ3 {
+	// K/V from the profile (independent), gated on the binary supporting KV quantization.
+	kvK, kvV := profile.EffectiveKVTypeK(), profile.EffectiveKVTypeV()
+	if !bin.SupportsKVQuant {
+		kvK, kvV = gguf.KVCacheF16, gguf.KVCacheF16
+	}
+	profile.KVTypeK, profile.KVTypeV = kvK, kvV
+	kvQuantUsed := profile.KVQuantized()
+
+	flags := ggufRunFlags(d, bin, profile)
+
+	reason := fmt.Sprintf("selected %s (%s) for %s at %s ctx", bin.Path, bin.Detail, d.ID, ctxLabel(profile.Ctx))
+	if reqs.TQ3 {
 		reason += " — TQ3_* quant requires the has_tq3 CUDA fork"
 	}
-	if allowCPUOffload {
+	if profile.AllowCPUOffload {
 		reason += " — CPU offload allowed (-ngl auto): llama.cpp offloads as many layers as fit, rest on CPU"
 	}
-	if speculative == SpeculativeNgramCache {
+	switch profile.SpecMode {
+	case SpeculativeNgramCache:
 		reason += " — self-speculative decoding on (--spec-type ngram-cache, draft-free, ~zero extra VRAM)"
+	case SpeculativeDraftMTP:
+		reason += fmt.Sprintf(" — embedded MTP head on (--spec-type draft-mtp, --spec-draft-n-max %d, -np 1: the pinned-build acceptance conditions)", profile.SpecDraftMax)
+	}
+	if kvQuantUsed {
+		reason += fmt.Sprintf(" — quantized KV (-ctk %s -ctv %s)", kvTypeName(kvK), kvTypeName(kvV))
 	}
 
 	// MoE expert CPU-offload (`-ncmoe N`, research §4). Only when the caller opted into CPU offload:
@@ -84,7 +106,7 @@ func PlanLlamaLaunch(d ModelDescriptor, avail EngineAvailability, ctx int, kvQua
 	// metadata (so admission can subtract them); if a MoE model opts into offload but its expert
 	// tensors are not measurable, we DECLINE with a clear reason instead of guessing.
 	offloadMiB := 0
-	if allowCPUOffload && (d.Format == FormatGGUF || d.Format == FormatOllama) {
+	if profile.AllowCPUOffload && (d.Format == FormatGGUF || d.Format == FormatOllama) {
 		// InspectMoE reads the GGUF header + tensor-info section (no model load). A parse ERROR
 		// (notably TQ3_* quants, which gguf-parser-go cannot decode) means we cannot even determine
 		// MoE-ness or expert bytes — we then fall back to the plain -ngl auto offload (conservative
@@ -100,7 +122,15 @@ func PlanLlamaLaunch(d ModelDescriptor, avail EngineAvailability, ctx int, kvQua
 			reason += mReason
 		}
 	}
-	return LaunchPlan{Binary: bin, Flags: flags, KVType: kvType, KVQuant: kvQuantUsed, Reason: reason, MoEExpertOffloadMiB: offloadMiB}, nil
+	// KVType is the CANONICAL (K,V) key — the value the observed-peak calibration store is indexed
+	// by. It MUST NOT be just kvK: a peak measured with `-ctk q8_0 -ctv q4_0` recorded under the
+	// bare key "q8_0" would later be matched for a q8_0/q8_0 lookup, letting a measurement taken
+	// with a cheap value cache justify an expensive one. Caught LIVE on 2026-07-25, when a real
+	// q8_0/q4_0 MTP run recorded `kv_type='q8_0'` in observed_peaks (KNOWN-LIMITATIONS #20).
+	// A symmetric pair still renders as the bare type, so pre-existing rows keep matching.
+	return LaunchPlan{Binary: bin, Flags: flags, KVTypeK: kvK, KVTypeV: kvV,
+		KVType: gguf.CanonicalKVKey(kvK, kvV), KVQuant: kvQuantUsed, Reason: reason,
+		Profile: profile, MoEExpertOffloadMiB: offloadMiB}, nil
 }
 
 // MoEOffloadSizing returns the expert weight (MiB) that a MoE CPU-offload would move OFF the GPU for

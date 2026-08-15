@@ -235,3 +235,86 @@ re-download; multi-file/modifier artifacts remain manual migration work and rece
 human-readable reason rather than a false runnable verdict.
 
 **Status:** Accepted 2026-07-11 (project-owner directive).
+
+---
+
+## ADR-010 — Experimental Anthropic Messages compatibility adapter (supersedes ADR-002 in part)
+
+**Decision:** LocalHub will expose a narrow, experimental Anthropic Messages compatibility
+adapter for Claude Code and other Anthropic-format clients. It translates
+`POST /v1/messages` to the selected local engine's OpenAI-compatible chat-completions
+endpoint and translates the response back to Anthropic's Messages shape. Streaming text
+and client-tool use are required for the feature to count as usable. An optional
+`POST /v1/messages/count_tokens` may be added when LocalHub can return an honest estimate.
+
+This supersedes ADR-002 only where it called the inference proxy "passthrough-only."
+OpenAI routes remain passthrough; the Anthropic route is necessarily a protocol translator.
+ADR-002's gateway boundary remains binding: LocalHub does **not** add API-key management,
+budgets, rate limits, usage billing, multi-provider routing, provider fallback, or response/
+prompt caching. Users who need those features put LiteLLM or another gateway in front.
+
+**Why:** The project owner explicitly made Anthropic-style API support a LocalHub goal on
+2026-07-30 so Claude Code can use LocalHub-managed local models. This is still aligned with
+the product wedge: the adapter routes to a model on this box through the existing admission,
+residency, in-flight accounting, and engine relay. It does not select among commercial
+providers or become a general AI gateway.
+
+The compatibility target is the versioned Anthropic Messages wire contract, including:
+
+- `anthropic-version: 2023-06-01`, Anthropic Message/content-block response shapes, and
+  Anthropic error envelopes;
+- SSE event framing (`message_start`, content-block start/delta/stop, `message_delta`,
+  `message_stop`) rather than relaying OpenAI SSE bytes unchanged;
+- `text`, `tool_use`, and `tool_result` content blocks, with streamed tool input emitted as
+  `input_json_delta` fragments and reassembled into an object at block completion;
+- LocalHub bearer authentication plus `x-api-key` as an alias for the same single admin
+  token on this adapter, so standard Anthropic clients can authenticate; and
+- explicit rejection, with a human-readable reason, of Anthropic features that cannot be
+  represented faithfully by the selected local engine.
+
+Primary contract references (revalidated 2026-07-30):
+[Messages](https://platform.claude.com/docs/en/api/messages),
+[streaming](https://platform.claude.com/docs/en/build-with-claude/streaming),
+[errors](https://platform.claude.com/docs/en/api/errors),
+[token counting](https://platform.claude.com/docs/en/api/messages/count_tokens), and
+[versioning](https://platform.claude.com/docs/en/api/versioning).
+
+**Consequence:** This route cannot use the OpenAI proxy's byte-passthrough implementation;
+it needs a small request/response/event translation boundary over the same service core and
+counted relay. Compatibility must be tested against a pinned current Claude Code release,
+including a real streamed tool round trip. The adapter must label itself experimental and
+must never imply that a non-Claude local model is Claude, Anthropic-hosted, Anthropic-
+supported, or behaviorally equivalent to Claude.
+
+**Status:** Accepted 2026-07-30 (project-owner directive; documentation contract recorded
+before implementation).
+
+---
+
+## ADR-011 — Bridge Codex namespace tools for local Responses engines
+
+**Decision:** On `POST /v1/responses`, LocalHub will flatten Codex's non-standard
+`type:"namespace"` tool wrappers into ordinary Responses function tools named
+`<namespace>__<tool>`. When the selected local engine emits a matching function call,
+LocalHub restores the original `namespace` and short `name` fields before returning it to
+Codex. Prior function calls replayed in request input are flattened in the other direction.
+All unrelated response events remain passthrough.
+
+**Why:** Codex 0.145 sends MCP/browser tools in a namespace wrapper that current local
+Responses implementations such as llama.cpp skip. A request-only flatten is insufficient:
+Codex routes MCP calls by the namespace/name pair, so the response must be mapped back as
+well. The issue and intended flat-name routing are documented in
+[openai/codex#23186](https://github.com/openai/codex/issues/23186) and
+[openai/codex#26234](https://github.com/openai/codex/issues/26234).
+
+This is a narrow compatibility exception to ADR-002. It does not discover tools, execute
+them, change client approvals, add providers, or make LocalHub an agent gateway. Tool
+allow-lists remain a client/agent configuration concern; they are required in practice to
+keep large namespace expansions within a local model's context window.
+
+**Verification:** Unit gates cover request flattening, prior-call replay, streaming and
+non-streaming response restoration, and preservation of unrelated SSE lines. The live gate
+is a real Codex parent launching a local-Qwen child with `fork_turns=1`, followed by
+successful Playwright navigate/snapshot/click/back sequences routed through LocalHub.
+
+**Status:** Accepted and implemented 2026-07-30.

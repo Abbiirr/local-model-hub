@@ -82,6 +82,74 @@ export function formatMetric(
   return `${value.toFixed(digits)}${unit}`;
 }
 
+// ── Extended GPU telemetry (-1 sentinel) ─────────────────────────────────────
+// Every extended nvidia-smi field uses -1 for "the driver did not report this". Rendering that as
+// 0 would be a lie the user cannot detect: an idle RTX 4060 Ti genuinely reports 0 % fan and can
+// genuinely sit near 0 MHz, so "0" and "unknown" MUST look different. `formatNa` is the single
+// place that decision is made, and it is why the -1 sentinel never reaches a React component.
+
+/** The one string used for "the probe did not report this". Lowercase, so it reads as an absence
+ *  rather than as a value. */
+export const NA = 'n/a';
+
+/**
+ * Format a telemetry reading that uses the -1 sentinel. Returns {@link NA} for absent, non-finite
+ * or NEGATIVE values, and the formatted number otherwise — so a legitimate 0 renders as "0", not
+ * as "n/a".
+ */
+export function formatNa(
+  value: number | null | undefined,
+  unit = '',
+  digits = 0,
+): string {
+  if (value == null || !Number.isFinite(value) || value < 0) return NA;
+  return `${value.toFixed(digits)}${unit}`;
+}
+
+/**
+ * Format a "current / max" pair (PCIe gen, PCIe width, SM clock). BOTH sides are always shown:
+ * PCIe downtrains to gen 1 at idle, so a bare "gen 1" reads as broken hardware when it is normal
+ * power management. An unknown side renders as {@link NA} independently of the other.
+ */
+export function formatCurMax(
+  current: number | null | undefined,
+  max: number | null | undefined,
+  unit = '',
+): string {
+  const cur = formatNa(current, unit);
+  const mx = formatNa(max, unit);
+  if (cur === NA && mx === NA) return NA;
+  return `${cur} / ${mx}`;
+}
+
+/**
+ * RAM admission state. On a 16 GB box RAM binds BEFORE VRAM: residency refuses a start while free
+ * RAM is under the configured floor, even with most of the card idle. Returning `belowFloor` as a
+ * derived fact (rather than colouring inline in JSX) keeps the rule testable and identical to the
+ * daemon's comparison — `free < floor`, strictly.
+ *
+ * `hasFloor` is false when the daemon omits/zeroes the floor; the caller must then say nothing
+ * about admission rather than invent a default.
+ */
+export interface RamFloorState {
+  hasFloor: boolean;
+  belowFloor: boolean;
+  /** MiB still to free before a start would be admitted; 0 when already above the floor. */
+  shortMib: number;
+}
+
+export function ramFloorState(
+  freeMib: number | null | undefined,
+  floorMib: number | null | undefined,
+): RamFloorState {
+  const floor = floorMib != null && Number.isFinite(floorMib) && floorMib > 0 ? floorMib : 0;
+  if (floor === 0 || freeMib == null || !Number.isFinite(freeMib)) {
+    return { hasFloor: floor > 0, belowFloor: false, shortMib: 0 };
+  }
+  const below = freeMib < floor;
+  return { hasFloor: true, belowFloor: below, shortMib: below ? floor - freeMib : 0 };
+}
+
 /** "3s ago" / "just now" from an RFC3339 timestamp; empty string if unparseable. */
 export function relativeTime(iso: string | null | undefined, now = Date.now()): string {
   if (!iso) return '';

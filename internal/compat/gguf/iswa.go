@@ -77,7 +77,11 @@ func iswaCorrection(ctx context.Context, source Source, cheap *ggufparser.GGUFFi
 		}
 	}
 
-	floor, nSWA, nGlobal, desc, fok := iswaKVFloorBytes(full, effCtx, opts.KVCacheType)
+	// Independent K/V (M4.1): price the sliding/global layers with the ACTUAL -ctk and -ctv
+	// dtypes. Reading opts.KVCacheType here used to receive the canonical calibration key
+	// ("q8_0/q4_0") for an asymmetric profile, which is not a dtype and fell through to f16.
+	floorKType, floorVType := resolveKVPair(opts)
+	floor, nSWA, nGlobal, desc, fok := iswaKVFloorBytes(full, effCtx, floorKType, floorVType)
 	if !fok {
 		return 0, 0, "", false
 	}
@@ -109,7 +113,9 @@ func parserKVBytes(run ggufparser.LLaMACppRunEstimate) uint64 {
 // the model is not an SWA model (no <arch>.attention.sliding_window key) or the
 // metadata needed to price it is absent/insufficient — in which case the caller
 // leaves the library estimate untouched. desc is a short human note for verdicts.
-func iswaKVFloorBytes(f *ggufparser.GGUFFile, ctxLen int, kvType KVCacheType) (bytes uint64, nSWALayers, nGlobalLayers int, desc string, ok bool) {
+// kType/vType are the INDEPENDENT key/value cache dtypes (llama.cpp -ctk/-ctv); each half of
+// every layer's cache is priced with its own dtype (M4.1).
+func iswaKVFloorBytes(f *ggufparser.GGUFFile, ctxLen int, kType, vType KVCacheType) (bytes uint64, nSWALayers, nGlobalLayers int, desc string, ok bool) {
 	if f == nil || ctxLen <= 0 {
 		return 0, 0, 0, "", false
 	}
@@ -155,7 +161,10 @@ func iswaKVFloorBytes(f *ggufparser.GGUFFile, ctxLen int, kvType KVCacheType) (b
 	// array; a scalar integer pattern N is interpreted as "every Nth layer global".
 	isSliding := perLayerSlidingMask(m, prefix+".attention.sliding_window_pattern", blockCount)
 
-	bpe := kvBytesPerElemX8(kvType) // bytes-per-element ×8 (avoids float; conservative round-up)
+	// Bytes-per-element ×8 per SIDE (avoids float; conservative round-up). K and V are priced
+	// separately so -ctk q8_0 -ctv q4_0 is not collapsed into one shared cost.
+	bpeK := kvBytesPerElemX8(kType)
+	bpeV := kvBytesPerElemX8(vType)
 	swaTokens := ctxLen
 	if nSWA+swaBatchAllowance < swaTokens {
 		swaTokens = nSWA + swaBatchAllowance
@@ -167,18 +176,18 @@ func iswaKVFloorBytes(f *ggufparser.GGUFFile, ctxLen int, kvType KVCacheType) (b
 		if h == 0 {
 			continue
 		}
-		var elemsPerTok, tokens uint64
+		var kElemsPerTok, vElemsPerTok, tokens uint64
 		if isSliding[i] {
-			elemsPerTok = (kSWA + vSWA) * h
+			kElemsPerTok, vElemsPerTok = kSWA*h, vSWA*h
 			tokens = uint64(swaTokens)
 			nSWALayers++
 		} else {
-			elemsPerTok = (kGlobal + vGlobal) * h
+			kElemsPerTok, vElemsPerTok = kGlobal*h, vGlobal*h
 			tokens = uint64(ctxLen)
 			nGlobalLayers++
 		}
 		// bytes = elems * tokens * (bpe/8); bpe is ×8 so divide once at the end.
-		total += elemsPerTok * tokens * bpe
+		total += tokens * (kElemsPerTok*bpeK + vElemsPerTok*bpeV)
 	}
 	total /= 8
 

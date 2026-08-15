@@ -178,6 +178,83 @@ func TestMigrate0001Then0002Stepwise(t *testing.T) {
 	}
 }
 
+// TestMigrate0015DataMigratesDecommissionedRows applies migrations stepwise up through 0014 (the
+// boolean decommission flag), seeds a decommissioned row and a normal row exactly as they would
+// exist on a pre-0015 database, then applies 0015 and confirms the DATA migration (not just the
+// column add): auto_load_disabled=1 rows MUST come back as launch_state='unavailable' — this is the
+// exact scenario the owner is relying on (a live decommissioned model that must stay decommissioned
+// across the upgrade) — and every other row defaults to launch_state='available_on_request'.
+func TestMigrate0015DataMigratesDecommissionedRows(t *testing.T) {
+	d := openTemp(t)
+	if err := d.ensureMigrationsTable(); err != nil {
+		t.Fatalf("ensureMigrationsTable: %v", err)
+	}
+	migs, err := loadMigrations()
+	if err != nil {
+		t.Fatalf("loadMigrations: %v", err)
+	}
+	// Locate migrations 0014 and 0015 by version rather than assuming a fixed index, so this test
+	// keeps working if earlier migrations are ever renumbered.
+	var idx14, idx15 = -1, -1
+	for i, m := range migs {
+		switch m.version {
+		case 14:
+			idx14 = i
+		case 15:
+			idx15 = i
+		}
+	}
+	if idx14 < 0 || idx15 < 0 {
+		t.Fatalf("expected migrations 14 and 15 to exist, got %d migrations", len(migs))
+	}
+	// Apply everything through 0014 (pre-0015 database state).
+	for i := 0; i <= idx14; i++ {
+		if err := d.applyOne(migs[i]); err != nil {
+			t.Fatalf("apply migration %d: %v", migs[i].version, err)
+		}
+	}
+	got := tableColumns(t, d, "models")
+	if got["launch_state"] {
+		t.Fatal("launch_state column should NOT exist before 0015 is applied")
+	}
+	if _, err := d.Exec(`INSERT INTO models (id, display_name, source, format, presence, auto_load_disabled) VALUES
+		('decommissioned','Decommissioned','local_path','gguf','present',1)`); err != nil {
+		t.Fatalf("insert pre-0015 decommissioned row: %v", err)
+	}
+	if _, err := d.Exec(`INSERT INTO models (id, display_name, source, format, presence, auto_load_disabled) VALUES
+		('normal','Normal','local_path','gguf','present',0)`); err != nil {
+		t.Fatalf("insert pre-0015 normal row: %v", err)
+	}
+
+	// Now apply 0015.
+	if err := d.applyOne(migs[idx15]); err != nil {
+		t.Fatalf("apply migration 15: %v", err)
+	}
+	got = tableColumns(t, d, "models")
+	if !got["launch_state"] {
+		t.Fatal("launch_state column missing after 0015")
+	}
+
+	var decommissionedState, normalState string
+	if err := d.QueryRow(`SELECT launch_state FROM models WHERE id='decommissioned'`).Scan(&decommissionedState); err != nil {
+		t.Fatalf("read back decommissioned row: %v", err)
+	}
+	if decommissionedState != "unavailable" {
+		t.Errorf("decommissioned row (auto_load_disabled=1) launch_state = %q, want unavailable", decommissionedState)
+	}
+	if err := d.QueryRow(`SELECT launch_state FROM models WHERE id='normal'`).Scan(&normalState); err != nil {
+		t.Fatalf("read back normal row: %v", err)
+	}
+	if normalState != "available_on_request" {
+		t.Errorf("normal row (auto_load_disabled=0) launch_state = %q, want available_on_request", normalState)
+	}
+
+	// Applying the full Migrate() now must be idempotent (0001..0015 already recorded).
+	if err := d.Migrate(); err != nil {
+		t.Fatalf("Migrate after stepwise must be idempotent: %v", err)
+	}
+}
+
 func TestSchemaColumnsMatchDDL(t *testing.T) {
 	d := openTemp(t)
 	if err := d.Migrate(); err != nil {

@@ -97,8 +97,15 @@ func fallbackEstimate(source Source, opts Options, parseErr error) (Result, erro
 			notes = append(notes, "note: model max context unknown from header; assumed 4096 for the KV term")
 		}
 	}
-	kvBytesPerElem := kvBytesForType(opts.KVCacheType)
-	kvBytes := kvCacheBytes(hdr, ctx, parallel(opts.ParallelSeq), kvBytesPerElem)
+	// INDEPENDENT K/V sizing (M4.1): the K and V halves of the cache are priced with their OWN
+	// dtypes (llama.cpp -ctk/-ctv), not one shared type. This previously read opts.KVCacheType,
+	// which the verdict path had overloaded with the canonical calibration key ("q8_0/q4_0") — an
+	// unrecognized token that fell through to the f16 default, so an asymmetric profile was priced
+	// as f16/f16 and the printed note disagreed with the emitted flags.
+	kTypeF, vTypeF := resolveKVPair(opts)
+	kvBytesPerElemK := kvBytesForType(kTypeF)
+	kvBytesPerElemV := kvBytesForType(vTypeF)
+	kvBytes := kvCacheBytes(hdr, ctx, parallel(opts.ParallelSeq), kvBytesPerElemK, kvBytesPerElemV)
 	kvMiB := int(math.Ceil(float64(kvBytes) / float64(MiB)))
 
 	est.VRAMMiB = weightsMiB + kvMiB + fallbackFixedOverheadMiB
@@ -107,16 +114,22 @@ func fallbackEstimate(source Source, opts Options, parseErr error) (Result, erro
 	est.Layers = int(hdr.blockCount)
 
 	notes = append(notes, fmt.Sprintf(
-		"inputs: file_size=%d bytes (%d MiB) → weights≈%d MiB; header n_layer=%d, n_embd=%d, n_head=%d, n_head_kv=%d, head_dim=%d → KV≈%d MiB at ctx=%d, parallel=%d, kv_bytes/elem=%d; fixed overhead=%d MiB",
+		"inputs: file_size=%d bytes (%d MiB) → weights≈%d MiB; header n_layer=%d, n_embd=%d, n_head=%d, n_head_kv=%d, head_dim=%d → KV≈%d MiB at ctx=%d, parallel=%d, kv=%s (k_bytes/elem=%d, v_bytes/elem=%d); fixed overhead=%d MiB",
 		fileSize, int(fileSize/MiB), weightsMiB,
 		hdr.blockCount, hdr.embeddingLength, hdr.headCount, hdr.headCountKV, hdr.headDim(),
-		kvMiB, ctx, parallel(opts.ParallelSeq), kvBytesPerElem, fallbackFixedOverheadMiB))
+		kvMiB, ctx, parallel(opts.ParallelSeq), kvLabelPair(kTypeF, vTypeF),
+		kvBytesPerElemK, kvBytesPerElemV, fallbackFixedOverheadMiB))
 	est.Notes = notes
 	return est, nil
 }
 
-// kvBytesForType returns per-element KV byte cost for a KV cache dtype on the
+// kvBytesForType returns per-element KV byte cost for ONE side (K or V) of the cache on the
 // fallback path. Empty => the conservative f16 default (2 bytes).
+//
+// This takes a SINGLE dtype, never a combined pair key: a caller must resolve the (K,V) pair
+// (resolveKVPair) and call this once per side. The `default` branch returns the conservative f16
+// cost for a genuinely unknown dtype (e.g. the fork-only tq3_0), which over-counts — the safe
+// direction per CLAUDE.md (a false `runs` that OOMs is a correctness bug; a false refusal is not).
 func kvBytesForType(t KVCacheType) int {
 	switch t {
 	case KVCacheF16, "":
@@ -130,10 +143,14 @@ func kvBytesForType(t KVCacheType) int {
 	}
 }
 
-// kvCacheBytes computes the KV cache footprint (GQA-aware) from header metadata.
+// kvCacheBytes computes the KV cache footprint (GQA-aware) from header metadata, sizing the K
+// and V halves INDEPENDENTLY (llama.cpp -ctk/-ctv may differ — M4.1):
 //
-//	kv_bytes = 2 (K and V) × n_layers × n_head_kv × head_dim × ctx × parallel × bytes_per_elem
-func kvCacheBytes(h ggufHeaderMeta, ctx, parallelSeq, bytesPerElem int) uint64 {
+//	kv_bytes = n_layers × n_head_kv × head_dim × ctx × parallel × (k_bytes_per_elem + v_bytes_per_elem)
+//
+// With a symmetric cache (k==v) this is identical to the previous
+// `2 × … × bytes_per_elem` formula, so no existing estimate moves.
+func kvCacheBytes(h ggufHeaderMeta, ctx, parallelSeq, kBytesPerElem, vBytesPerElem int) uint64 {
 	if parallelSeq <= 0 {
 		parallelSeq = 1
 	}
@@ -148,14 +165,13 @@ func kvCacheBytes(h ggufHeaderMeta, ctx, parallelSeq, bytesPerElem int) uint64 {
 	if nKV == 0 {
 		return 0
 	}
-	// 2 (K+V) × layers × n_kv_heads × head_dim × ctx × parallel × bytes/elem
-	return 2 *
-		uint64(h.blockCount) *
+	// layers × n_kv_heads × head_dim × ctx × parallel × (k_bytes + v_bytes)
+	return uint64(h.blockCount) *
 		uint64(nKV) *
 		uint64(headDim) *
 		uint64(ctx) *
 		uint64(parallelSeq) *
-		uint64(bytesPerElem)
+		uint64(kBytesPerElem+vBytesPerElem)
 }
 
 // ggufHeaderMeta is the minimal subset of GGUF KV metadata the fallback needs.

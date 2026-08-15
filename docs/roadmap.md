@@ -13,7 +13,7 @@ is met.
 Before building, run the target workflow with off-the-shelf tools and record where it
 hurts. This is what tells you what LocalHub must actually improve.
 
-- Stand up: Ollama + a folder of GGUFs; llama-swap in front of llama.cpp/vLLM; Open WebUI
+- Stand up: a folder of GGUFs + llama.cpp/vLLM; llama-swap in front of the engines; Open WebUI
   for chat; Tailscale Serve for phone access; `gguf-parser` CLI for estimates.
 - Try to answer, by hand, for 10 real models: "does it fit, on what engine, at what ctx?"
 - Note every manual/painful/impossible step. Those become LocalHub's feature list.
@@ -30,8 +30,7 @@ Pure read. No mutation, no downloads, no queue. Immediately useful and low-risk.
 
 - Hardware detection (NVIDIA/NVML first): GPU name, VRAM total/free, driver, CUDA, CC,
   temp, power, util; CPU/RAM/disk.
-- Engine detection: Ollama (`/api/version`, `/api/tags`, `/api/ps`), configured
-  llama.cpp, configured vLLM.
+- Engine detection: configured llama.cpp and configured vLLM.
 - Normalized model inventory table across sources.
 - Live GPU dashboard, **reachable from phone over Tailscale.**
 
@@ -59,7 +58,7 @@ actually OOM. Measure and record the estimator error.
 
 ## Phase 3 — Supply chain (download + manifest)
 
-- HF download with revision→commit pinning; single-GGUF URL; `ollama pull`; local import.
+- HF download with revision→commit pinning; single-GGUF URL; local import.
 - Per-file sha256; immutable manifest; license + security-warning scan.
 - Show verdict + resolved commit SHA **before** committing a large download.
 
@@ -74,7 +73,8 @@ First engine mutation. Owned processes only at first.
 
 - llama.cpp adapter: spawn/health/stop `llama-server`; port pool; flags recorded.
 - vLLM adapter: spawn/health/stop; `STARTING` UX for slow cold start.
-- Ollama adapter: warm via API; unload via `keep_alive: 0`; mirror `/api/ps`.
+- Ollama was retired after this phase under ADR-009; supported lifecycle ownership is now
+  supervised llama.cpp plus vLLM.
 - Instance state machine + reconciliation on control-plane restart.
 - Verify `stop` frees VRAM via NVML delta.
 
@@ -112,7 +112,8 @@ transparently; streaming intact; blocks return fast with a reason.
 
 ## Explicitly deferred / never
 
-- Multi-node (only if real demand; keep the single-box data model clean until then).
+- Cluster scheduling, cross-node weight transfer, and distributed state. ADR-008 permits only the
+  opt-in thin LAN federation of otherwise autonomous single-box daemons.
 - ML-based estimation (only if rule error proves large).
 - TPS/throughput prediction (label clearly as rough if added).
 - Auto Safetensors→GGUF conversion in core — **never** (ADR-004).

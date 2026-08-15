@@ -11,15 +11,18 @@ import (
 )
 
 // Request bundles everything one Evaluate call needs beyond the descriptor: the target
-// context/batch and the live hardware + engine availability.
+// context/batch, the live hardware + engine availability, and the LaunchProfile (M2.x) whose
+// K/V types, spec mode, slots, and offload preference shape both the VRAM estimate and the
+// advertised run flags. A zero Profile = f16 KV, no spec, 1 slot, full GPU (the historical
+// default), so callers and tests that omit it keep the prior behavior.
 type Request struct {
 	Descriptor   ModelDescriptor
 	RequestedCtx int // requested context tokens; 0 => default (8192)
 	Batch        int // concurrent sequences; 0 => 1
-	// KVQuant, if true, requests a quantized KV cache (q4_0/q8_0 GGUF; fp8 safetensors) to
-	// help a near-boundary model fit. The engine may set this itself when a model fits only
-	// with KV quant (runs_degraded).
-	KVQuant bool
+	// Profile carries the durable launch profile (independent K/V, spec mode incl. draft-mtp,
+	// MTP draft max, slots, CPU offload). The verdict's footprint and advertised flags reflect
+	// it so admission and launch agree (M2.2). KVQuant (bool) is replaced by Profile.KVQuantized().
+	Profile LaunchProfile
 }
 
 // defaultRequestedContext when the caller passes 0. Matches config.Compatibility.DefaultContext.
@@ -96,12 +99,12 @@ func (e *Engine) Evaluate(ctx context.Context, req Request, snap hardware.Snapsh
 
 	switch d.Format {
 	case FormatGGUF, FormatOllama:
-		return e.evaluateGGUF(ctx, model, d, reqCtx, batch, req.KVQuant, free, total, avail)
+		return e.evaluateGGUF(ctx, model, d, reqCtx, batch, req.Profile, free, total, avail)
 	case FormatSafetensors:
-		return e.evaluateSafetensors(model, d, reqCtx, batch, req.KVQuant, free, total, cc, ccKnown, avail)
+		return e.evaluateSafetensors(model, d, reqCtx, batch, req.Profile.KVQuantized(), free, total, cc, ccKnown, avail)
 	case FormatPyTorch:
 		// pickle/pytorch: safetensors-path math still applies for size, but route note differs.
-		return e.evaluateSafetensors(model, d, reqCtx, batch, req.KVQuant, free, total, cc, ccKnown, avail).
+		return e.evaluateSafetensors(model, d, reqCtx, batch, req.Profile.KVQuantized(), free, total, cc, ccKnown, avail).
 			addWarning("pytorch/pickle weights: prefer a safetensors version (pickle can execute code on load); " +
 				"vLLM can serve it but the security warning applies (ADR-004).")
 	default:
@@ -141,6 +144,42 @@ func nearBoundary(requiredMiB, usableMiB float64) bool {
 	lo := usableMiB * (1 - DegradedBoundaryFraction)
 	hi := usableMiB * (1 + DegradedBoundaryFraction)
 	return requiredMiB >= lo && requiredMiB <= hi
+}
+
+// usableVRAMFor returns the VRAM a verdict may spend, choosing the margin by CONFIDENCE:
+//
+//   - Confidence "exact" (a MEASURED observed peak): free − CalibratedMarginMiB. A measurement has no
+//     estimator error left to absorb, so the multiplicative cushion is unjustified — and on a 16 GB
+//     card it is large enough to permanently exclude a model sized to fill the card.
+//   - anything else (approximate / fallback): free × SafetyFactor, unchanged.
+//
+// The additive branch is clamped at 0 so a nearly-full card can never yield negative usable VRAM.
+func usableVRAMFor(freeMiB int, conf Confidence) float64 {
+	if conf != ConfidenceExact {
+		return usableVRAM(freeMiB)
+	}
+	u := float64(freeMiB - CalibratedMarginMiB)
+	if u < 0 {
+		return 0
+	}
+	return u
+}
+
+// withinAdmissionNoise reports whether a FITTING estimate clears usable VRAM by less than the
+// measured VRAM-noise band (M4.6). It is deliberately different from nearBoundary:
+//
+//   - nearBoundary is a RELATIVE ±15% band used to flag a low-confidence FALLBACK estimate.
+//   - this is an ABSOLUTE MiB headroom check that applies however confident the estimate is,
+//     because the problem is not estimator uncertainty — it is that free VRAM itself moves by tens
+//     of MiB between two otherwise identical requests.
+//
+// It returns false for a non-fitting estimate: that case is already handled as a refusal/degrade,
+// and this check must never soften a refusal.
+func withinAdmissionNoise(requiredMiB, usableMiB float64) bool {
+	if usableMiB <= 0 || requiredMiB > usableMiB {
+		return false
+	}
+	return usableMiB-requiredMiB < float64(AdmissionNoiseMiB)
 }
 
 // roundMiB rounds a float MiB figure to an int for the verdict.

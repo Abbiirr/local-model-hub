@@ -169,6 +169,20 @@ type AdmitSpec struct {
 	// exact priority the user asked for.
 	Priority int
 
+	// Profile carries the rest of the behaviour-affecting launch profile (independent KV pair,
+	// slots, speculative mode + draft max, CPU-offload permission) so a QUEUED request replays
+	// with the profile the caller actually asked for (migration 0009, KNOWN-LIMITATIONS #21).
+	Profile ProfileSpec
+
+	// MeasuredFootprint states that FootprintMiB came from a MEASURED observed peak (NVML truth from
+	// a real prior run of this exact model+ctx+KV profile), not an estimate. It selects the smaller
+	// CalibratedMarginMiB cushion instead of the configured safety_margin_mb.
+	//
+	// Callers MUST NOT set this for an estimate. The margin it replaces is what stands between a
+	// wrong number and an OOM; the claim is only safe because a measurement has no estimator error
+	// left to absorb. core sets it strictly from Verdict.Confidence == "exact".
+	MeasuredFootprint bool
+
 	// FootprintMiB, if > 0, is a pre-computed footprint the caller already has (e.g. from the
 	// compat verdict it computed for the start path). Admission uses it verbatim and skips the
 	// estimator — avoiding a duplicate estimate. 0 → ask the FootprintEstimator.
@@ -436,7 +450,15 @@ func (m *Manager) admitLocked(ctx context.Context, spec AdmitSpec) (AdmitResult,
 		}
 		footprint = f
 	}
-	need := footprint + m.safetyMarginMiB
+	// A MEASURED footprint gets a smaller cushion than an estimated one. The configured
+	// safety_margin_mb absorbs estimator error on top of the compat layer's own multiplicative
+	// factor; when the caller states the number came from a real observed peak (NVML truth from a
+	// prior run of this exact profile), the only thing left to absorb is allocator jitter. Without
+	// this the two margins stack, and a model sized to fill the card can never be admitted even with
+	// driver-truth numbers — the Qwen3.6-27B MTP profile at 64K needs ~15687 MiB, so 15687 + 1024
+	// exceeds a 16380 MiB card outright.
+	marginMiB := m.marginFor(spec)
+	need := footprint + marginMiB
 	// A matching model is already between admission and process registration. Do not
 	// launch a duplicate process while the first start is still reserved.
 	if m.reservations[reservationKey(spec.ModelID, spec.Engine)] > 0 {
@@ -686,6 +708,10 @@ func (m *Manager) enqueueOrReject(ctx context.Context, spec AdmitSpec, res Admit
 		Batch:    spec.Batch,
 		Pin:      spec.Pin,
 		Priority: spec.Priority,
+		// The launch profile rides along (migration 0009) so the drain loop replays the SAME
+		// profile — KV pair, slots, spec mode, offload — that admission just priced. Without it a
+		// queued q4_0 request came back as f16 and could never fit (KNOWN-LIMITATIONS #21).
+		Profile: spec.Profile,
 	}
 	stored, err := m.queue.Enqueue(req)
 	if err != nil {
@@ -741,12 +767,33 @@ func (m *Manager) RestoreWaiting(ctx context.Context) (int, error) {
 			Batch:    row.ReqBatch,
 			Pin:      row.ReqPin,
 			Priority: row.Priority,
+			// Restore the persisted launch profile too (migration 0009). This is the DAEMON-RESTART
+			// half of the replay contract (M2.GATE / TESTING.md#m2): a queued start must yield an
+			// identical normalized launch plan after a restart, never regressing to f16 KV.
+			Profile: row.Profile,
 		}, row.Seq, row.EnqueuedAt)
 		if err != nil {
 			return 0, fmt.Errorf("restore waiting queue row %s: %w", row.ID, err)
 		}
 	}
 	return len(rows), nil
+}
+
+// CalibratedMarginMiB is the additive cushion used when the caller supplied a MEASURED footprint.
+// It mirrors compat.CalibratedMarginMiB (residency must not import compat — see ProfileSpec for the
+// same rule); the two are kept equal deliberately so the verdict and admission agree about how much
+// headroom a driver-truth number needs. It covers allocator jitter and free-VRAM noise, nothing more.
+const CalibratedMarginMiB = 320
+
+// marginFor picks the admission cushion: the small additive CalibratedMarginMiB when the footprint is
+// a real measurement, else the configured safety_margin_mb. It never returns MORE than the configured
+// margin, so this can only ever loosen admission for a measured number and never tighten it for an
+// estimate.
+func (m *Manager) marginFor(spec AdmitSpec) int {
+	if spec.MeasuredFootprint && CalibratedMarginMiB < m.safetyMarginMiB {
+		return CalibratedMarginMiB
+	}
+	return m.safetyMarginMiB
 }
 
 // queuePositionLocked returns the 1-based score-order position of the request id in the queue

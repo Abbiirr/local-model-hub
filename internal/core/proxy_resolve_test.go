@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/localhub/localhub/internal/compat"
@@ -45,6 +46,31 @@ func TestOpenAIModels_FiltersToRunnable(t *testing.T) {
 			t.Errorf("%q should NOT be listed (not runnable/present)", notWant)
 		}
 	}
+}
+
+func TestOpenAIModels_IncludesHealthyAdoptedInstanceOutsideCatalog(t *testing.T) {
+	svc, _, _ := startResidencyService(t, compat.Verdict{
+		Status: compat.StatusRuns, Reason: "ok", EstimatedVRAMMiB: 4000,
+	}, 15200, []instances.Instance{
+		{
+			ID:      "adopted-live",
+			ModelID: "external-qwen",
+			Engine:  instances.EngineLlamaCPP,
+			State:   instances.StateHealthy,
+			Adopted: true,
+		},
+	})
+
+	models, err := svc.OpenAIModels(context.Background())
+	if err != nil {
+		t.Fatalf("OpenAIModels: %v", err)
+	}
+	for _, model := range models {
+		if model.ID == "external-qwen" {
+			return
+		}
+	}
+	t.Fatal("healthy adopted model was not advertised")
 }
 
 // TestResolveForProxy_WarmRoutesAndCountsInFlight: a HEALTHY instance already serving the model is
@@ -249,6 +275,180 @@ func TestBeginInstanceRequest_UpstreamModel(t *testing.T) {
 func TestResolveForProxy_ModelNotFound(t *testing.T) {
 	svc, _, _ := startResidencyService(t, compat.Verdict{Status: compat.StatusRuns, Reason: "ok"}, 15200, nil)
 	_, _, err := svc.ResolveForProxy(context.Background(), "no-such-model", 1)
+	if !errors.Is(err, ErrProxyModelNotFound) {
+		t.Errorf("want ErrProxyModelNotFound for an unknown model, got %v", err)
+	}
+}
+
+// --- POST /v1/embeddings resolution (ResolveForEmbeddings) --------------------------------------
+//
+// An instance is embedding-mode iff its persisted LaunchFlags contains the exact element
+// "--embedding" (instanceIsEmbedding, proxy.go) — the flag vector llama.cpp's runner actually spawned
+// the process with. These tests seed that column directly via `UPDATE instances SET
+// launch_flags_json=...`, the same direct-DB pattern the existing warm tests above use for base_url
+// (Transition on an already-HEALTHY row is a same-state transition and may be rejected).
+
+// TestResolveForEmbeddings_RoutesToEmbeddingModeInstance is the embeddings-path mirror of
+// TestResolveForProxy_WarmRoutesAndCountsInFlight: a HEALTHY llama.cpp instance whose LaunchFlags
+// contain "--embedding" is exactly what /v1/embeddings must route to (llama.cpp restricts such a
+// server to the embedding routes — tools/server/README.md: "--embedding, --embeddings : restrict to
+// only support embedding use case"). ResolveForEmbeddings must warm-route to it (no spawn) and drive
+// the SAME never-kill-active in-flight accounting as the ordinary chat path.
+func TestResolveForEmbeddings_RoutesToEmbeddingModeInstance(t *testing.T) {
+	svc, fr, _ := startResidencyService(t, compat.Verdict{
+		Status: compat.StatusRuns, Reason: "ok", EstimatedVRAMMiB: 4000,
+	}, 15200, []instances.Instance{
+		{ID: "emb1", ModelID: "m1", Engine: instances.EngineLlamaCPP, VRAMEstMiB: 4000},
+	})
+	base := "http://127.0.0.1:40140"
+	if _, err := svc.deps.DB.Exec(`UPDATE instances SET base_url=?, launch_flags_json=? WHERE id='emb1'`,
+		base, `["-ngl","all","--embedding"]`); err != nil {
+		t.Fatalf("seed embedding launch flags: %v", err)
+	}
+
+	handle, block, err := svc.ResolveForEmbeddings(context.Background(), "m1", 1)
+	if err != nil {
+		t.Fatalf("ResolveForEmbeddings warm: %v", err)
+	}
+	if block != nil {
+		t.Fatalf("an embedding-mode resident must not block: %s", block.Reason)
+	}
+	if handle == nil {
+		t.Fatal("expected a handle for a warm embedding-mode instance")
+	}
+	if fr.startCalled {
+		t.Error("warm embeddings route must NOT spawn (runner.Start called)")
+	}
+	if c := svc.deps.InFlight.ActiveCount("emb1"); c != 1 {
+		t.Errorf("in-flight during embeddings request = %d, want 1 (never-kill-active gate)", c)
+	}
+	handle.Done()
+	if c := svc.deps.InFlight.ActiveCount("emb1"); c != 0 {
+		t.Errorf("in-flight after Done = %d, want 0", c)
+	}
+}
+
+// TestResolveForEmbeddings_RefusesGenerationModeInstance pins the correctness bar named in
+// resolveForProxy's own doc comment: an embeddings request must never be relayed to a server started
+// without --embedding, because llama.cpp restricts such a server to the generation routes.
+//
+// Actual production behavior, verified by reading the code (do not assume): the resident here is
+// HEALTHY for the right model+engine but lacks "--embedding", so (a) the mode-aware warm
+// short-circuit at the top of StartInstance (instances.go) does NOT match it (it requires
+// instanceLaunchedForEmbedding(resident) == req.Embedding), so the request falls through to the full
+// verdict+admission path; (b) residency's OWN warm check inside admitGate (warmInstance in
+// residency/admission.go) matches on model+engine ONLY, mode-blind, so it DOES return this resident
+// as "warm"; (c) the guard immediately after admitGate in StartInstance (instances.go) detects the
+// mode mismatch and returns a "REFUSED: ..." error instead of the warm instance; (d) resolveForProxy's
+// "REFUSED:" branch converts that into a (nil, *ProxyBlock, nil) — NOT a raw error. So the refusal
+// here is a *ProxyBlock, not an error.
+func TestResolveForEmbeddings_RefusesGenerationModeInstance(t *testing.T) {
+	svc, fr, _ := startResidencyService(t, compat.Verdict{
+		Status: compat.StatusRuns, Reason: "ok", EstimatedVRAMMiB: 4000,
+	}, 15200, []instances.Instance{
+		{ID: "gen1", ModelID: "m1", Engine: instances.EngineLlamaCPP, VRAMEstMiB: 4000},
+	})
+	base := "http://127.0.0.1:40150"
+	if _, err := svc.deps.DB.Exec(`UPDATE instances SET base_url=? WHERE id='gen1'`, base); err != nil {
+		t.Fatalf("seed base_url: %v", err)
+	}
+
+	handle, block, err := svc.ResolveForEmbeddings(context.Background(), "m1", 1)
+	if handle != nil {
+		t.Fatal("a generation-mode resident must never be handed out as an embeddings handle")
+	}
+	if fr.startCalled {
+		t.Error("must not spawn a new instance when refusing a mode mismatch")
+	}
+	if err != nil {
+		t.Fatalf("expected the refusal as a *ProxyBlock (the REFUSED-error mapping), got a raw error instead: %v", err)
+	}
+	if block == nil {
+		t.Fatal("expected a *ProxyBlock refusing the mode mismatch")
+	}
+	reason := strings.ToLower(block.Reason)
+	if !strings.Contains(reason, "embedding") || !strings.Contains(reason, "generation") {
+		t.Errorf("block reason should name the mode problem (embedding vs generation), got: %s", block.Reason)
+	}
+}
+
+// TestResolveForProxy_RefusesEmbeddingModeInstanceForGeneration is the mirror image of
+// TestResolveForEmbeddings_RefusesGenerationModeInstance: a resident started WITH --embedding must
+// never be handed to an ordinary chat-completion caller through the ordinary ResolveForProxy path
+// either — an embedding-only llama.cpp server cannot answer the generation routes.
+//
+// Actual production behavior, verified by reading the code: same shape as the mirror case above, NOT
+// a fresh spawn attempt. The model+engine-only warm check inside admitGate matches the embedding-mode
+// resident (mode-blind), the guard in StartInstance right after admitGate catches the mismatch and
+// returns a "REFUSED: ..." error, and resolveForProxy converts that into a (nil, *ProxyBlock, nil) —
+// so this, too, asserts a block, not a raw error, and no spawn.
+func TestResolveForProxy_RefusesEmbeddingModeInstanceForGeneration(t *testing.T) {
+	svc, fr, _ := startResidencyService(t, compat.Verdict{
+		Status: compat.StatusRuns, Reason: "ok", EstimatedVRAMMiB: 4000,
+	}, 15200, []instances.Instance{
+		{ID: "emb2", ModelID: "m1", Engine: instances.EngineLlamaCPP, VRAMEstMiB: 4000},
+	})
+	base := "http://127.0.0.1:40160"
+	if _, err := svc.deps.DB.Exec(`UPDATE instances SET base_url=?, launch_flags_json=? WHERE id='emb2'`,
+		base, `["-ngl","all","--embedding"]`); err != nil {
+		t.Fatalf("seed embedding launch flags: %v", err)
+	}
+
+	handle, block, err := svc.ResolveForProxy(context.Background(), "m1", 1)
+	if handle != nil {
+		t.Fatal("an embedding-only resident must never be handed out for a chat-completion request")
+	}
+	if fr.startCalled {
+		t.Error("must not spawn a NEW instance when refusing a mode mismatch (verified: this is a block, not a fresh spawn attempt)")
+	}
+	if err != nil {
+		t.Fatalf("expected the refusal as a *ProxyBlock (the REFUSED-error mapping), got a raw error instead: %v", err)
+	}
+	if block == nil {
+		t.Fatal("expected a *ProxyBlock refusing the mode mismatch")
+	}
+	reason := strings.ToLower(block.Reason)
+	if !strings.Contains(reason, "embedding") || !strings.Contains(reason, "generation") {
+		t.Errorf("block reason should name the mode problem (embedding vs generation), got: %s", block.Reason)
+	}
+}
+
+// TestInstanceIsEmbedding is a direct unit test of instanceIsEmbedding (proxy.go): it scans
+// InstanceView.LaunchFlags for the EXACT element "--embedding" — no prefix/substring match — because
+// that flag vector is the FULL spawned vector the llama.cpp runner persisted, the authoritative record
+// of the mode the process is actually in (no separate schema field to drift out of sync).
+//
+// Verified by reading the implementation (a simple `flag == "--embedding"` loop): a near-miss like
+// llama.cpp's plural alias "--embeddings" or a hypothetical "--embedding=true" is NOT an exact-element
+// match, so both are false here even though a human skimming the flag list might assume otherwise.
+func TestInstanceIsEmbedding(t *testing.T) {
+	cases := []struct {
+		name  string
+		flags []string
+		want  bool
+	}{
+		{"nil LaunchFlags", nil, false},
+		{"flags without the marker", []string{"-ngl", "all", "--ctx-size", "4096"}, false},
+		{"flags with the exact marker", []string{"-ngl", "all", "--embedding"}, true},
+		{"near-miss plural --embeddings is NOT an exact match", []string{"--embeddings"}, false},
+		{"near-miss --embedding=true is NOT an exact match", []string{"--embedding=true"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := instanceIsEmbedding(InstanceView{LaunchFlags: tc.flags})
+			if got != tc.want {
+				t.Errorf("instanceIsEmbedding(%v) = %v, want %v", tc.flags, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveForEmbeddings_ModelNotFound mirrors TestResolveForProxy_ModelNotFound: an unknown model
+// on the embeddings path returns the SAME ErrProxyModelNotFound (both resolvers share
+// resolveForProxy's not-found handling), so the handler maps it to 404 model_not_found identically.
+func TestResolveForEmbeddings_ModelNotFound(t *testing.T) {
+	svc, _, _ := startResidencyService(t, compat.Verdict{Status: compat.StatusRuns, Reason: "ok"}, 15200, nil)
+	_, _, err := svc.ResolveForEmbeddings(context.Background(), "no-such-model", 1)
 	if !errors.Is(err, ErrProxyModelNotFound) {
 		t.Errorf("want ErrProxyModelNotFound for an unknown model, got %v", err)
 	}

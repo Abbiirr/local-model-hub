@@ -149,7 +149,12 @@ func (s *Service) admitGate(ctx context.Context, req StartInstanceRequest, reqCt
 		}
 		return nil, false, nil
 	}
-	decision, aerr := s.admitForStart(ctx, req, reqCtx, verdict.EstimatedVRAMMiB)
+	// Pass the verdict's CONFIDENCE, not just its number: a footprint that came from a measured
+	// observed peak earns the smaller additive admission cushion, an estimate keeps the full
+	// configured margin. This is the only place the claim is made, and it is derived strictly from
+	// the verdict rather than from anything a caller supplied.
+	decision, aerr := s.admitForStart(ctx, req, reqCtx, verdict.EstimatedVRAMMiB,
+		verdict.Confidence == compat.ConfidenceExact)
 	if aerr != nil {
 		return nil, false, fmt.Errorf("admission: %w", aerr)
 	}
@@ -180,7 +185,7 @@ func (s *Service) admitGate(ctx context.Context, req StartInstanceRequest, reqCt
 // StartInstance uses it to decide whether to proceed to spawn (RouteLoaded/LoadNew/EvictThenLoad)
 // or to refuse-with-queue-position (Queue/Reject). It passes the precomputed footprint from the
 // verdict when available so admission does not re-estimate.
-func (s *Service) admitForStart(ctx context.Context, req StartInstanceRequest, reqCtx int, footprintMiB int) (residency.AdmitResult, error) {
+func (s *Service) admitForStart(ctx context.Context, req StartInstanceRequest, reqCtx int, footprintMiB int, measured bool) (residency.AdmitResult, error) {
 	spec := residency.AdmitSpec{
 		ModelID:      req.ModelID,
 		Engine:       req.Engine,
@@ -190,6 +195,11 @@ func (s *Service) admitForStart(ctx context.Context, req StartInstanceRequest, r
 		Pin:          req.Pin,
 		Priority:     req.Priority,
 		FootprintMiB: footprintMiB,
+		// True only when footprintMiB is a MEASURED observed peak (Verdict.Confidence "exact").
+		MeasuredFootprint: measured,
+		// The launch profile the footprint above was computed FOR. Persisted with the queue row so
+		// a queued start replays with the same profile instead of a default-shaped one (M2.4).
+		Profile: profileSpecFromRequest(req),
 	}
 	if spec.Engine == "" {
 		spec.Engine = string(instances.EngineLlamaCPP)
@@ -201,8 +211,23 @@ func (s *Service) admitForStart(ctx context.Context, req StartInstanceRequest, r
 	// (residencyEstimator.Footprint) — the conservative, anti-OOM number for admission (fix 2).
 	if spec.Engine == string(instances.EngineVLLM) {
 		spec.FootprintMiB = 0
+		// The measurement claim belonged to the discarded compat number; residency will estimate
+		// util×total itself, and that is NOT a measured peak.
+		spec.MeasuredFootprint = false
 	}
 	return s.deps.Residency.Admit(ctx, spec)
+}
+
+// --- AutoLoadGate seam (migration 0014) ----------------------------------------------------------
+
+// residencyAutoLoadGate implements residency.AutoLoadGate over the models table so the drain loop
+// can refuse to PROMOTE a decommissioned model out of the queue (see AutoLoadGate's doc comment in
+// internal/residency/drain.go and StartInstance's belt-and-braces check for the other two enforcement
+// points of the same flag).
+type residencyAutoLoadGate struct{ s *Service }
+
+func (g residencyAutoLoadGate) AutoLoadRefusalReason(ctx context.Context, modelID string) string {
+	return g.s.autoLoadDisabledReason(ctx, modelID)
 }
 
 // --- Queue API surface --------------------------------------------------------------------------
@@ -308,6 +333,70 @@ func (s *Service) publishQueueUpdated() {
 	}
 }
 
+// --- Launch-profile ⇄ queue translation (M2.4) --------------------------------------------------
+//
+// These two functions are the ONLY bridge between `core.StartInstanceRequest` (the API shape) and
+// `residency.ProfileSpec` (the persisted queue shape). They are exact inverses for every
+// behaviour-affecting field, which is the property TestProfileSpecRoundTrip pins:
+//
+//	startRequestFromDrain(drainOf(profileSpecFromRequest(req))) == req   (for profile fields)
+//
+// Keeping the mapping in one pair of functions is what makes the round-trip auditable. The
+// 2026-07-25 defect existed precisely because the reverse direction was written inline in
+// StartQueued and silently omitted three fields.
+
+// profileSpecFromRequest projects the profile-bearing fields of a start request into the durable
+// queue shape. The legacy `kv_quant` bool is RESOLVED here — not stored alongside the pair — so the
+// queue holds exactly one representation of the KV cache and a restart cannot surface a
+// disagreement between them. The resolution matches startProfile's precedence exactly: an explicit
+// (K,V) wins; otherwise kv_quant=true means q4_0 on both sides.
+func profileSpecFromRequest(req StartInstanceRequest) residency.ProfileSpec {
+	p := startProfile(req, req.Ctx)
+	return residency.ProfileSpec{
+		KVTypeK:         string(p.KVTypeK),
+		KVTypeV:         string(p.KVTypeV),
+		Slots:           p.Slots,
+		SpecMode:        p.SpecMode,
+		SpecDraftMax:    p.SpecDraftMax,
+		AllowCPUOffload: p.AllowCPUOffload,
+		// Server-MODE fields (migration 0013): dropping these here is the 2026-08-06 defect — a
+		// queued embedding/reranking start replayed as a plain generation start and crashed
+		// encoder-only models (bge-m3) instantly. See ProfileSpec.Embedding's doc comment.
+		Embedding: p.Embedding,
+		Pooling:   p.Pooling,
+		Reranking: p.Reranking,
+	}
+}
+
+// startRequestFromDrain rebuilds the start request for a de-queued (drained) request, restoring the
+// FULL launch profile the request was admitted with.
+//
+// KVQuant is deliberately left false: the KV cache is now described by the explicit (K,V) pair the
+// queue persisted, and startProfile's precedence gives that pair priority anyway. Setting the bool
+// too would be redundant at best and contradictory at worst.
+func startRequestFromDrain(req residency.DrainRequest) StartInstanceRequest {
+	return StartInstanceRequest{
+		ModelID:         req.ModelID,
+		Engine:          req.Engine,
+		Ctx:             req.Ctx,
+		Batch:           req.Batch,
+		Priority:        req.Priority,
+		Pin:             req.Pin,
+		KVTypeK:         req.Profile.KVTypeK,
+		KVTypeV:         req.Profile.KVTypeV,
+		Slots:           req.Profile.Slots,
+		Speculative:     req.Profile.SpecMode,
+		SpecDraftMax:    req.Profile.SpecDraftMax,
+		AllowCPUOffload: req.Profile.AllowCPUOffload,
+		// Server-MODE fields (migration 0013): restored so a replayed start rebuilds the SAME
+		// LaunchProfile it was queued with, instead of silently defaulting to plain generation mode
+		// (the 2026-08-06 bge-m3 crash-loop defect).
+		Embedding: req.Profile.Embedding,
+		Pooling:   req.Profile.Pooling,
+		Reranking: req.Profile.Reranking,
+	}
+}
+
 // --- Drain loop wiring (Phase 5 fix 1) ---------------------------------------------------------
 
 // residencyStarter implements residency.QueueStarter: it re-runs the start path for a de-queued
@@ -315,6 +404,44 @@ func (s *Service) publishQueueUpdated() {
 // capacity frees. Kept on the service (the start path lives here); residency only decides WHICH
 // queued request to attempt and WHEN.
 type residencyStarter struct{ s *Service }
+
+func (r residencyStarter) rejectWrongModeReplay(ctx context.Context, view InstanceView, mismatch error) error {
+	if r.s.deps.LlamaRunner == nil {
+		return mismatch
+	}
+	if _, stopErr := r.s.deps.LlamaRunner.Stop(ctx, view.ID); stopErr != nil {
+		return fmt.Errorf("%w; cleanup of wrong-mode instance %q failed: %v", mismatch, view.ID, stopErr)
+	}
+	return mismatch
+}
+
+// verifyReplayedLaunchMode is the SAFETY GUARD (migration 0013): a replayed start must launch in
+// the SAME mode it was queued with. LaunchFlags is the AUTHORITATIVE record of what the process
+// actually spawned with (launchFlagsHaveEmbedding's doc comment) — comparing it against what the
+// restored request asked for catches ANY way the mode failed to survive the round-trip, not just
+// the specific dropped-field bug fixed here. Scoped to llama.cpp: Embedding/Pooling/Reranking are
+// llama.cpp-specific fields that ollama/vllm ignore (StartInstanceRequest doc comments), so
+// LaunchFlags is not a meaningful mode record for those engines — nil error for them always.
+//
+// This matters even beyond the bge-m3 case: a model that CAN serve generation traffic without
+// crashing would otherwise silently come back in the wrong mode and answer the wrong endpoints — a
+// crash is a lucky, loud failure; this guard makes the failure loud even when the process would
+// otherwise start "successfully" in the wrong mode (CLAUDE.md: every verdict/error carries a
+// human-readable reason; refuse rather than silently mis-launch).
+func verifyReplayedLaunchMode(queueID, modelID string, sreq StartInstanceRequest, view InstanceView) error {
+	if sreq.Engine != string(instances.EngineLlamaCPP) {
+		return nil
+	}
+	want := requestedLaunchMode(sreq)
+	got := launchModeOfFlags(view.LaunchFlags)
+	if got == want {
+		return nil
+	}
+	return fmt.Errorf(
+		"queued start %s for model %q replayed in %s mode but was requested as %s mode "+
+			"(launch-profile restore mismatch) — refusing rather than silently serving the wrong endpoints",
+		queueID, modelID, got, want)
+}
 
 // StartQueued re-runs StartInstance for a drained request. It reports:
 //   - started=true when an instance started (or routed to a warm one),
@@ -325,16 +452,16 @@ type residencyStarter struct{ s *Service }
 // re-enqueue under the SAME queue id (admission creates a fresh row on a re-queue; the drain loop
 // marks the old row DONE).
 func (r residencyStarter) StartQueued(ctx context.Context, req residency.DrainRequest) (started bool, requeued bool, err error) {
-	sreq := StartInstanceRequest{
-		ModelID:  req.ModelID,
-		Engine:   req.Engine,
-		Ctx:      req.Ctx,
-		Batch:    req.Batch,
-		Priority: req.Priority,
-		Pin:      req.Pin,
-	}
-	_, serr := r.s.StartInstance(ctx, sreq)
+	sreq := startRequestFromDrain(req)
+	view, serr := r.s.StartInstance(ctx, sreq)
 	if serr == nil {
+		if gerr := verifyReplayedLaunchMode(req.QueueID, req.ModelID, sreq, view); gerr != nil {
+			// The guard verifies the process that actually launched, so a mismatch can only be known
+			// after StartInstance returns. Do not leave that known-wrong server resident: stop it through
+			// the engine adapter, whose stop path verifies VRAM release. A cleanup failure is included in
+			// the durable queue failure reason rather than hiding the original mode mismatch.
+			return false, false, r.rejectWrongModeReplay(ctx, view, gerr)
+		}
 		return true, false, nil
 	}
 	var qErr *QueuedError

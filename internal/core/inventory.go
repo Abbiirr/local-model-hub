@@ -27,6 +27,21 @@ type ModelSummary struct {
 	Presence     string `json:"presence"` // present | missing
 	MissingSince string `json:"missing_since,omitempty"`
 	UpdatedAt    string `json:"updated_at,omitempty"`
+	// LaunchState is the four-state per-model residency policy (migration 0015):
+	// always_available | available | available_on_request (default) | unavailable. It governs
+	// eagerness/eviction/idle-TTL — NOT visibility — except that unavailable also excludes the model
+	// from GET /v1/models (the only list-hiding rule tied to this field). See migration 0015's doc
+	// comment and docs/api-spec.md for the full state table. Set via
+	// PUT /api/models/{id}/launch-state {"state": "..."}.
+	LaunchState string `json:"launch_state"`
+	// AutoLoadDisabled is DEPRECATED and now DERIVED (LaunchState == "unavailable"), kept so existing
+	// readers of this bool keep working unchanged. It marks a model every implicit/auto start path
+	// (the OpenAI proxy, the residency queue drain/promotion loop, the async jobs worker) refuses to
+	// load, and that GET /v1/models excludes. GET /api/models (this view) STILL lists it — the
+	// operator must be able to see and reverse it — and an EXPLICIT POST /api/instances start is NOT
+	// affected by this flag. Prefer LaunchState; toggle via the new
+	// PUT /api/models/{id}/launch-state or the deprecated PUT /api/models/{id}/auto-load alias.
+	AutoLoadDisabled bool `json:"auto_load_disabled"`
 }
 
 // RescanResult summarizes a POST /api/models/rescan pass. Every count and the Ollama
@@ -111,7 +126,8 @@ func (s *Service) Models(ctx context.Context) ([]ModelSummary, error) {
 SELECT id, display_name, source, format,
        COALESCE(quantization,''), COALESCE(repo,''), COALESCE(local_path,''),
        size_bytes, COALESCE(sha256,''), COALESCE(compat_status,''),
-       COALESCE(presence,'present'), COALESCE(missing_since,''), COALESCE(updated_at,'')
+       COALESCE(presence,'present'), COALESCE(missing_since,''), COALESCE(updated_at,''),
+       COALESCE(launch_state,'available_on_request')
 FROM models
 WHERE COALESCE(source, '') <> 'ollama' AND COALESCE(format, '') <> 'ollama'
 ORDER BY display_name COLLATE NOCASE, id`
@@ -129,10 +145,12 @@ ORDER BY display_name COLLATE NOCASE, id`
 			&m.Quantization, &m.Repo, &m.LocalPath,
 			&size, &m.SHA256, &m.CompatStatus,
 			&m.Presence, &m.MissingSince, &m.UpdatedAt,
+			&m.LaunchState,
 		); err != nil {
 			return nil, fmt.Errorf("scan model row: %w", err)
 		}
 		m.SizeBytes = size
+		m.AutoLoadDisabled = m.LaunchState == launchStateUnavailable
 		out = append(out, m)
 	}
 	if err := rows.Err(); err != nil {

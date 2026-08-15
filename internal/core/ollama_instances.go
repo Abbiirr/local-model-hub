@@ -42,7 +42,8 @@ func (s *Service) startOllamaInstance(ctx context.Context, req StartInstanceRequ
 	}
 	avail := s.engineAvailability(ctx)
 	verdict := s.deps.Compat.Evaluate(ctx, compat.Request{
-		Descriptor: desc, RequestedCtx: reqCtx, Batch: req.Batch, KVQuant: req.KVQuant,
+		Descriptor: desc, RequestedCtx: reqCtx, Batch: req.Batch,
+		Profile: legacyKVProfile(reqCtx, req.Batch, req.KVQuant),
 	}, snap, avail)
 
 	// Ollama models carry no local GGUF path (the daemon owns the blob), so the GGUF estimator
@@ -95,14 +96,19 @@ func (s *Service) startOllamaInstance(ctx context.Context, req StartInstanceRequ
 		numGPU = ollama.FullGPULayers()
 	}
 
+	// Four-state residency policy (migration 0015) — see instances.go's identical call site for the
+	// full explanation; the same pin/TTL derivation applies uniformly across engines.
+	launchState := s.launchStateFor(ctx, req.ModelID)
+	ttlSeconds, forcePin := residencyPolicyForLaunchState(launchState, s.deps.Cfg.Residency.DefaultTTLSeconds)
+
 	instanceID := uuid.NewString()
 	inst, err := s.deps.OllamaRunner.Warm(ctx, ollama.WarmSpec{
 		InstanceID: instanceID,
 		ModelID:    req.ModelID,
 		OllamaTag:  tag,
-		Pinned:     req.Pin,
+		Pinned:     req.Pin || forcePin,
 		Priority:   req.Priority,
-		TTLSeconds: s.deps.Cfg.Residency.DefaultTTLSeconds,
+		TTLSeconds: ttlSeconds,
 		NumGPU:     numGPU,
 	})
 	if err != nil {

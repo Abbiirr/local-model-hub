@@ -9,6 +9,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -51,7 +52,21 @@ func run() error {
 		return fmt.Errorf("config: %w", err)
 	}
 
-	logger := cfg.Logging.NewLogger(os.Stderr)
+	// localhub.exe is linked for the Windows GUI subsystem (-H=windowsgui) so it never opens a
+	// console window. That means os.Stderr is an invalid handle and every log line would be
+	// silently dropped — so when logging.file is set we tee to a file, which becomes the only
+	// place output actually lands. Failing to open that file is deliberately NOT fatal: losing
+	// logs must never stop the daemon from serving.
+	logWriter := io.Writer(os.Stderr)
+	if path := strings.TrimSpace(cfg.Logging.File); path != "" {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err == nil {
+			if f, ferr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); ferr == nil {
+				defer f.Close()
+				logWriter = io.MultiWriter(os.Stderr, f)
+			}
+		}
+	}
+	logger := cfg.Logging.NewLogger(logWriter)
 	logger.Info("localhub starting",
 		"version", core.Version,
 		"config", configPathLabel(configPath),
@@ -120,7 +135,11 @@ func run() error {
 	manifestStore := manifest.NewStore(database.DB)
 	var downloader *manifest.Downloader
 	if len(cfg.Data.ModelDirs) > 0 {
-		guard := manifest.GuardConfig{FreeDiskBytes: freeDiskBytes(ctxBg(), hwProbe, cfg.Data.ModelDirs[0])}
+		guard := manifest.GuardConfig{
+			HardCapBytes:      cfg.Downloads.MaxBytes,
+			DiskHeadroomBytes: cfg.Downloads.DiskHeadroomBytes,
+			FreeDiskBytes:     freeDiskBytes(ctxBg(), hwProbe, cfg.Data.ModelDirs[0]),
+		}
 		downloader = manifest.NewDownloader(
 			cfg.Data.ModelDirs[0], guard, cfg.Security.StrictModelArtifactMode, "")
 	}
@@ -135,9 +154,13 @@ func run() error {
 	instStore := instances.NewStore(database.DB)
 	var llamaRunner *llamacpp.Runner
 	var reconciler *instances.Reconciler
+	// llamaPortPool is hoisted out of the block below because the POST-HEALTHY monitor (M5) also
+	// frees ports, and it can only be built AFTER the in-flight tracker exists (never-kill-active).
+	var llamaPortPool *instances.PortPool
 	if cfg.Engines.LlamaCPP.Enabled {
 		pr := cfg.Engines.LlamaCPP.PortRange
 		portPool := instances.NewPortPool(database.DB, pr[0], pr[1])
+		llamaPortPool = portPool
 		vramProbe := llamacpp.FreeVRAMFromProbe{Probe: hwProbe}
 		llamaRunner = llamacpp.NewRunner(instStore, portPool, vramProbe, llamacpp.RunnerConfig{
 			HealthTimeout: time.Duration(healthTimeoutSeconds(cfg)) * time.Second,
@@ -208,6 +231,23 @@ func run() error {
 		}
 	}
 
+	// POST-HEALTHY monitor (M5). Built HERE, after the in-flight tracker exists, because the
+	// never-kill-active guard depends on it: an instance that is slow to answer /health BECAUSE it is
+	// mid-generation must never be reaped (CLAUDE.md). When residency is disabled there is no
+	// tracker, so activeCount stays nil and the monitor treats every instance as idle — safe only
+	// because pinned instances are still protected and the reap threshold requires several
+	// consecutive failures.
+	var instMonitor *instances.Monitor
+	if llamaPortPool != nil {
+		var activeCount func(string) int
+		if inflight != nil {
+			activeCount = inflight.ActiveCount
+		}
+		instMonitor = instances.NewMonitor(instStore, llamaPortPool,
+			llamacpp.NewReconcileHealthChecker(), activeCount,
+			instances.MonitorConfig{ReapAfterFailures: instances.DefaultReapAfterFailures})
+	}
+
 	svc := core.New(core.Deps{
 		Cfg:       cfg,
 		DB:        database,
@@ -233,6 +273,7 @@ func run() error {
 		InstanceStore: instStore,
 		LlamaRunner:   llamaRunnerOrNil(llamaRunner),
 		Reconciler:    reconciler,
+		Monitor:       instMonitor,
 		// P4.3 Ollama warm/unload + /api/ps mirror (nil when Ollama is disabled).
 		OllamaRunner: ollamaRunnerOrNil(ollamaRunner),
 		OllamaMirror: ollamaMirrorOrNil(ollamaMirror),
@@ -291,6 +332,11 @@ func run() error {
 				"heartbeat_interval", hbInterval.String())
 		}
 	}
+	startupRoot, err := startupRepoRoot(configPath)
+	if err != nil {
+		return fmt.Errorf("resolve startup configuration root: %w", err)
+	}
+	clusterOpts = append(clusterOpts, api.WithStartupConfig(startupRoot))
 
 	srv, err := api.New(svc, logger, cfg.Server.Bind, cfg.Server.Port, adminToken, clusterOpts...)
 	if err != nil {
@@ -371,12 +417,48 @@ func run() error {
 		)
 	}
 
+	// POST-HEALTHY health/process monitor (M5.1/M5.2). Runs until shutdown. This is what makes a
+	// llama-server that dies while LocalHub keeps running show up as FAILED — with a reason — instead
+	// of sitting at HEALTHY until the next daemon restart. The interval is the DOCUMENTED detection
+	// latency for the M5 gate.
+	if instMonitor != nil {
+		go svc.StartPeriodicMonitor(ctx, core.DefaultMonitorInterval,
+			func(res instances.MonitorResult) {
+				logger.Warn("instance monitor state change",
+					"died", res.Died, "reaped", res.Reaped, "degraded", res.Degraded, "skipped", res.Skipped)
+			},
+			func(err error) { logger.Debug("instance monitor error", "err", err) },
+		)
+	}
+
 	// P6.2 async-job worker (gated on cfg.Jobs.Enabled, default true; mirrors residency.enabled):
 	// drains queued jobs oldest/highest-priority-first, admits each through the SAME residency path
 	// as the proxy, relays non-streaming, and records the result. Returns when ctx is cancelled.
 	if cfg.Jobs.Enabled {
 		go svc.RunJobWorker(ctx)
 	}
+
+	// GPU telemetry sampler (PLAN-ui-gpu-rework.md §2.4): feeds the dashboard sparklines.
+	//
+	// It runs its own ticker rather than piggy-backing on the SSE stream so history accrues
+	// whether or not a browser is attached — otherwise the graph would only ever show the
+	// window in which someone happened to be watching, which is precisely the wrong property
+	// for "what did the GPU do while I was away". Probe failures are skipped silently: a gap in
+	// a sparkline is self-explanatory and does not warrant log spam every tick.
+	go func() {
+		t := time.NewTicker(svc.HardwarePollInterval())
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if snap, err := svc.Hardware(ctx); err == nil {
+					svc.RecordGPUSample(snap)
+				}
+			}
+		}
+	}()
 
 	// Initial inventory scan in the background (non-blocking, logged). GET /api/models is
 	// usable immediately (empty until the scan lands); the scan is header-sniff only, no
@@ -401,6 +483,24 @@ func run() error {
 	}
 	logger.Info("localhub stopped")
 	return nil
+}
+
+// startupRepoRoot resolves the directory shared by the daemon and native tray. The normal
+// configs/config.yaml layout stores startup policy at configs/startup.json; a custom config file
+// outside a configs directory keeps the policy in a configs child beside that deployment.
+func startupRepoRoot(configPath string) (string, error) {
+	if strings.TrimSpace(configPath) == "" {
+		return os.Getwd()
+	}
+	absolute, err := filepath.Abs(configPath)
+	if err != nil {
+		return "", err
+	}
+	directory := filepath.Dir(absolute)
+	if strings.EqualFold(filepath.Base(directory), "configs") {
+		return filepath.Dir(directory), nil
+	}
+	return directory, nil
 }
 
 // defaultConfigPath returns the config path used when --config is not passed. It prefers

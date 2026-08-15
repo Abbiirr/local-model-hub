@@ -9,6 +9,10 @@ import type {
   Verdict,
 } from '../api/types';
 
+// Extended telemetry values are the REAL readings from the reference box (RTX 4060 Ti, driver
+// 576.40): PCIe downtrained to gen 1 of a max 3, fan genuinely at 0 %, throttle "idle". Keeping
+// them real is the point — a fixture with tidy numbers would not exercise the two cases that
+// actually bite (a legitimate 0 vs the -1 "not reported" sentinel).
 export const hardwareFixture: HardwareSnapshot = {
   gpus: [
     {
@@ -22,6 +26,18 @@ export const hardwareFixture: HardwareSnapshot = {
       util: 0,
       temp: 55,
       power: 14.76,
+      clock_sm_mhz: 210,
+      clock_mem_mhz: 405,
+      clock_sm_max_mhz: 3105,
+      fan_pct: 0,
+      pcie_gen: 1,
+      pcie_gen_max: 3,
+      pcie_width: 8,
+      pcie_width_max: 8,
+      power_limit_w: 165,
+      power_max_limit_w: 165,
+      throttle: 'idle',
+      usable_vram_mib: 12224,
     },
   ],
   cpu: {
@@ -30,8 +46,14 @@ export const hardwareFixture: HardwareSnapshot = {
     threads: 12,
     util: -1,
   },
-  ram: { total: 16331, free: 4145, used: 12186 },
+  ram: { total: 16331, free: 4145, used: 12186, floor_mib: 2048 },
   disk: [{ path: 'K:\\', total_gib: 1863.01, free_gib: 24.93, used_gib: 1838.08 }],
+  // used_mib is -1 on EVERY row on Windows (WDDM does not attribute VRAM per process), and an
+  // empty name is what nvidia-smi returns when Windows denies access to the image path.
+  gpu_processes: [
+    { pid: 18908, name: 'K:\\WindowsApps\\Claude\\app\\claude.exe', used_mib: -1 },
+    { pid: 1836, name: '', used_mib: -1 },
+  ],
   captured_at: '2026-07-06T07:05:33Z',
 };
 

@@ -51,6 +51,11 @@ type DrainRequest struct {
 	Pin      bool
 	Priority int
 	Class    PriorityClass
+	// Profile is the persisted launch profile (migration 0009) the queued request was admitted
+	// with. The starter seam MUST forward it verbatim: replaying a queued start without it is the
+	// 2026-07-25 defect where a q4_0 request came back as f16 and never fit
+	// (KNOWN-LIMITATIONS #21).
+	Profile ProfileSpec
 }
 
 // DrainResult summarizes one DrainQueue pass (for logging + tests).
@@ -59,7 +64,36 @@ type DrainResult struct {
 	Requeued []string // queue IDs still queued (no room)
 	Failed   []string // queue IDs whose start errored this pass
 	Skipped  int      // candidates skipped by the in-flight start guard
+	// Dropped lists queue IDs removed from the queue WITHOUT ever attempting a start, because
+	// AutoLoadGate refused their model (a DECOMMISSIONED model, migration 0014) — see
+	// AutoLoadGate's doc comment. Distinct from Failed (a start was attempted and errored) and from
+	// Requeued (still waiting for room): a dropped entry's durable row is marked DONE and it never
+	// comes back on its own.
+	Dropped []string
 }
+
+// AutoLoadGate is the seam a caller (core) wires so the drain loop can refuse to PROMOTE a
+// decommissioned model out of the queue at all, rather than popping it, handing it to the
+// QueueStarter, and having the start fail every tick (which would requeue-and-hard-stop the pass
+// per DrainQueue's err!=nil branch — a busy-loop of REFUSED attempts on a model that will never
+// become startable this way). AutoLoadRefusalReason returns "" when the model may be promoted, or a
+// human-readable reason (naming the model + how to load it manually) when it must not be. nil
+// disables the check (no gate — every model may be promoted, prior behavior).
+//
+// This does not distinguish an entry that was originally enqueued by an EXPLICIT operator start
+// (POST /api/instances that had to queue for VRAM) from one enqueued by an implicit/auto path: by
+// the time the drain loop is the one attempting to promote it, unattended, that promotion attempt
+// is itself an AUTOMATIC action regardless of how the entry originally got there. An operator who
+// wants a decommissioned model loaded RIGHT NOW gets it synchronously via POST /api/instances
+// (Manual=true bypasses this gate entirely, per instances.go); a decommissioned model that had to
+// wait in queue is intentionally not auto-promoted later.
+type AutoLoadGate interface {
+	AutoLoadRefusalReason(ctx context.Context, modelID string) string
+}
+
+// SetAutoLoadGate injects the AutoLoadGate (wired at core.New time, like SetStarter). Not safe to
+// call concurrently with DrainQueue.
+func (m *Manager) SetAutoLoadGate(gate AutoLoadGate) { m.drain.autoLoadGate = gate }
 
 // starterSeam / drain bookkeeping live on the Manager (added here to keep admission.go focused).
 // The Manager gained a `starter`, a `draining` single-flight flag, and a `startingIDs` set for the
@@ -69,6 +103,7 @@ type DrainResult struct {
 // drainState is the drain-loop bookkeeping embedded in the Manager.
 type drainState struct {
 	starter       QueueStarter
+	autoLoadGate  AutoLoadGate
 	drainInterval time.Duration
 
 	dmu         sync.Mutex
@@ -133,6 +168,20 @@ func (m *Manager) DrainQueue(ctx context.Context) (DrainResult, error) {
 		req, ok := m.popNextForDrain(ctx)
 		if !ok {
 			break // queue empty
+		}
+
+		// AutoLoadGate (migration 0014): a DECOMMISSIONED model is never PROMOTED out of the queue by
+		// this loop — drop the entry (mark its durable row DONE with the refusal reason) instead of
+		// handing it to the QueueStarter, which would just fail every tick. See AutoLoadGate's doc
+		// comment for why this does not distinguish how the entry originally got enqueued.
+		if m.drain.autoLoadGate != nil {
+			if reason := m.drain.autoLoadGate.AutoLoadRefusalReason(ctx, req.ModelID); reason != "" {
+				if err := m.markQueueDone(ctx, req.QueueID, reason); err != nil {
+					return res, fmt.Errorf("drain: drop decommissioned queued %s (%s): %w", req.QueueID, req.ModelID, err)
+				}
+				res.Dropped = append(res.Dropped, req.QueueID)
+				continue
+			}
 		}
 
 		// Idempotency guard: skip if this queue ID is already being started by another pass. We
@@ -205,10 +254,11 @@ func (m *Manager) popNextForDrain(ctx context.Context) (DrainRequest, bool) {
 		Pin:      r.Pin,
 		Priority: r.Priority,
 		Class:    r.Class,
+		Profile:  r.Profile,
 	}
 	// If the in-memory request lost its context (e.g. re-seeded from the store on restart without
 	// the fields), fall back to the durable row.
-	if dr.Ctx == 0 || dr.Engine == "" {
+	if dr.Ctx == 0 || dr.Engine == "" || dr.Profile.IsZero() {
 		if row, err := m.qstore.get(ctx, r.ID); err == nil {
 			if dr.Ctx == 0 {
 				dr.Ctx = row.ReqCtx
@@ -224,6 +274,12 @@ func (m *Manager) popNextForDrain(ctx context.Context) (DrainRequest, bool) {
 			}
 			if dr.Priority == 0 {
 				dr.Priority = row.Priority
+			}
+			// The launch profile is restored as a WHOLE, never field-by-field: a partially-merged
+			// profile could pair one request's KV types with another's spec mode. An in-memory
+			// profile that is present wins; only a fully-empty one falls back to the durable row.
+			if dr.Profile.IsZero() {
+				dr.Profile = row.Profile
 			}
 		}
 	}
@@ -268,6 +324,7 @@ func (m *Manager) requeueForDrain(req DrainRequest) {
 		Batch:    req.Batch,
 		Pin:      req.Pin,
 		Priority: req.Priority,
+		Profile:  req.Profile, // a retried start must keep the profile it was admitted with
 	})
 }
 

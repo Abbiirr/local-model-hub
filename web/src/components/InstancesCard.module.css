@@ -176,6 +176,53 @@
   white-space: nowrap;
 }
 
+/* Verdict cluster: badge + estimate, kept together so the estimate always reads as
+   belonging to the badge beside it. */
+.startVerdict {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s1);
+  flex-shrink: 0;
+}
+.startEstimate {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Launch options — one disclosure holding the CPU-offload toggle, the advanced launch
+   profile and the attach form. Collapsed by default (§3.4): the model list above is the
+   primary action, these are occasional settings. */
+.options {
+  margin-top: var(--s3);
+  padding-top: var(--s3);
+  border-top: 1px solid var(--border);
+}
+.optionsToggle {
+  background: transparent;
+  border: none;
+  padding: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-faint);
+  cursor: pointer;
+  text-align: left;
+  transition: color 0.15s;
+}
+.optionsToggle:hover {
+  color: var(--text-dim);
+}
+/* An armed non-default setting is called out in the accent colour even when collapsed. */
+.optionsSummary {
+  color: var(--accent);
+  font-weight: 600;
+}
+.optionsBody {
+  margin-top: var(--s3);
+}
+
 .startBtn {
   background: var(--accent-bg);
   border: 1px solid var(--accent-dim);
@@ -194,4 +241,57 @@
 .startBtn:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+/* Attach-a-running-server row (migration 0012). Same quiet register as the offload toggle: this is
+   an occasional operator action, not a primary control. Wraps on narrow screens (390px target). */
+.attachRow {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--s1) var(--s2);
+  margin: 0 0 var(--s3);
+  min-width: 0;
+}
+.attachLabel {
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.attachInput {
+  font: inherit;
+  font-size: 12px;
+  padding: 2px 5px;
+  width: 8.5em;
+  min-width: 0;
+  background: var(--bg-raised, var(--bg));
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  box-sizing: border-box;
+}
+.attachInput:focus {
+  outline: 1px solid var(--accent);
+}
+.attachBtn {
+  font: inherit;
+  font-size: 11.5px;
+  padding: 3px 8px;
+  background: none;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.attachBtn:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--text-faint);
+}
+.attachBtn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.attachHint {
+  font-size: 11px;
+  color: var(--text-faint);
+  min-width: 0;
 }

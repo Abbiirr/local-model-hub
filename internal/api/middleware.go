@@ -11,6 +11,8 @@ import (
 	"runtime/debug"
 	"strings"
 	"time"
+
+	"github.com/localhub/localhub/internal/proxy"
 )
 
 // dashboardLiveCookie is accepted only on read-only live endpoints. Browser
@@ -119,12 +121,33 @@ func authMiddleware(adminToken string, next http.Handler, extraTokens ...string)
 					break
 				}
 			}
+			// Anthropic SDKs normally use x-api-key while Claude Code can use
+			// Authorization: Bearer. Both authenticate to the same single
+			// LocalHub admin token; neither credential is forwarded upstream.
+			anthropicPath := path == "/v1/messages" || path == "/v1/messages/count_tokens"
+			bothCredentialsMismatch := false
+			if anthropicPath && r.Header.Get("Authorization") != "" && r.Header.Get("x-api-key") != "" {
+				wantBearer := []byte("Bearer " + adminToken)
+				if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), wantBearer) != 1 ||
+					subtle.ConstantTimeCompare([]byte(r.Header.Get("x-api-key")), []byte(adminToken)) != 1 {
+					ok = false
+					bothCredentialsMismatch = true
+				}
+			}
+			if !ok && anthropicPath && !bothCredentialsMismatch {
+				ok = subtle.ConstantTimeCompare([]byte(r.Header.Get("x-api-key")), []byte(adminToken)) == 1
+			}
 			if !ok && r.Method == http.MethodGet && (path == "/api/hardware/live" || path == "/api/ws") {
 				if c, err := r.Cookie(dashboardLiveCookie); err == nil && subtle.ConstantTimeCompare([]byte(c.Value), []byte(dashboardLiveCookieValue(adminToken))) == 1 {
 					ok = true
 				}
 			}
 			if !ok {
+				if anthropicPath {
+					proxy.WriteAnthropicError(w, http.StatusUnauthorized, "authentication_error",
+						"missing or invalid LocalHub credential; send Authorization: Bearer <admin_token> or x-api-key: <admin_token>")
+					return
+				}
 				writeError(w, http.StatusUnauthorized, "unauthorized",
 					"missing or invalid bearer token",
 					"this daemon requires Authorization: Bearer <admin_token> (server.admin_token is set)")

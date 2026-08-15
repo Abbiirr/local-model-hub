@@ -38,6 +38,12 @@ export default defineConfig({
       '/api': {
         target: 'http://127.0.0.1:39876',
         changeOrigin: true,
+        // The live channel's default transport is a WebSocket at /api/ws (live/connection.ts
+        // defaultWsUrl), which matches THIS rule, not the '/ws' rule below. Without ws:true the
+        // upgrade is proxied as plain HTTP, the socket never opens, and `npm run dev` sits in a
+        // reconnect loop with the GPU panel stuck on "Waiting for first hardware frame…".
+        // Production is unaffected (the Go daemon serves API + assets from one origin).
+        ws: true,
       },
       '/ws': {
         target: 'ws://127.0.0.1:39876',

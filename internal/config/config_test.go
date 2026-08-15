@@ -202,6 +202,62 @@ engines:
 	}
 }
 
+func TestRemoteLlamaCPPModelConfigLoadsNormalizesAndValidates(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "remote.yaml")
+	yaml := `
+engines:
+  llamacpp:
+    enabled: true
+    remote_models:
+      - id: " kat "
+        base_url: "http://192.168.0.157:8080/"
+        upstream_model: " /models/kat.gguf "
+`
+	if err := os.WriteFile(p, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load remote config: %v", err)
+	}
+	got := cfg.Engines.LlamaCPP.RemoteModels
+	if len(got) != 1 {
+		t.Fatalf("RemoteModels = %+v", got)
+	}
+	if got[0].ID != "kat" || got[0].BaseURL != "http://192.168.0.157:8080" ||
+		got[0].UpstreamModel != "/models/kat.gguf" {
+		t.Errorf("remote normalization failed: %+v", got[0])
+	}
+}
+
+func TestRemoteLlamaCPPModelConfigRefusesUnsafeOrAmbiguousEntries(t *testing.T) {
+	tests := []struct {
+		name   string
+		models []RemoteLlamaCPPModelConfig
+	}{
+		{"missing id", []RemoteLlamaCPPModelConfig{{BaseURL: "http://127.0.0.1:8080", UpstreamModel: "m"}}},
+		{"missing upstream", []RemoteLlamaCPPModelConfig{{ID: "m", BaseURL: "http://127.0.0.1:8080"}}},
+		{"bad scheme", []RemoteLlamaCPPModelConfig{{ID: "m", BaseURL: "file:///tmp/server", UpstreamModel: "m"}}},
+		{"credentials", []RemoteLlamaCPPModelConfig{{ID: "m", BaseURL: "http://user:pass@127.0.0.1:8080", UpstreamModel: "m"}}},
+		{"path", []RemoteLlamaCPPModelConfig{{ID: "m", BaseURL: "http://127.0.0.1:8080/admin", UpstreamModel: "m"}}},
+		{"duplicate id", []RemoteLlamaCPPModelConfig{
+			{ID: "m", BaseURL: "http://127.0.0.1:8080", UpstreamModel: "m1"},
+			{ID: "m", BaseURL: "http://127.0.0.1:8081", UpstreamModel: "m2"},
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Default()
+			cfg.Engines.LlamaCPP.RemoteModels = tc.models
+			cfg.normalize()
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
 func TestExpandHome(t *testing.T) {
 	home, err := os.UserHomeDir()
 	if err != nil {

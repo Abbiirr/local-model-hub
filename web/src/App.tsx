@@ -10,6 +10,7 @@ import { CompatCard } from './components/CompatCard';
 import { DownloadsCard } from './components/DownloadsCard';
 import { InstancesCard } from './components/InstancesCard';
 import { QueueCard } from './components/QueueCard';
+import { StartupPanel } from './components/StartupPanel';
 import styles from './App.module.css';
 
 export default function App() {
@@ -77,6 +78,11 @@ function Dashboard() {
   // sibling panels share one source of truth. Default OFF = full GPU, never offload to CPU.
   const [allowCpuOffload, setAllowCpuOffload] = useState(false);
 
+  // Cached fit verdicts are only true for the free VRAM they were computed against. A Free-GPU
+  // sweep changes that materially, so bumping this epoch is what invalidates them — and it is the
+  // ONLY invalidation lever, so an ordinary re-render can never turn into a refetch storm.
+  const [compatEpoch, setCompatEpoch] = useState(0);
+
   // A one-shot poll fallback for engines so a card appears even if the live
   // channel never signals (Phase 1: it won't). Cheap, 15s cadence.
   useEffect(() => {
@@ -111,7 +117,14 @@ function Dashboard() {
             (GPU → instances → queue → the rest). */}
         <div className={styles.left}>
           <div className={styles.pGpu}>
-            <GpuPanel hardware={hardware} live={status.state === 'connected'} />
+            <GpuPanel
+              hardware={hardware}
+              live={status.state === 'connected'}
+              onGpuFreed={() => {
+                setCompatEpoch((e) => e + 1);
+                models.refresh();
+              }}
+            />
           </div>
           <div className={styles.pInstances}>
             <InstancesCard
@@ -119,6 +132,7 @@ function Dashboard() {
               instancesInvalidation={invalidations.instances}
               allowCpuOffload={allowCpuOffload}
               onAllowCpuOffloadChange={setAllowCpuOffload}
+              compatEpoch={compatEpoch}
             />
           </div>
         </div>
@@ -143,6 +157,10 @@ function Dashboard() {
         </div>
 
         <div className={styles.wide}>
+          <StartupPanel models={models.data} />
+        </div>
+
+        <div className={styles.wide}>
           <InventoryPanel
             models={models.data}
             loading={models.loading}
@@ -150,6 +168,8 @@ function Dashboard() {
             onRescanned={() => models.refresh()}
             allowCpuOffload={allowCpuOffload}
             onAllowCpuOffloadChange={setAllowCpuOffload}
+            onLaunchStateChanged={() => models.refresh()}
+            compatEpoch={compatEpoch}
           />
         </div>
       </main>

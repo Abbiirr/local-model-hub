@@ -86,6 +86,44 @@ func enqueueWaiting(t *testing.T, m *Manager, store *QueueStore, req Request, bl
 	}
 }
 
+// fakeAutoLoadGate implements AutoLoadGate over a static map (migration 0014 test double).
+type fakeAutoLoadGate struct{ blocked map[string]string }
+
+func (g fakeAutoLoadGate) AutoLoadRefusalReason(_ context.Context, modelID string) string {
+	return g.blocked[modelID]
+}
+
+// TestDrainQueue_DropsDecommissionedModel: a WAITING entry for a model the AutoLoadGate refuses is
+// DROPPED (durable row marked DONE with the reason) rather than handed to the QueueStarter — the
+// drain loop must never attempt to PROMOTE (auto-start) a decommissioned model.
+func TestDrainQueue_DropsDecommissionedModel(t *testing.T) {
+	store, _ := drainTestStore(t)
+	starter := &recordingStarter{outcomes: []starterOutcome{{started: true}}}
+	m := mgrForDrain(t, store, 8000, nil, starter)
+	reason := `model "m1" (M1) is decommissioned from automatic loading`
+	m.SetAutoLoadGate(fakeAutoLoadGate{blocked: map[string]string{"m1": reason}})
+
+	enqueueWaiting(t, m, store, Request{ID: "q1", ModelID: "m1", Class: ClassNormal}, "waiting for VRAM")
+
+	res, err := m.DrainQueue(context.Background())
+	if err != nil {
+		t.Fatalf("DrainQueue: %v", err)
+	}
+	if len(res.Dropped) != 1 || res.Dropped[0] != "q1" {
+		t.Fatalf("expected q1 in Dropped, got %+v", res)
+	}
+	if len(starter.seen) != 0 {
+		t.Errorf("the QueueStarter must never be called for a decommissioned model, got %d call(s)", len(starter.seen))
+	}
+	rows, err := store.List(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Status != QueueDone || rows[0].BlockedReason != reason {
+		t.Fatalf("expected the durable row DONE with the decommission reason, got %+v", rows)
+	}
+}
+
 // TestDrainQueue_AutoStartsWhenRoom is THE fix-1 gate: a queued request auto-starts when the drain
 // loop runs and the starter reports it fit — WITHOUT any manual per-request API call. The queue row
 // becomes ADMITTED and the request is removed from the in-memory queue.

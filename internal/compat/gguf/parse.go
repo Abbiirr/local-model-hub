@@ -42,10 +42,14 @@ func parseAndEstimate(ctx context.Context, source Source, opts Options) (Result,
 	}
 	ramBytes := uint64(item.RAM.NonUMA)
 
+	// Report the EFFECTIVE (K,V) pair, resolved by the same helper that builds the estimator
+	// options, so the human-readable note can never disagree with the dtypes actually handed
+	// to gguf-parser.
+	noteKType, noteVType := resolveKVPair(opts)
 	notes := []string{
 		fmt.Sprintf("estimated by %s (arch=%s) at ctx=%d, flash_attn=%v, kv=%s, ngl=%s, parallel=%d",
 			ParserVersion, sum.Architecture, sum.ContextSize, opts.FlashAttention,
-			kvLabel(opts.KVCacheType), nglLabel(opts.NGL), parallel(opts.ParallelSeq)),
+			kvLabelPair(noteKType, noteVType), nglLabel(opts.NGL), parallel(opts.ParallelSeq)),
 	}
 
 	// iSWA KV correction (ADR-002: wrap, don't fork). gguf-parser-go v0.24.1 does
@@ -58,6 +62,31 @@ func parseAndEstimate(ctx context.Context, source Source, opts Options) (Result,
 		vramBytes += add
 		ctxVRAM = kvFloorMiB
 		notes = append(notes, note)
+	}
+
+	// HYBRID SSM correction (ADR-002: wrap, don't fork) — the MIRROR IMAGE of the iSWA case above.
+	// gguf-parser-go prices a KV cache for EVERY block, but a hybrid SSM/attention model (Qwen3.5/3.6
+	// "qwen35") holds one on only a fraction of them; the rest carry a CONSTANT recurrent state. On
+	// Qwen3.6-27B-MTP-mini that is 17 attention blocks of 65, so the context term is inflated ~3.8× —
+	// enough to make LocalHub refuse `wont_run` at 64K for a profile that demonstrably RUNS on this
+	// card. A false refusal is a real defect, so the KV term is replaced with one derived from the
+	// model's own metadata. It only ever REDUCES an over-count and never touches weights; see
+	// hybrid.go for the derivation and the safety argument.
+	//
+	// Ordered AFTER the iSWA branch and guarded on `ctxVRAM == 0` so the two corrections can never
+	// both claim the context term for one model. They target disjoint architectures (a model here is
+	// either sliding-window or hybrid-SSM), but the guard makes double-correction impossible rather
+	// than merely unlikely.
+	if ctxVRAM == 0 {
+		if delta, ctxMiB, note, ok := hybridSSMCorrection(f, libraryKVBytes(run), opts); ok {
+			// delta is negative (the phantom KV handed back). Clamp defensively so a pathological
+			// metadata combination can never drive the total below the weights term.
+			if reduce := uint64(-delta); reduce < vramBytes {
+				vramBytes -= reduce
+				ctxVRAM = ctxMiB
+				notes = append(notes, note)
+			}
+		}
 	}
 	if run.Projector != nil {
 		notes = append(notes, "note: multimodal projector (mmproj) present; its VRAM is included by the estimator only if you passed it explicitly — a sibling mmproj file loaded at runtime adds VRAM not counted here")
@@ -120,6 +149,23 @@ func parseSource(ctx context.Context, source Source) (*ggufparser.GGUFFile, erro
 	}
 }
 
+// resolveKVPair returns the EFFECTIVE (K,V) cache dtypes for a request. Each side prefers its
+// own explicit type (llama.cpp -ctk/-ctv), then falls back to the shared KVCacheType, then to
+// "" which means the llama.cpp default (f16). ONE resolution feeds both the estimator options
+// and the human-readable note, so the reported pair can never drift from the estimated pair.
+// The Qwen3.6-27B MTP profile uses -ctk q8_0 -ctv q4_0 (verified against b10106 --help).
+func resolveKVPair(opts Options) (KVCacheType, KVCacheType) {
+	kType := opts.KVCacheTypeK
+	if kType == "" {
+		kType = opts.KVCacheType
+	}
+	vType := opts.KVCacheTypeV
+	if vType == "" {
+		vType = opts.KVCacheType
+	}
+	return kType, vType
+}
+
 // runOptions translates Options into gguf-parser-go run-estimate options.
 func runOptions(opts Options) ([]ggufparser.GGUFRunEstimateOption, error) {
 	var out []ggufparser.GGUFRunEstimateOption
@@ -135,17 +181,21 @@ func runOptions(opts Options) ([]ggufparser.GGUFRunEstimateOption, error) {
 		out = append(out, ggufparser.WithFlashAttention())
 	}
 
-	// KV cache dtype (both key and value set to the same type, matching how
-	// llama.cpp's -ctk/-ctv are usually paired for the standard quants).
-	if opts.KVCacheType != "" {
-		t, err := kvGGMLType(opts.KVCacheType)
+	// INDEPENDENT K/V cache dtypes (llama.cpp -ctk/-ctv), resolved once by resolveKVPair.
+	kType, vType := resolveKVPair(opts)
+	if kType != "" {
+		t, err := kvGGMLType(kType)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out,
-			ggufparser.WithLLaMACppCacheKeyType(t),
-			ggufparser.WithLLaMACppCacheValueType(t),
-		)
+		out = append(out, ggufparser.WithLLaMACppCacheKeyType(t))
+	}
+	if vType != "" {
+		t, err := kvGGMLType(vType)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ggufparser.WithLLaMACppCacheValueType(t))
 	}
 
 	// NGL: -1 or 0 => offload all layers (a large sentinel offloads every layer;
@@ -184,6 +234,15 @@ func kvLabel(t KVCacheType) string {
 		return "f16(default)"
 	}
 	return string(t)
+}
+
+// kvLabelPair renders the effective independent K/V pair for an estimate note, e.g.
+// "q8_0/q4_0" or "f16(default)" when both are unset.
+func kvLabelPair(k, v KVCacheType) string {
+	if k == "" && v == "" {
+		return "f16(default)"
+	}
+	return kvLabel(k) + "/" + kvLabel(v)
 }
 
 func nglLabel(ngl int) string {

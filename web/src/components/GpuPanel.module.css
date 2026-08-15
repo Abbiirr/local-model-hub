@@ -45,6 +45,41 @@
   letter-spacing: -0.01em;
 }
 
+/* Admission budget — the number a start is ACTUALLY checked against. It sits directly
+   under the VRAM bar because that bar shows free VRAM, which is always the larger and
+   more optimistic figure. */
+.budget {
+  margin-top: var(--s3);
+  padding: var(--s2) var(--s3);
+  background: var(--bg-raised);
+  border-radius: var(--radius-sm);
+}
+.budgetMain {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s2);
+}
+.budgetLabel {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-faint);
+}
+.budgetValue {
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+.budgetNote {
+  margin-top: 2px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-faint);
+}
+
 /* util / temp / power — three quiet readouts split by hairlines, not boxes. */
 .stats {
   display: grid;
@@ -77,6 +112,113 @@
   margin-top: var(--s1);
 }
 
+/* ── Extended telemetry (clocks / fan / PCIe / power / throttle) ───────────
+   Two columns of label→value pairs on anything but a phone: these are reference
+   readings, not headline metrics, so they get small type and no chrome. */
+.details {
+  margin-top: var(--s3);
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 2px var(--s4);
+}
+@media (min-width: 420px) {
+  .details {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+.detailRow {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s2);
+  padding: 3px 0;
+  min-width: 0;
+  border-bottom: 1px solid var(--border);
+}
+.detailLabel {
+  font-size: 11px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+.detailValue {
+  font-size: 11.5px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+/* "n/a" is an absence, not a reading — it must not compete visually with real numbers. */
+.detailMuted {
+  color: var(--text-faint);
+}
+
+/* ── GPU holders — collapsed by default; the list is long on a desktop box. ─ */
+.procs {
+  margin-top: var(--s3);
+  padding-top: var(--s3);
+  border-top: 1px solid var(--border);
+}
+.procToggle {
+  background: transparent;
+  border: none;
+  padding: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-faint);
+  cursor: pointer;
+  transition: color 0.15s;
+}
+.procToggle:hover {
+  color: var(--text-dim);
+}
+.procNote {
+  margin-top: var(--s2);
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-faint);
+}
+.procList {
+  list-style: none;
+  margin: var(--s2) 0 0;
+  padding: 0;
+  display: grid;
+  gap: 1px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.procItem {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s2);
+  font-size: 11.5px;
+  min-width: 0;
+}
+.procPid {
+  font-family: var(--mono);
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+  min-width: 4.5em;
+}
+.procName {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.procUnknown {
+  color: var(--text-faint);
+  font-style: italic;
+}
+.procUsed {
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+}
+
 /* system summary — CPU / RAM / disk as a clean definition-style block. */
 .sysRow {
   display: grid;
@@ -96,6 +238,25 @@
   font-weight: 650;
   font-variant-numeric: tabular-nums;
 }
+.sysFaint {
+  color: var(--text-faint);
+}
+/* Free RAM under the residency floor is a REFUSAL condition on this box, not a soft warning —
+   it reads in the critical colour so it is not mistaken for ordinary secondary text. */
+.sysCrit {
+  color: var(--crit);
+  font-weight: 600;
+}
+.ramWarn {
+  margin-top: var(--s2);
+  padding: var(--s2) var(--s3);
+  border-radius: var(--radius-sm);
+  background: var(--crit-bg);
+  color: var(--crit);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
 .diskList {
   margin-top: var(--s2);
   display: grid;

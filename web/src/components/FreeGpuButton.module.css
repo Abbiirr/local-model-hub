@@ -1,0 +1,202 @@
+/* Free-GPU control — a destructive action, so it reads as one: quiet until armed,
+   then explicit. Same hairline register as the rest of the GPU panel (no boxed card). */
+
+.wrap {
+  margin-top: var(--s4);
+  padding-top: var(--s4);
+  border-top: 1px solid var(--border);
+  display: grid;
+  gap: var(--s2);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s2);
+  flex-wrap: wrap;
+}
+
+.copy {
+  min-width: 0;
+}
+
+.title {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text);
+}
+
+.hint {
+  font-size: 11px;
+  color: var(--text-faint);
+  line-height: 1.4;
+}
+
+.freeBtn {
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 5px 14px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.freeBtn:hover:not(:disabled) {
+  color: var(--crit);
+  border-color: var(--crit);
+  background: var(--crit-bg);
+}
+.freeBtn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.confirmRow {
+  display: flex;
+  gap: var(--s2);
+  flex-shrink: 0;
+}
+
+.dangerBtn {
+  background: var(--crit-bg);
+  border: 1px solid var(--crit);
+  border-radius: var(--radius-sm);
+  padding: 5px 14px;
+  color: var(--crit);
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+.dangerBtn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.quietBtn {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 5px 12px;
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.error {
+  color: var(--crit);
+  background: var(--crit-bg);
+  border-radius: var(--radius-sm);
+  padding: var(--s2) var(--s3);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+/* ── Outcome — measured numbers first, then the per-instance detail ──────── */
+.outcome {
+  display: grid;
+  gap: var(--s2);
+  padding: var(--s3);
+  background: var(--bg-raised);
+  border-radius: var(--radius-sm);
+}
+
+.outcomeHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s2);
+  flex-wrap: wrap;
+}
+
+.counts {
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.counts b {
+  color: var(--text);
+  font-weight: 650;
+}
+
+.reclaimed {
+  font-size: 15px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+.ok {
+  color: var(--ok);
+}
+.warnText {
+  color: var(--warn);
+}
+.neutralText {
+  color: var(--text-dim);
+}
+
+.deltaLine {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--s1);
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s2);
+  font-size: 11.5px;
+  min-width: 0;
+}
+
+.stopped {
+  color: var(--ok);
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.kept {
+  color: var(--warn);
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.model {
+  font-family: var(--mono);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex-shrink: 0;
+  max-width: 45%;
+}
+
+.itemReason {
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.pinnedRetry {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s2);
+  flex-wrap: wrap;
+  padding-top: var(--s2);
+  border-top: 1px solid var(--border);
+}

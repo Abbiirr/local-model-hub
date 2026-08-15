@@ -52,13 +52,51 @@ type StartInstanceRequest struct {
 	Batch    int    `json:"batch,omitempty"`
 	Priority int    `json:"priority,omitempty"`
 	Pin      bool   `json:"pin,omitempty"`
-	KVQuant  bool   `json:"kv_quant,omitempty"`
+	// KVQuant is the LEGACY single-bool KV description: true => q4_0 on BOTH cache sides. Kept
+	// for back-compat (existing callers and the UI's simple toggle use it). It is a SHORTHAND for
+	// KVTypeK/KVTypeV: when either of those is set explicitly they WIN and this bool is ignored
+	// (see startProfile).
+	KVQuant bool `json:"kv_quant,omitempty"`
+	// KVTypeK / KVTypeV request INDEPENDENT key/value cache dtypes (llama.cpp -ctk/-ctv).
+	// Valid: "" (unset), "f16", "q8_0", "q4_0" — validated by compat.ValidateKVCacheType, which
+	// refuses tq3_0 because the estimator cannot price it. The validated Qwen3.6-27B MTP profile
+	// is kv_type_k=q8_0, kv_type_v=q4_0 — previously inexpressible through this API at all
+	// (KNOWN-LIMITATIONS #21). Both the VRAM estimate and the emitted flags follow these.
+	KVTypeK string `json:"kv_type_k,omitempty"`
+	KVTypeV string `json:"kv_type_v,omitempty"`
+	// Slots is llama.cpp `-np` (parallel server slots). 0 => 1. Each slot multiplies the KV cache,
+	// so it is admission-relevant, not cosmetic. A draft-mtp start FORCES 1 (the pinned-build
+	// acceptance condition) regardless of what is requested here.
+	Slots int `json:"slots,omitempty"`
+	// SpecDraftMax is `--spec-draft-n-max` for a speculative mode. 0 => omit the flag (engine
+	// default). The validated Qwen3.6 MTP profile uses 2. Emitted only when the SELECTED binary
+	// advertises the flag (has_spec_draft_max).
+	SpecDraftMax int `json:"spec_draft_max,omitempty"`
 	// AllowCPUOffload opts into a GPU/CPU split for this start. Default false = FULL GPU, never
 	// offload to CPU (the hard default: llama.cpp -ngl all / Ollama num_gpu forced to all layers).
 	// When true, borderline models may split across GPU+CPU (llama.cpp -ngl auto / Ollama num_gpu:-1
 	// dynamic). It relaxes only the launch FLAGS, NOT admission: a model whose weights exceed VRAM is
 	// still refused by the compat verdict (docs/api-spec.md instances §allow_cpu_offload).
 	AllowCPUOffload bool `json:"allow_cpu_offload,omitempty"`
+	// Embedding starts this llama.cpp instance in embedding-ONLY mode (`--embedding`). It is NOT a
+	// superset of a normal start: llama.cpp restricts such a server to the embedding routes, so a
+	// generation request to it fails and vice versa. LocalHub therefore treats embedding and
+	// generation instances of the same model as DIFFERENT residents — the warm-route match below is
+	// mode-aware — and POST /v1/embeddings resolves only to instances started this way.
+	Embedding bool `json:"embedding,omitempty"`
+	// Pooling is llama.cpp `--pooling` (none|mean|cls|last|rank); "" omits the flag and uses the
+	// model default. Meaningful only with Embedding. Validated by compat.ValidatePooling.
+	Pooling string `json:"pooling,omitempty"`
+	// Reranking starts this llama.cpp instance with `--reranking`. llama.cpp REQUIRES that flag be
+	// combined with --embedding and --pooling rank (tools/server/README.md: "Requires a reranker
+	// model ... and the --embedding --pooling rank options"), so setting this IMPLIES embedding +
+	// pooling rank regardless of what those two fields were set to (compat.LaunchProfile.Normalize
+	// does the coupling). The resulting instance answers POST /v1/rerank — NOT
+	// /v1/chat/completions and NOT /v1/embeddings, even though it was also started with
+	// --embedding — because a reranker returns a relevance SCORE per (query, document) pair, not a
+	// reusable vector. That is why the warm-route match below is mode-aware across three states
+	// (generation / embedding-only / reranking), not just the two-way embedding check.
+	Reranking bool `json:"reranking,omitempty"`
 	// Speculative opts into draft-free self-speculative decoding for this start. "" (default) = off,
 	// today's flags. "ngram-cache" appends llama.cpp's `--spec-type ngram-cache` (draft-free n-gram
 	// self-speculation): no second model, ~zero extra VRAM (a hash pool), so it relaxes NOTHING in
@@ -66,6 +104,13 @@ type StartInstanceRequest struct {
 	// Any other value is rejected at StartInstance with a reason listing the valid values
 	// (compat.ValidateSpeculative; docs/api-spec.md instances §speculative). llama.cpp path only.
 	Speculative string `json:"speculative,omitempty"`
+	// Manual marks this start as an EXPLICIT operator action (set ONLY by the POST /api/instances
+	// handler). It is the sole switch the decommission gate (migration 0014, model_auto_load.go)
+	// reads: every implicit/auto path — the OpenAI proxy resolve, the residency queue drain loop, the
+	// async jobs worker — leaves this false (their zero value), so a DECOMMISSIONED model
+	// (auto_load_disabled=1) is refused there but an operator's direct POST /api/instances still
+	// succeeds. Never set this from anything other than a live, explicit admin HTTP call.
+	Manual bool `json:"-"`
 }
 
 // InstanceView is the API projection of an instances.Instance (GET /api/instances). It carries
@@ -91,6 +136,27 @@ type InstanceView struct {
 	CreatedAt    time.Time `json:"created_at,omitempty"`
 	StartedAt    time.Time `json:"started_at,omitempty"`
 	StoppedAt    time.Time `json:"stopped_at,omitempty"`
+
+	// --- Truthful monitoring (migration 0010, M5). ---
+
+	// LastHealthAt is the last SUCCESSFUL health probe by the periodic monitor. A state of HEALTHY
+	// with a stale LastHealthAt is meaningfully different from a freshly-confirmed one.
+	LastHealthAt time.Time `json:"last_health_at,omitempty"`
+	// HealthFailures is the count of CONSECUTIVE failed probes. Non-zero on a HEALTHY instance means
+	// DEGRADED — the monitor is seeing failures but has not reached the reap threshold.
+	HealthFailures int `json:"health_failures,omitempty"`
+	// Adopted marks an instance LocalHub ATTACHED to rather than spawned (migration 0012). The UI must
+	// show this: a Stop on an adopted row kills a process owned by whatever launched it, so it is
+	// refused without an explicit force, and residency never auto-evicts it.
+	Adopted bool `json:"adopted,omitempty"`
+	// AdoptedSource says HOW it was discovered (e.g. "attach: port 8080, PID 20352").
+	AdoptedSource string `json:"adopted_source,omitempty"`
+
+	// ReclaimVerified distinguishes a VERIFIED VRAM reclaim from a timed-out or inconclusive one on
+	// a terminal instance. null = no stop attempted; false = the process is gone but reclamation was
+	// never proven by an NVML delta. Consumers must not read state=STOPPED alone as "VRAM is back"
+	// (M5.5); the paired Reason always spells out which case it was.
+	ReclaimVerified *bool `json:"reclaim_verified,omitempty"`
 }
 
 func instanceToView(inst instances.Instance) InstanceView {
@@ -101,6 +167,9 @@ func instanceToView(inst instances.Instance) InstanceView {
 		VRAMEstMiB: inst.VRAMEstMiB, VRAMObsMiB: inst.VRAMObsMiB, VRAMFreedMiB: inst.VRAMFreedMiB,
 		Pinned: inst.Pinned, Priority: inst.Priority, LaunchFlags: inst.LaunchFlags,
 		Reason: inst.Reason, CreatedAt: inst.CreatedAt, StartedAt: inst.StartedAt, StoppedAt: inst.StoppedAt,
+		LastHealthAt: inst.LastHealthAt, HealthFailures: inst.HealthFailures,
+		ReclaimVerified: inst.ReclaimVerified,
+		Adopted:         inst.Adopted, AdoptedSource: inst.AdoptedSource,
 	}
 }
 
@@ -138,6 +207,97 @@ func (s *Service) Instance(ctx context.Context, id string) (InstanceView, error)
 	return instanceToView(inst), nil
 }
 
+// launchFlagsHaveEmbedding reports whether a spawned llama.cpp flag vector includes --embedding.
+// The llama.cpp runner persists the FULL spawned flag vector into Instance.LaunchFlags, so the
+// flags are the authoritative record of the mode the process is actually in — no schema migration
+// and no trust in a remembered request. Shared by launchModeOfFlags below.
+func launchFlagsHaveEmbedding(flags []string) bool {
+	for _, f := range flags {
+		if f == "--embedding" {
+			return true
+		}
+	}
+	return false
+}
+
+// launchFlagsHaveReranking reports whether a spawned llama.cpp flag vector includes --reranking.
+// Mirrors launchFlagsHaveEmbedding exactly (exact-element match), for the same reason: LaunchFlags
+// is the authoritative record of what the process was actually started with, not what any caller
+// later claims it asked for.
+func launchFlagsHaveReranking(flags []string) bool {
+	for _, f := range flags {
+		if f == "--reranking" {
+			return true
+		}
+	}
+	return false
+}
+
+// instanceLaunchedForReranking reports whether a running instance was spawned in llama.cpp's
+// reranking mode (--reranking, which llama.cpp requires alongside --embedding --pooling rank —
+// tools/server/README.md). Mirrors the flags-only check the same way an embedding-mode check would
+// at the Instance level; kept for Instance-typed callers even though the warm-route path below
+// works from raw LaunchFlags via launchModeOfFlags.
+func instanceLaunchedForReranking(inst instances.Instance) bool {
+	return launchFlagsHaveReranking(inst.LaunchFlags)
+}
+
+// launchMode is the mode a llama.cpp instance is ACTUALLY serving, derived from its launch flags
+// (see launchModeOfFlags). Three states, not a bool, because a reranking start ALWAYS also carries
+// --embedding (llama.cpp's own requirement), so a two-way embedding check alone cannot distinguish
+// a reranker (POST /v1/rerank, relevance scores) from a plain embedding server (POST
+// /v1/embeddings, vectors) — conflating them would let a plain embedding request warm-route onto a
+// rerank server whose pooling rank output is not a usable embedding vector, or vice versa.
+type launchMode int
+
+const (
+	modeGeneration launchMode = iota
+	modeEmbedding
+	modeReranking
+)
+
+// String renders a launchMode in the human words used in warm-route refusal messages.
+func (m launchMode) String() string {
+	switch m {
+	case modeEmbedding:
+		return "embedding-only"
+	case modeReranking:
+		return "reranking"
+	default:
+		return "generation"
+	}
+}
+
+// launchModeOfFlags derives the mode a llama.cpp process is actually running from its FULL spawned
+// flag vector (Instance.LaunchFlags) — the authoritative record, per launchFlagsHaveEmbedding's doc
+// comment. Reranking is checked FIRST and wins over embedding: a rerank start always carries
+// --embedding too (tools/server/README.md: "Requires ... the --embedding --pooling rank options"),
+// so checking embedding first would misclassify every reranking instance as merely embedding-only.
+func launchModeOfFlags(flags []string) launchMode {
+	if launchFlagsHaveReranking(flags) {
+		return modeReranking
+	}
+	if launchFlagsHaveEmbedding(flags) {
+		return modeEmbedding
+	}
+	return modeGeneration
+}
+
+// requestedLaunchMode derives the mode a StartInstanceRequest is asking for, mirroring
+// launchModeOfFlags's reranking-wins-over-embedding precedence: Reranking:true implies embedding
+// too (compat.LaunchProfile.Normalize enforces this on the profile that actually gets launched), so
+// it must be checked before Embedding here as well, or a reranking request would be misclassified
+// as a plain embedding request and warm-route onto (or be refused against) the wrong resident mode.
+func requestedLaunchMode(req StartInstanceRequest) launchMode {
+	if req.Reranking {
+		return modeReranking
+	}
+	if req.Embedding {
+		return modeEmbedding
+	}
+	return modeGeneration
+}
+
 // StartInstance is the Phase-4 model-start entry point. It:
 //  1. Resolves the model descriptor + estimator source (reusing the compat path).
 //  2. Computes the compat verdict at the requested ctx (SAFETY pre-check — refuse unless
@@ -159,14 +319,26 @@ func (s *Service) StartInstance(ctx context.Context, req StartInstanceRequest) (
 	if req.Engine == string(instances.EngineOllama) || s.isRetiredOllamaModel(ctx, req.ModelID) {
 		return InstanceView{}, fmt.Errorf("start instance: Ollama is retired; import or download a standalone GGUF and run it with llamacpp instead")
 	}
-	// Validate the per-start speculative knob up front (empty=off is always valid) so an invalid
-	// value is refused with a human reason regardless of the target engine. It is applied only on the
-	// llama.cpp launch path below; other engines ignore it (see StartInstanceRequest.Speculative).
-	spec, err := compat.ValidateSpeculative(req.Speculative)
+	// Decommission gate (migration 0014): a DECOMMISSIONED model refuses every path that is NOT the
+	// explicit operator start (Manual=true, set only by the POST /api/instances handler). This is the
+	// belt-and-braces safety net — the OpenAI proxy (resolveForProxy) and the residency queue drain
+	// loop also refuse earlier/elsewhere so their callers get a more specific response, but every path
+	// ultimately funnels through StartInstance, so the gate here is what makes the refusal
+	// unconditional regardless of which caller forgot to check first.
+	if !req.Manual {
+		if reason := s.autoLoadDisabledReason(ctx, req.ModelID); reason != "" {
+			return InstanceView{}, fmt.Errorf("REFUSED: %s", reason)
+		}
+	}
+	// Validate every profile-bearing knob up front (all-empty/zero = the historical defaults, always
+	// valid) so an invalid value is refused with a human reason regardless of the target engine, and
+	// before anything is spawned or queued. The llama.cpp launch path below applies them; Ollama and
+	// vLLM ignore the llama.cpp-specific ones (see StartInstanceRequest).
+	validated, err := validateStartProfile(req)
 	if err != nil {
 		return InstanceView{}, fmt.Errorf("start instance: %w", err)
 	}
-	req.Speculative = spec
+	req = validated
 	engine := req.Engine
 	if engine == "" {
 		// Infer the owning engine from the model's inventory source when the caller did not pin
@@ -222,8 +394,18 @@ func (s *Service) StartInstance(ctx context.Context, req StartInstanceRequest) (
 	if s.deps.InstanceStore != nil {
 		if list, lerr := s.deps.InstanceStore.List(ctx, true); lerr == nil {
 			for i := range list {
+				// The mode match (launchModeOfFlags == requestedLaunchMode) is required IN ADDITION
+				// to model+engine, and is THREE-WAY, not a two-way embedding bool: an embedding-only
+				// llama.cpp server cannot answer a generation request and vice versa
+				// (tools/server/README.md), and a reranking server — which ALSO carries --embedding,
+				// since llama.cpp requires that combination — answers relevance scores on
+				// /v1/rerank, not reusable vectors on /v1/embeddings. Comparing on Embedding alone
+				// would let a plain embedding request warm-route onto a resident reranking instance
+				// of the same model (or the reverse), so the mode compare must resolve reranking
+				// before embedding on both sides (see launchModeOfFlags/requestedLaunchMode).
 				if list[i].State == instances.StateHealthy && list[i].ModelID == req.ModelID &&
-					list[i].Engine == instances.EngineLlamaCPP {
+					list[i].Engine == instances.EngineLlamaCPP &&
+					launchModeOfFlags(list[i].LaunchFlags) == requestedLaunchMode(req) {
 					return instanceToView(list[i]), nil // route_loaded: warm HEALTHY instance, no spawn.
 				}
 			}
@@ -248,8 +430,11 @@ func (s *Service) StartInstance(ctx context.Context, req StartInstanceRequest) (
 		return InstanceView{}, fmt.Errorf("read hardware snapshot: %w", err)
 	}
 	avail := s.engineAvailability(ctx)
+	// ONE profile drives BOTH the verdict below and PlanLlamaLaunch further down (M2.2), so the
+	// footprint admission is judged on and the flags actually spawned can never diverge.
+	profile := startProfile(req, reqCtx)
 	verdict := s.deps.Compat.Evaluate(ctx, compat.Request{
-		Descriptor: desc, RequestedCtx: reqCtx, Batch: req.Batch, KVQuant: req.KVQuant,
+		Descriptor: desc, RequestedCtx: reqCtx, Batch: req.Batch, Profile: profile,
 	}, snap, avail)
 
 	// --- MoE CPU-offload sizing (BEFORE admission; no binary needed). ---
@@ -277,6 +462,21 @@ func (s *Service) StartInstance(ctx context.Context, req StartInstanceRequest) (
 		return InstanceView{}, aerr
 	}
 	if warm != nil {
+		// Residency's own warm check (residency.Admit → route_loaded) matches on model+engine ONLY;
+		// it does not know about llama.cpp's embedding-only or reranking modes. Guard it here with
+		// the same THREE-WAY mode compare as the pre-admission warm-route loop above: a generation
+		// server, an embedding-only server, and a reranking server for the SAME model are three
+		// different processes that cannot be substituted for each other (tools/server/README.md —
+		// embedding is "restrict to only support embedding use case"; reranking additionally
+		// requires --embedding --pooling rank but answers a different route with a different output
+		// shape), so silently routing a mismatched request onto the resident instance would send it
+		// a request its process cannot answer.
+		if residentMode, wantMode := launchModeOfFlags(warm.LaunchFlags), requestedLaunchMode(req); residentMode != wantMode {
+			return InstanceView{}, fmt.Errorf("REFUSED: model %q is already resident in %s mode as instance %s. "+
+				"A %s llama.cpp server cannot be reused for a %s start — they are different processes answering "+
+				"different routes. Stop instance %s first, or drop the mode-changing option(s) to use the resident one",
+				req.ModelID, residentMode, warm.ID, residentMode, wantMode, warm.ID)
+		}
 		return *warm, nil // route_loaded: already HEALTHY-resident, no spawn.
 	}
 	if s.deps.Residency != nil {
@@ -295,7 +495,7 @@ func (s *Service) StartInstance(ctx context.Context, req StartInstanceRequest) (
 	// missing binary is a plan error, not an admission decision). For a MoE offload it re-derives and
 	// emits `-ncmoe N`; the reduced footprint was already applied to admission above via
 	// MoEOffloadSizing, so a non-derivable MoE was declined before we reached here.
-	plan, err := compat.PlanLlamaLaunch(desc, avail, reqCtx, req.KVQuant, req.AllowCPUOffload, req.Speculative)
+	plan, err := compat.PlanLlamaLaunch(desc, avail, profile)
 	if err != nil {
 		return InstanceView{}, fmt.Errorf("plan launch for %q: %w", req.ModelID, err)
 	}
@@ -305,6 +505,14 @@ func (s *Service) StartInstance(ctx context.Context, req StartInstanceRequest) (
 	if len(snap.GPUs) > 0 {
 		freeBefore = snap.GPUs[0].VRAMFreeMiB
 	}
+
+	// Four-state residency policy (migration 0015): always_available forces Pin (wired into the
+	// EXISTING pin mechanism — eviction's never-evict-pinned gate already refuses a pinned instance,
+	// see residencyPolicyForLaunchState's doc comment); always_available/available are exempt from
+	// idle-TTL unload (TTLSeconds<=0, the EXISTING "never expires by TTL" behavior). Looked up once,
+	// right before the spec that actually carries Pinned/TTLSeconds to the runner.
+	launchState := s.launchStateFor(ctx, req.ModelID)
+	ttlSeconds, forcePin := residencyPolicyForLaunchState(launchState, s.deps.Cfg.Residency.DefaultTTLSeconds)
 
 	instanceID := uuid.NewString()
 	inst, err := s.deps.LlamaRunner.Start(ctx, llamacpp.StartSpec{
@@ -318,9 +526,9 @@ func (s *Service) StartInstance(ctx context.Context, req StartInstanceRequest) (
 		Flags:        plan.Flags,
 		HasFlashAttn: plan.Binary.HasFlashAttn,
 		VRAMEstMiB:   verdict.EstimatedVRAMMiB,
-		Pinned:       req.Pin,
+		Pinned:       req.Pin || forcePin,
 		Priority:     req.Priority,
-		TTLSeconds:   s.deps.Cfg.Residency.DefaultTTLSeconds,
+		TTLSeconds:   ttlSeconds,
 	})
 	if err != nil {
 		s.publishInstanceUpdated()
@@ -434,6 +642,14 @@ func (s *Service) calibrateAfterHealthy(instanceID, baseURL, modelID string, req
 // It returns the stopped instance view; the StopResult's verified/freed detail is folded into
 // the instance's reason.
 func (s *Service) StopInstance(ctx context.Context, id string) (InstanceView, error) {
+	return s.stopInstance(ctx, id, false)
+}
+
+// stopInstance is the synchronous engine-stop implementation. force is carried only from the
+// explicit operator ?force=true path for an ADOPTED instance; all internal callers use false.
+// Keeping it on the detached path matters: validating force before marking DRAINING and then
+// dropping it in the goroutine leaves an adopted row permanently DRAINING without stopping it.
+func (s *Service) stopInstance(ctx context.Context, id string, force bool) (InstanceView, error) {
 	if s.deps.InstanceStore == nil {
 		return InstanceView{}, fmt.Errorf("instance store not configured")
 	}
@@ -444,6 +660,11 @@ func (s *Service) StopInstance(ctx context.Context, id string) (InstanceView, er
 	}
 	if inst.Engine == instances.EngineOllama {
 		return InstanceView{}, fmt.Errorf("stop instance: Ollama is retired; its legacy instance is not managed by LocalHub")
+	}
+	// An ADOPTED process is stopped only when the explicit operator force survives all the way from
+	// StopInstanceAsyncForce into this detached synchronous implementation.
+	if aerr := guardAdoptedStop(inst, force); aerr != nil {
+		return InstanceView{}, aerr
 	}
 
 	// Ollama: unload (keep_alive:0) + /api/ps poll + VRAM-delta verify (never kills the daemon).
@@ -505,6 +726,29 @@ func (s *Service) StopInstance(ctx context.Context, id string) (InstanceView, er
 // It returns the DRAINING (or already-terminal) instance view. A stop of an already-terminal or
 // unknown instance returns synchronously without detaching.
 func (s *Service) StopInstanceAsync(ctx context.Context, id string) (InstanceView, error) {
+	return s.StopInstanceAsyncForce(ctx, id, false)
+}
+
+// guardAdoptedStop refuses to stop an ADOPTED instance unless the caller explicitly forced it.
+//
+// LocalHub did not spawn an adopted process — it belongs to whatever started it, typically a launcher
+// script with its own lifecycle (scripts/run-qwen-64k-q4q4.ps1 on the reference box). Killing it on
+// LocalHub's own initiative would destroy state LocalHub never owned, so every internal path (TTL
+// expiry, the drain loop, a plain DELETE, JSON-RPC) is refused with a reason that names the override.
+func guardAdoptedStop(inst instances.Instance, force bool) error {
+	if !inst.Adopted || force {
+		return nil
+	}
+	return fmt.Errorf("REFUSED: instance %s was ADOPTED, not started by LocalHub (%s). Stopping it would "+
+		"kill PID %d, a process owned by whatever launched it. Re-send with force=true if you really want "+
+		"LocalHub to kill it, or stop it where it was started",
+		inst.ID, inst.AdoptedSource, inst.PID)
+}
+
+// StopInstanceAsyncForce is StopInstanceAsync with an explicit override for ADOPTED instances.
+// force=false is every internal caller; force=true is the operator saying "kill it anyway", which the
+// API surfaces as an explicit ?force=true.
+func (s *Service) StopInstanceAsyncForce(ctx context.Context, id string, force bool) (InstanceView, error) {
 	if s.deps.InstanceStore == nil {
 		return InstanceView{}, fmt.Errorf("instance store not configured")
 	}
@@ -514,6 +758,9 @@ func (s *Service) StopInstanceAsync(ctx context.Context, id string) (InstanceVie
 	}
 	if inst.State.Terminal() {
 		return instanceToView(inst), nil
+	}
+	if aerr := guardAdoptedStop(inst, force); aerr != nil {
+		return InstanceView{}, aerr
 	}
 
 	// Mark DRAINING synchronously when coming from HEALTHY so the 202 view is truthful and the
@@ -545,7 +792,7 @@ func (s *Service) StopInstanceAsync(ctx context.Context, id string) (InstanceVie
 		bg, cancel := context.WithTimeout(context.Background(), drainTimeout+5*time.Minute)
 		defer cancel()
 		s.waitForDrain(bg, id, drainingSince, drainTimeout)
-		if _, serr := s.StopInstance(bg, id); serr != nil {
+		if _, serr := s.stopInstance(bg, id, force); serr != nil {
 			// Best-effort: log via the event bus is not available; the reconciler will reap a
 			// DRAINING-with-dead-pid row on the next tick if this failed after the kill.
 			_ = serr
@@ -593,6 +840,63 @@ func (s *Service) ReconcileInstances(ctx context.Context) (instances.ReconcileRe
 	}
 	return res, err
 }
+
+// MonitorInstances runs ONE post-HEALTHY process/health reconciliation pass (M5.1/M5.2). Unlike
+// ReconcileInstances (startup only), this is driven on a timer for the daemon's whole life, so an
+// engine that dies after reaching HEALTHY is reflected in the API/UI without a LocalHub restart.
+//
+// It publishes an instance.update only when something actually CHANGED, so a quiet box does not
+// generate WS traffic every tick.
+func (s *Service) MonitorInstances(ctx context.Context) (instances.MonitorResult, error) {
+	if s.deps.Monitor == nil {
+		return instances.MonitorResult{}, nil
+	}
+	res, err := s.deps.Monitor.Check(ctx)
+	if len(res.Died) > 0 || len(res.Reaped) > 0 {
+		s.publishInstanceUpdated()
+		// A death or a reap frees VRAM, so queued starts may now fit. Kick a drain rather than
+		// waiting up to a full drain interval — the same trigger a normal stop fires.
+		s.drainAsync()
+	} else if len(res.Degraded) > 0 {
+		// State did not change, but health_failures did; refresh so the UI can show DEGRADED.
+		s.publishInstanceUpdated()
+	}
+	return res, err
+}
+
+// StartPeriodicMonitor runs MonitorInstances on a ticker until ctx is cancelled. main starts it in a
+// goroutine alongside StartPeriodicDrain. The interval is the DOCUMENTED detection latency for the
+// M5 gate ("reflected within the documented interval"), so it is passed in explicitly rather than
+// hidden: at the default 15 s, a dead engine is FAILED within ~15 s, and an unresponsive one is
+// reaped after ReapAfterFailures × interval (~45 s at the defaults).
+func (s *Service) StartPeriodicMonitor(ctx context.Context, interval time.Duration, onPass func(instances.MonitorResult), onErr func(error)) {
+	if s.deps.Monitor == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = DefaultMonitorInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			res, err := s.MonitorInstances(ctx)
+			if err != nil && onErr != nil {
+				onErr(err)
+			} else if onPass != nil && (len(res.Died) > 0 || len(res.Reaped) > 0 || len(res.Degraded) > 0) {
+				onPass(res)
+			}
+		}
+	}
+}
+
+// DefaultMonitorInterval is the post-HEALTHY health-probe period. 15 s keeps detection latency
+// small while costing one cheap HTTP GET per resident instance — /health on a loaded llama-server
+// answers in single-digit ms, so this does not perturb inference.
+const DefaultMonitorInterval = 15 * time.Second
 
 // llamaExtraPathFor returns the ExtraPath dirs to prepend to PATH for the given binary — the
 // CUDA fork's DLL directory. It matches the config: absolute-path candidates get the configured

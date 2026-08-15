@@ -11,6 +11,11 @@
 //     "version: <build> (<sha>)" and prints loaded backends before it. We capture BOTH
 //     streams because the version and backend hints land on stderr.
 //   - Run `--help` and grep for capability flags.
+//   - Backends: parse the `--version` banner (load_backend:/ggml_cuda_init lines). A MODERN
+//     build loads its backends as dynamic ggml-*.dll siblings and prints NO banner, so when
+//     `--version` advertised nothing we fall back to inferring backends from the co-located
+//     ggml-*.dll/.so/.dylib libraries (backendsFromDir) — the fix for a CUDA build being
+//     misread as backend-less / has_cuda=false (build 10106, verified 2026-07-25).
 //
 // CAPABILITY PROBING (lmwrapper reuse pattern, research/lmwrapper-reuse-notes.md §4): the
 // two binaries on this box differ. We must NOT assume a flag exists — we grep --help/
@@ -40,11 +45,14 @@ package llamacpp
 import (
 	"bytes"
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 
 	"github.com/localhub/localhub/internal/engines"
+	"github.com/localhub/localhub/internal/winproc"
 )
 
 // BinarySpec is one candidate llama-server binary to probe. Path is a bare name (resolved
@@ -58,11 +66,37 @@ type BinarySpec struct {
 }
 
 // Capabilities are boolean feature flags detected by grepping --help/--version output.
+//
+// [RE-VERIFIED 2026-07-25 against the three LOCAL binaries' --help] The MTP/spec and KV bits
+// below discriminate correctly on this box:
+//   - b10106 (tools/llama.cpp): `--spec-type none,draft-simple,draft-eagle3,draft-mtp,
+//     draft-dflash,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache`,
+//     `--spec-draft-n-max N` (default 3), `-ctk/-ctv`, `-np/--parallel N` → has_spec_mtp=true.
+//   - the llama.cpp-tq3 fork and the winget build: `--spec-type` and `-ctk/-ctv` present but
+//     NO `draft-mtp` token and NO `--spec-draft-n-max` → has_spec_mtp=false.
+//
+// These are PINNED-BUILD observations, not timeless llama.cpp facts (PLAN §4 D8): re-run the
+// --help diff after any engine upgrade (docs/22-engine-version-policy.md).
 type Capabilities struct {
 	HasFit       bool `json:"has_fit"`        // --fit (fit-to-VRAM auto-tuning)
 	HasSleepIdle bool `json:"has_sleep_idle"` // --sleep-idle-seconds
 	HasTQ3       bool `json:"has_tq3"`        // tq3_0 KV cache / TQ3 quant kernels (fork-only)
 	HasFlashAttn bool `json:"has_flash_attn"` // --flash-attn
+	// HasSpecMTP: `--spec-type` advertises `draft-mtp` — the EMBEDDED multi-token-prediction
+	// head (no separate draft model). Gates the MTP launch profile's binary side (M3.1/M3.3).
+	HasSpecMTP bool `json:"has_spec_mtp"`
+	// HasSpecDraftMax: `--spec-draft-n-max N` exists (the draft-token count for a spec mode).
+	// Independent of HasSpecMTP: a build may expose one without the other, so we never infer
+	// one from the other.
+	HasSpecDraftMax bool `json:"has_spec_draft_max"`
+	// HasKVCacheTypes: BOTH `--cache-type-k` (-ctk) and `--cache-type-v` (-ctv) exist, i.e. the
+	// binary can quantize K and V INDEPENDENTLY. The Qwen3.6 profile PROVEN at 64K on this box is
+	// symmetric (-ctk q4_0 -ctv q4_0, scripts/run-qwen-64k-q4q4.ps1); an asymmetric pair such as
+	// -ctk q8_0 -ctv q4_0 is what independent support additionally buys. A binary without BOTH
+	// flags must be launched with an f16 cache.
+	HasKVCacheTypes bool `json:"has_kv_cache_types"`
+	// HasParallelSlots: `-np`/`--parallel` exists (server slot count; draft-mtp pins it to 1).
+	HasParallelSlots bool `json:"has_parallel_slots"`
 }
 
 // Adapter probes a set of candidate llama-server binaries. Construct with New. Read-only.
@@ -169,6 +203,21 @@ func (a *Adapter) detectOne(ctx context.Context, spec BinarySpec) engines.Engine
 
 	version, sha := parseVersion(verOut)
 	backends := parseBackends(verOut)
+	// Modern llama.cpp loads compute backends as DYNAMIC sibling libraries
+	// (ggml-cuda.dll, ggml-vulkan.dll, ...) and its `--version` prints NO backend
+	// banner at all (verified on the reference box, build 10106/1425386fd, 2026-07-25:
+	// --version prints only "version: 10106 (1425386fd)" / "built with Clang 20.1.8").
+	// The older fork (static CUDA) and the winget build (static Vulkan/CPU) DO print
+	// banners, so parseBackends already returns the right set for them. We only
+	// AUGMENT from the co-located backend DLLs when --version advertised nothing —
+	// that is the exact defect (a CUDA build misread as backend-less / has_cuda=false,
+	// which used to make it lose binary selection). This is a filesystem probe of the
+	// binary's own directory, not an engine-behavior claim; presence of ggml-cuda.dll
+	// means the build supports the CUDA backend. HasCUDA is now an accurate REPORTING
+	// field and (after M3.6) no longer a selection criterion.
+	if len(backends) == 0 {
+		backends = backendsFromDir(resolved)
+	}
 	caps := parseCapabilities(combined)
 
 	st.Detected = true
@@ -179,10 +228,14 @@ func (a *Adapter) detectOne(ctx context.Context, spec BinarySpec) engines.Engine
 	}
 	st.Details["backends"] = backends
 	st.Details["capabilities"] = map[string]bool{
-		"has_fit":        caps.HasFit,
-		"has_sleep_idle": caps.HasSleepIdle,
-		"has_tq3":        caps.HasTQ3,
-		"has_flash_attn": caps.HasFlashAttn,
+		"has_fit":            caps.HasFit,
+		"has_sleep_idle":     caps.HasSleepIdle,
+		"has_tq3":            caps.HasTQ3,
+		"has_flash_attn":     caps.HasFlashAttn,
+		"has_spec_mtp":       caps.HasSpecMTP,
+		"has_spec_draft_max": caps.HasSpecDraftMax,
+		"has_kv_cache_types": caps.HasKVCacheTypes,
+		"has_parallel_slots": caps.HasParallelSlots,
 	}
 
 	st.Reason = buildReason(version, backends, caps)
@@ -277,8 +330,85 @@ func backendFromLoadLine(line string) string {
 	}
 }
 
+// backendsFromDir infers available compute backends from the ggml-<name> shared libraries
+// co-located with the binary (ggml-cuda.dll, ggml-vulkan.dll, ...). It is the fallback for
+// modern llama.cpp builds whose `--version` advertises no backends because they load every
+// backend dynamically. Returns a de-duplicated, order-preserving list; empty when the
+// directory has no ggml-* backend libraries (e.g. a statically-linked build, or a temp dir
+// in tests). This reads only the binary's own directory — no engine process is spawned.
+func backendsFromDir(binaryPath string) []string {
+	dir := filepath.Dir(binaryPath)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var backends []string
+	add := func(name string) {
+		if name != "" && !seen[name] {
+			seen[name] = true
+			backends = append(backends, name)
+		}
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := strings.ToLower(e.Name())
+		if !strings.HasPrefix(name, "ggml-") {
+			continue
+		}
+		// Only shared libraries: .dll (Windows), .so (Linux), .dylib (macOS).
+		if !(strings.HasSuffix(name, ".dll") || strings.HasSuffix(name, ".so") || strings.HasSuffix(name, ".dylib")) {
+			continue
+		}
+		// "ggml-cuda.dll" -> "cuda"; "ggml-cpu-haswell.dll" -> "cpu-haswell" -> CPU.
+		tok := strings.TrimPrefix(name, "ggml-")
+		tok = strings.TrimSuffix(tok, ".dll")
+		tok = strings.TrimSuffix(tok, ".so")
+		tok = strings.TrimSuffix(tok, ".dylib")
+		add(normalizeBackendToken(tok))
+	}
+	return backends
+}
+
+// normalizeBackendToken maps a ggml-<tok> library token to a clean backend label, matching
+// the names parseBackends/backendFromLoadLine already produce so the two sources merge
+// without duplicates. Returns "" for tokens that are NOT compute backends (notably "base" —
+// ggml-base.dll is the shared runtime library, not a backend) so the caller can skip them.
+func normalizeBackendToken(tok string) string {
+	switch {
+	case strings.HasPrefix(tok, "cuda"):
+		return "CUDA"
+	case strings.HasPrefix(tok, "vulkan"):
+		return "Vulkan"
+	case strings.HasPrefix(tok, "rpc"):
+		return "RPC"
+	case strings.HasPrefix(tok, "metal"):
+		return "Metal"
+	case strings.HasPrefix(tok, "opencl"):
+		return "OpenCL"
+	case strings.HasPrefix(tok, "sycl"):
+		return "SYCL"
+	case strings.HasPrefix(tok, "kompute"):
+		return "Kompute"
+	case strings.HasPrefix(tok, "cann"):
+		return "CANN"
+	case strings.HasPrefix(tok, "cpu"):
+		return "CPU"
+	default:
+		return "" // not a compute backend (e.g. "base"); skip
+	}
+}
+
 // parseCapabilities greps the combined --version/--help text for capability signals. All
 // checks are case-insensitive substring matches on the flag/type tokens.
+//
+// The spec/KV bits are matched on the EXACT tokens observed in the b10106 --help (see the
+// Capabilities doc comment). Each bit is probed independently — we never infer `draft-mtp`
+// support from the presence of `--spec-type`, because the fork and the winget build both
+// expose `--spec-type` WITHOUT draft-mtp (verified 2026-07-25). A false has_spec_mtp would
+// let a start emit `--spec-type draft-mtp` at a binary that rejects it.
 func parseCapabilities(text string) Capabilities {
 	low := strings.ToLower(text)
 	return Capabilities{
@@ -287,6 +417,13 @@ func parseCapabilities(text string) Capabilities {
 		// tq3 is fork-only: match "tq3" or "turboquant" anywhere in help/version.
 		HasTQ3:       strings.Contains(low, "tq3") || strings.Contains(low, "turboquant"),
 		HasFlashAttn: strings.Contains(low, "--flash-attn") || strings.Contains(low, "flash-attn"),
+		// draft-mtp appears as a value in the `--spec-type` enumeration, not as its own flag.
+		HasSpecMTP:      strings.Contains(low, "draft-mtp"),
+		HasSpecDraftMax: strings.Contains(low, "--spec-draft-n-max"),
+		// Independent K/V needs BOTH sides; a build with only one cannot express -ctk q8_0 -ctv q4_0.
+		HasKVCacheTypes: (strings.Contains(low, "--cache-type-k") || strings.Contains(low, "-ctk")) &&
+			(strings.Contains(low, "--cache-type-v") || strings.Contains(low, "-ctv")),
+		HasParallelSlots: strings.Contains(low, "--parallel") || strings.Contains(low, "-np,"),
 	}
 }
 
@@ -314,6 +451,15 @@ func buildReason(version string, backends []string, caps Capabilities) string {
 	if caps.HasTQ3 {
 		capList = append(capList, "tq3 (fork)")
 	}
+	if caps.HasKVCacheTypes {
+		capList = append(capList, "kv-types (-ctk/-ctv)")
+	}
+	if caps.HasSpecMTP {
+		capList = append(capList, "spec-mtp (draft-mtp)")
+	}
+	if caps.HasSpecDraftMax {
+		capList = append(capList, "spec-draft-n-max")
+	}
 	if len(capList) > 0 {
 		sb.WriteString("; caps: " + strings.Join(capList, ", "))
 	}
@@ -328,6 +474,10 @@ func buildReason(version string, backends []string, caps Capabilities) string {
 // --version/--help llama-server exits 0. Read-only: no model is loaded.
 func runProbe(ctx context.Context, binary string, extraPath []string, arg string) (string, error) {
 	cmd := exec.CommandContext(ctx, binary, arg)
+	// No console window. This is the noisiest spawn site in the daemon: GET /api/engines runs
+	// this probe once per DETECTED llama.cpp build, and the dashboard polls that endpoint, so
+	// without this a box with three installs flashes three console windows on every refresh.
+	winproc.Hide(cmd)
 	cmd.Env = envWithExtraPath(extraPath)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf

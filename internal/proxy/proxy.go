@@ -15,18 +15,21 @@
 //   - per-key or per-model budgets / spend tracking / cost accounting
 //   - rate limiting
 //   - provider fallback / retry-across-providers
-//   - multi-provider routing (OpenAI / Anthropic / etc.)
+//   - multi-provider routing or fallback
 //   - load-balancing across duplicate deployments
 //   - request/response caching
 //   - prompt logging by default
 //
-// The proxy only ever relays /v1/chat/completions and /v1/completions to a local engine that
-// LocalHub's own residency admitted. It never forwards vLLM dev endpoints
+// The passthrough proxy only relays the allowlisted OpenAI inference routes
+// /v1/chat/completions, /v1/completions, and /v1/responses to a local engine that LocalHub's
+// own residency admitted. The experimental /v1/messages edge adapter performs deterministic
+// protocol translation under ADR-010. LocalHub never forwards vLLM dev endpoints
 // (/sleep, /wake_up, /collective_rpc, /reset_prefix_cache) — security.md.
 // ---------------------------------------------------------------------------------------------
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -113,6 +116,180 @@ func SetJSONField(body []byte, key string, value any) []byte {
 		return body
 	}
 	return out
+}
+
+// NormalizeResponsesInput adapts Codex's role-typed input items (for example
+// {"type":"developer",...}) to the canonical Responses message item shape
+// understood by llama.cpp. OpenAI accepts role-bearing easy-input messages,
+// but some local Responses implementations require type=message explicitly.
+// All other items and fields are preserved.
+func NormalizeResponsesInput(body []byte) []byte {
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return body
+	}
+	items, ok := root["input"].([]any)
+	if !ok {
+		return body
+	}
+	changed := false
+	filtered := make([]any, 0, len(items))
+	var leadingInstructions []string
+	for _, raw := range items {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			filtered = append(filtered, raw)
+			continue
+		}
+		itemType, _ := item["type"].(string)
+		switch itemType {
+		case "message":
+			role, _ := item["role"].(string)
+			if (role == "developer" || role == "system") && appendResponsesInstruction(&leadingInstructions, item["content"]) {
+				changed = true
+				continue
+			}
+			before, _ := json.Marshal(item["content"])
+			normalizeResponsesMessageContent(item)
+			after, _ := json.Marshal(item["content"])
+			if !bytes.Equal(before, after) {
+				changed = true
+			}
+		case "developer", "system", "user", "assistant":
+			if (itemType == "developer" || itemType == "system") && appendResponsesInstruction(&leadingInstructions, item["content"]) {
+				changed = true
+				continue
+			}
+			item["type"] = "message"
+			if _, exists := item["role"]; !exists {
+				item["role"] = itemType
+			}
+			normalizeResponsesMessageContent(item)
+			changed = true
+		case "agent_message":
+			item["type"] = "message"
+			item["role"] = "assistant"
+			if _, exists := item["content"]; !exists {
+				if text, ok := item["text"].(string); ok {
+					item["content"] = text
+					delete(item, "text")
+				}
+			}
+			normalizeResponsesMessageContent(item)
+			changed = true
+		}
+		filtered = append(filtered, item)
+	}
+	if len(leadingInstructions) > 0 {
+		if existing, ok := root["instructions"].(string); ok && strings.TrimSpace(existing) != "" {
+			leadingInstructions = append([]string{existing}, leadingInstructions...)
+		}
+		root["instructions"] = strings.Join(leadingInstructions, "\n\n")
+		root["input"] = filtered
+		changed = true
+	}
+	if !changed {
+		return body
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// appendResponsesInstruction moves text-only system/developer input messages into the
+// Responses API's top-level instructions field. Some llama.cpp chat templates allow a
+// system turn only at the beginning; Codex can otherwise produce a later developer turn
+// when it layers repository guidance into an inherited conversation.
+func appendResponsesInstruction(dst *[]string, content any) bool {
+	switch typed := content.(type) {
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return false
+		}
+		*dst = append(*dst, typed)
+		return true
+	case []any:
+		parts := make([]string, 0, len(typed))
+		for _, raw := range typed {
+			block, ok := raw.(map[string]any)
+			if !ok {
+				return false
+			}
+			blockType, _ := block["type"].(string)
+			if blockType != "text" && blockType != "input_text" && blockType != "output_text" {
+				return false
+			}
+			text, ok := block["text"].(string)
+			if !ok {
+				return false
+			}
+			if strings.TrimSpace(text) != "" {
+				parts = append(parts, text)
+			}
+		}
+		if len(parts) == 0 {
+			return false
+		}
+		*dst = append(*dst, strings.Join(parts, "\n"))
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeResponsesMessageContent(item map[string]any) {
+	role, _ := item["role"].(string)
+	blocks, ok := item["content"].([]any)
+	if !ok {
+		return
+	}
+	// Codex's collaboration layer delivers a spawned task as a NEW_TASK
+	// envelope in a trailing assistant item. For a child model this is an
+	// instruction, not prior assistant output; local providers need it as the
+	// final user turn so the model acts on the payload instead of echoing it.
+	if role == "assistant" && responsesBlocksContainNewTask(blocks) {
+		role = "user"
+		item["role"] = role
+	}
+	filtered := make([]any, 0, len(blocks))
+	for _, raw := range blocks {
+		block, ok := raw.(map[string]any)
+		if !ok {
+			filtered = append(filtered, raw)
+			continue
+		}
+		blockType, _ := block["type"].(string)
+		// Codex can carry encrypted reasoning from the cloud parent into a
+		// spawned child's context. It is opaque to local providers and
+		// llama.cpp correctly refuses it as message content, so omit it.
+		if blockType == "encrypted_content" {
+			continue
+		}
+		switch {
+		case role == "assistant" && (blockType == "text" || blockType == "input_text"):
+			block["type"] = "output_text"
+		case role != "assistant" && (blockType == "text" || blockType == "output_text"):
+			block["type"] = "input_text"
+		}
+		filtered = append(filtered, block)
+	}
+	item["content"] = filtered
+}
+
+func responsesBlocksContainNewTask(blocks []any) bool {
+	for _, raw := range blocks {
+		block, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		text, _ := block["text"].(string)
+		if strings.HasPrefix(strings.TrimSpace(text), "Message Type: NEW_TASK") {
+			return true
+		}
+	}
+	return false
 }
 
 // RelayResult reports the upstream status returned by Relay (for callers that record it, e.g. the

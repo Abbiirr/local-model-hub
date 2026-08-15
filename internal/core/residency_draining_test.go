@@ -60,6 +60,46 @@ func TestStopInstanceAsync_DetachesAndCompletes(t *testing.T) {
 	}
 }
 
+// A forced operator stop of an ADOPTED instance must carry the force bit into the detached
+// goroutine. The old implementation validated force before DRAINING, then called StopInstance
+// (which always re-guarded with force=false), leaving the row stuck DRAINING forever.
+func TestStopInstanceAsyncForce_AdoptedCarriesForceIntoDetachedStop(t *testing.T) {
+	svc, fr, _ := startResidencyService(t, compat.Verdict{Status: compat.StatusRuns, Reason: "ok", EstimatedVRAMMiB: 4000}, 15000, nil)
+	store := svc.deps.InstanceStore
+	if _, err := store.Create(context.Background(), instances.CreateParams{
+		ID: "adopted-1", ModelID: "m1", Engine: instances.EngineLlamaCPP, Reason: "seed adopted",
+		Adopted: true, AdoptedSource: "test attach", PID: 4243,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Transition(context.Background(), "adopted-1", instances.TransitionParams{
+		To: instances.StateStarting, Reason: "seed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Transition(context.Background(), "adopted-1", instances.TransitionParams{
+		To: instances.StateHealthy, Reason: "seed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	view, err := svc.StopInstanceAsyncForce(context.Background(), "adopted-1", true)
+	if err != nil {
+		t.Fatalf("forced async stop: %v", err)
+	}
+	if view.State != string(instances.StateDraining) {
+		t.Fatalf("forced async stop should return DRAINING, got %s", view.State)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for fr.stopped != "adopted-1" {
+		if time.Now().After(deadline) {
+			t.Fatalf("forced adopted stop never reached runner; row would remain DRAINING")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // TestReconcile_DrainingDeadPidBecomesStopped is the fix-4 reconciler gate: a DRAINING row whose
 // PID is dead (the stop killed the process but the final STOPPED write was lost — e.g. a crash
 // mid-drain) is reaped to STOPPED on the reconcile pass. Uses the reconciler with a dead-PID alive

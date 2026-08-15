@@ -18,6 +18,7 @@ coverage/
 # Frontend dependencies and caches
 **/node_modules/
 web/.vite/
+web/vite.config.ts.timestamp-*.mjs
 # web/dist is committed deliberately: go:embed requires it at build time
 
 # Local configuration and secrets
@@ -25,6 +26,7 @@ web/.vite/
 /.env.*
 !/.env.example
 /configs/config.yaml
+/configs/startup.json
 
 # Workflow and agent scratch (regenerable)
 temp-research/context-summary.md
@@ -32,11 +34,16 @@ temp-research/context-summary.md
 /.agents/
 /.claude/
 /.codex/
+/.playwright-mcp/
+/scratchpad/
 
 # Logs, crash dumps, and transient files
 *.log
 *.stackdump
 *.tmp
+*.db.bak-*
+/localhub*.exe*
+/nocap.json
 
 # Editor and OS noise
 .idea/

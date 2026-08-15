@@ -6,19 +6,24 @@
 
 import type {
   ApiErrorBody,
+  AttachInstanceRequest,
   CompatPreviewRequest,
   DownloadJob,
   DownloadRequest,
   Engine,
+  FreeGPUResult,
   HardwareSnapshot,
   InstanceView,
+  LaunchState,
   Manifest,
+  ModelLaunchDefault,
   ModelSummary,
   QueuedResponse,
   QueueEntry,
   ReproduceBundle,
   RescanResult,
   StartInstanceRequest,
+  StartupConfig,
   Verdict,
 } from './types';
 
@@ -141,6 +146,13 @@ export const api = {
   hardware: () => request<HardwareSnapshot>('/api/hardware'),
   engines: () => request<Engine[]>('/api/engines'),
   models: () => request<ModelSummary[]>('/api/models'),
+  startupConfig: () => request<StartupConfig>('/api/startup'),
+  saveStartupConfig: (config: StartupConfig) =>
+    request<StartupConfig>('/api/startup', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config),
+    }),
   /** Control-plane rescan (walks disk) — NOT engine mutation. */
   rescanModels: () =>
     request<RescanResult>('/api/models/rescan', { method: 'POST' }),
@@ -156,6 +168,21 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req),
     }),
+  /**
+   * Set a model's residency launch state (always_available | available | available_on_request |
+   * unavailable — see {@link LaunchState}). Returns the updated {@link ModelSummary}; the caller
+   * still refetches/invalidates the models list to keep the rest of the row (e.g. the derived
+   * `auto_load_disabled` mirror) consistent.
+   */
+  setModelLaunchState: (id: string, state: LaunchState) =>
+    request<ModelSummary>(
+      `/api/models/${encodeURIComponent(id)}/launch-state`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ state }),
+      },
+    ),
 
   // ── Supply chain (Phase 3) ──────────────────────────────────────────────────
   /**
@@ -212,10 +239,95 @@ export const api = {
           : req,
       ),
     }),
-  /** Stop an instance (drain → stop with VRAM-delta verification). */
-  stopInstance: (id: string) =>
-    request<InstanceView>(`/api/instances/${encodeURIComponent(id)}`, {
-      method: 'DELETE',
+  /**
+   * ADOPT an already-running llama-server (e.g. one started by scripts/run-qwen-64k-q4q4.ps1).
+   *
+   * LocalHub reads the live process rather than predicting anything: the PID owning the port, the real
+   * command line (hence the true context, KV types, speculative mode and slots), and a health probe.
+   * NO admission runs — the process already holds its VRAM, so there is nothing to allocate. Nothing is
+   * started, signalled, or stopped, so adopting cannot disturb the server.
+   *
+   * Rejects with an ApiError: 400 if the port owner is not a llama-server, 404 if the served model is
+   * not in the inventory (rescan first), 409 if that PID is already tracked, 502 if it does not answer
+   * /health — which is exactly what happens when the server binds a LAN address and `host` was left at
+   * loopback, so pass the address it actually binds.
+   */
+  attachInstance: (req: AttachInstanceRequest) =>
+    request<InstanceView>('/api/instances/attach', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req),
+    }),
+
+  /**
+   * Stop an instance (drain → stop with VRAM-delta verification).
+   *
+   * `force` is REQUIRED for an ADOPTED instance: without it the server refuses with 409, because
+   * stopping one kills a process LocalHub never started. Callers should confirm with the operator
+   * before passing force — the whole point of the guard is that a Stop button must not silently kill
+   * someone else's server.
+   */
+  stopInstance: (id: string, options?: { force?: boolean }) =>
+    request<InstanceView>(
+      `/api/instances/${encodeURIComponent(id)}${options?.force ? '?force=true' : ''}`,
+      { method: 'DELETE' },
+    ),
+
+  // ── Saved per-model launch default (M2.3) ───────────────────────────────────
+  /**
+   * Read a model's saved launch default. REJECTS with a 404 ApiError when none is saved — the NORMAL
+   * state for most models, so callers should treat 404 as "no default", not as a failure.
+   *
+   * The result is ADVISORY: it pre-fills the advanced start form. Starting still sends whatever the
+   * form contains, so the operator always sees what will actually be launched (M6.1).
+   */
+  modelLaunchDefault: (modelId: string) =>
+    request<ModelLaunchDefault>(
+      `/api/models/${encodeURIComponent(modelId)}/launch-default`,
+    ),
+  /**
+   * Save (upsert) a model's launch default. The server validates the profile through the SAME path a
+   * live start uses, so an unstartable profile is refused with a 400 whose reason names the valid set
+   * — a stored default that fails at start time would be worse than none.
+   *
+   * `model_id` in the body is ignored: the URL identifies the model, so a copy-pasted body cannot
+   * write a default onto the wrong model.
+   */
+  saveModelLaunchDefault: (
+    modelId: string,
+    def: Omit<ModelLaunchDefault, 'model_id'>,
+  ) =>
+    request<ModelLaunchDefault>(
+      `/api/models/${encodeURIComponent(modelId)}/launch-default`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(def),
+      },
+    ),
+  /** Clear a model's saved launch default. Idempotent (204 even when none existed). */
+  deleteModelLaunchDefault: (modelId: string) =>
+    request<void>(
+      `/api/models/${encodeURIComponent(modelId)}/launch-default`,
+      { method: 'DELETE' },
+    ),
+
+  // ── Free the GPU (PLAN-ui-gpu-rework.md §2.5 — ADMIN: kills GPU processes) ──
+  /**
+   * Stop every instance holding the GPU and report how much VRAM actually came back.
+   *
+   * `includePinned` defaults to FALSE: a pinned instance is an explicit "keep this resident"
+   * instruction and a one-click convenience must not override it. Those are reported as
+   * `skipped` with a reason, and the caller can re-issue with `true` after confirming.
+   *
+   * `reclaimed_mib` is a MEASURED before/after NVML delta, not a sum of estimates, and may be
+   * negative if another process took VRAM during the sweep — render what the daemon reports.
+   */
+  freeGPU: (includePinned = false) =>
+    request<FreeGPUResult>('/api/gpu/free', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ include_pinned: includePinned }),
     }),
 
   // ── Residency queue (Phase 5) ───────────────────────────────────────────────

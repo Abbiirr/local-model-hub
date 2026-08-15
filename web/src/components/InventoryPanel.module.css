@@ -143,6 +143,46 @@
   color: var(--accent);
 }
 
+/* Launch state (residency) cell — a compact select + a terse consequence line. */
+.launchTd {
+  min-width: 170px;
+}
+.launchCell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-width: 200px;
+}
+.launchSelect {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 6px;
+  background: var(--bg-raised, var(--bg));
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  min-width: 0;
+  cursor: pointer;
+}
+.launchSelect:focus {
+  outline: 1px solid var(--accent);
+  outline-offset: 0;
+}
+.launchSelect:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.launchHint {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+.cardLaunch {
+  margin-top: var(--s2);
+  padding-top: var(--s2);
+  border-top: 1px solid var(--border);
+}
+
 /* Compatibility cell (table) + card section. */
 .compatTd {
   min-width: 220px;
@@ -156,6 +196,19 @@
   display: flex;
   align-items: center;
   gap: var(--s2);
+}
+/* Auto-fetched verdict (§3.3): badge + estimated VRAM, kept on one line so the estimate
+   reads as belonging to the badge. The full reason lives in the element title. */
+.autoVerdict {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s1);
+}
+.autoEstimate {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 .cardCompat {
   margin-top: var(--s2);

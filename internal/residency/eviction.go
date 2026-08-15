@@ -122,6 +122,12 @@ func classifyVictim(inst instances.Instance, tracker ActiveTracker, pol Eviction
 	v.TTLExpired = ttlExpired(inst, pol.Now)
 
 	switch {
+	case inst.Adopted:
+		// An ADOPTED instance (migration 0012) was started OUTSIDE LocalHub — typically by a launcher
+		// script with its own lifecycle. LocalHub did not create it and cannot know what depends on it,
+		// so reclaiming its VRAM is not LocalHub's call. Checked BEFORE Pinned so the reason stays
+		// specific even when a caller explicitly un-pinned it.
+		v.Ineligible = "adopted from an externally-started process (LocalHub did not spawn it; never auto-evict)"
 	case inst.Pinned:
 		v.Ineligible = "pinned (never auto-evict)"
 	case inst.State != instances.StateHealthy:

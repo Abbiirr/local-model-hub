@@ -75,6 +75,29 @@ essentially the llama-swap pattern (see [ADR-003](decisions.md#adr-003) on possi
 llama-swap directly).
 
 - **detect:** `llama-server --version` (locate binary; store in `engines.binary_path`).
+
+  > **Backends are inferred from disk when `--version` says nothing (2026-07-25).** Modern
+  > llama.cpp loads `ggml-cuda.dll` / `.so` / `.dylib` as a *dynamic* backend, so its
+  > `--version` banner prints only the build number — no backend line at all. b10106 printed
+  > `version: 10106 (1425386fd)` + `built with Clang`, and nothing else. The old CUDA fork does
+  > print `ggml_cuda_init: found 1 CUDA devices`. Parsing the banner alone therefore reported a
+  > real CUDA build as backend-less. `llamacpp.detectOne` now falls back to `backendsFromDir`,
+  > which infers backends from the `ggml-*` shared libraries beside the executable.
+  > Live result: b10106 reports `backends: [CPU, CUDA, RPC]` (previously `null`).
+  > **Do not treat a missing backend banner as "no GPU support"** — re-verify against the
+  > binary's actual shipped libraries.
+
+- **binary selection is capability-first, then CONFIGURED ORDER — never `has_cuda`.**
+  `compat.bestLlamaBinary` takes a `BinaryRequirements` filter (e.g. `TQ3`, `SpecMTP`) and
+  returns the first *detected* candidate in the order the operator configured. It previously
+  preferred any binary whose `has_cuda` was true, which silently overrode config order: a
+  modern build detected as `has_cuda=false` (see above) **lost to an older CUDA fork**, and that
+  fork then failed to load a newer architecture outright —
+  `llama_model_load: error loading model: missing tensor 'blk.64.ssm_conv1d.weight'` for
+  Qwen3.6's hybrid SSM/attention arch. `HasCUDA` is now an accurate **reporting** field only.
+  Consequence for operators: **the order of `engines.llamacpp.binary_paths` is meaningful** —
+  list the preferred build first; capability-gated fallbacks (the `has_tq3` fork) still win
+  automatically for models that require them.
 - **start:** spawn, bound to localhost, on an allocated port:
 
   ```bash

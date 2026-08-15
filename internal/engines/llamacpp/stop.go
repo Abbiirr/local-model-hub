@@ -88,10 +88,15 @@ func (r *Runner) Stop(ctx context.Context, instanceID string) (StopResult, error
 	if beforeErr != nil {
 		reason = "stopped: process was signalled, but VRAM reclaim is UNVERIFIED because the baseline probe failed: " + beforeErr.Error()
 	}
+	// reclaim_verified (migration 0010, M5.5) makes the outcome MACHINE-readable. The reason string
+	// has always been truthful, but state=STOPPED + vram_freed_mib alone let a reclaim TIMEOUT or an
+	// inconclusive baseline read as a clean stop to any programmatic consumer. `verified` is false
+	// for both failure modes: a timeout, and a failed baseline probe (where a delta is meaningless).
 	stopped, serr := r.store.Transition(ctx, instanceID, instances.TransitionParams{
-		To:           instances.StateStopped,
-		Reason:       reason,
-		VRAMFreedMiB: &freedForRow,
+		To:              instances.StateStopped,
+		Reason:          reason,
+		VRAMFreedMiB:    &freedForRow,
+		ReclaimVerified: &verified,
 	})
 	if serr != nil {
 		return StopResult{}, fmt.Errorf("mark stopped: %w", serr)

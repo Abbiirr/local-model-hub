@@ -79,6 +79,15 @@ func (p *probe) Snapshot(ctx context.Context) (Snapshot, error) {
 		snap.GPUs = []GPU{}
 	}
 
+	// GPU-holder processes: also never fatal, and skipped entirely when there is no GPU (the
+	// extra nvidia-smi exec would just fail). On error the list stays nil, which the JSON
+	// omits — "we do not know" rather than "nothing is using the GPU".
+	if p.gpu != nil && len(snap.GPUs) > 0 {
+		if procs, err := p.gpu.Processes(ctx); err == nil {
+			snap.GPUProcesses = procs
+		}
+	}
+
 	// System info: a failure here is the only thing that can error the snapshot, and even
 	// then we prefer a cached good snapshot to nothing.
 	var sysErr error

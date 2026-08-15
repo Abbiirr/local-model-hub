@@ -29,6 +29,7 @@ import (
 	"strings"
 
 	"github.com/localhub/localhub/internal/engines"
+	"github.com/localhub/localhub/internal/winproc"
 )
 
 // Mode selects how the adapter reaches vLLM.
@@ -250,6 +251,8 @@ func matchImages(out, match string) []string {
 // runCmd runs a read-only command with the context timeout and returns combined output.
 func runCmd(ctx context.Context, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	// No console window — these read-only probes run on every engines poll.
+	winproc.Hide(cmd)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf

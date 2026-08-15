@@ -15,6 +15,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -96,6 +97,11 @@ type Deps struct {
 	// Reconciler runs daemon-startup reconciliation of orphaned/dead child processes (P4.1).
 	// nil-safe: ReconcileInstances is a no-op when unset.
 	Reconciler *instances.Reconciler
+
+	// Monitor is the POST-HEALTHY process/health reconciler (M5). Reconciler above runs once at
+	// startup; this one runs on a ticker (StartPeriodicMonitor) so an engine that dies while the
+	// daemon keeps running is not reported as HEALTHY forever. nil disables periodic monitoring.
+	Monitor *instances.Monitor
 
 	// OllamaRunner warms/unloads Ollama models against the instance state machine (P4.3). Ollama
 	// is a shared daemon LocalHub never spawns or kills; this seam warms via keep_alive and
@@ -186,11 +192,14 @@ type Service struct {
 	// initialized (jobs() / jobStateOnce) so a Service with no jobs feature wired stays zero-cost.
 	jobState     *jobWorkerState
 	jobStateOnce sync.Once
+	// gpuHist is the in-memory GPU telemetry ring buffer backing the dashboard sparklines
+	// (PLAN-ui-gpu-rework.md §2.4). Always non-nil after New; deliberately not persisted.
+	gpuHist *gpuHistory
 }
 
 // New constructs the service core from its dependencies.
 func New(deps Deps) *Service {
-	s := &Service{deps: deps, registry: newDownloadRegistry()}
+	s := &Service{deps: deps, registry: newDownloadRegistry(), gpuHist: newGPUHistory()}
 	// Wire the residency manager's estimator + evictor seams, which live on the service (they need
 	// the compat engine + engine runners). Resolves the manager↔service wiring cycle: main builds
 	// the manager with the store-backed lister + probe; here we complete it with the core seams.
@@ -199,6 +208,9 @@ func New(deps Deps) *Service {
 		// Wire the production queue-drain starter (fix 1): the drain loop re-runs StartInstance for
 		// a de-queued request through this seam when capacity frees.
 		deps.Residency.SetStarter(residencyStarter{s: s})
+		// Wire the decommission gate (migration 0014): the drain loop drops a DECOMMISSIONED model's
+		// queue entry instead of promoting it.
+		deps.Residency.SetAutoLoadGate(residencyAutoLoadGate{s: s})
 	}
 	return s
 }
@@ -216,6 +228,9 @@ type HealthResult struct {
 	Status  string `json:"status"`  // "ok" | "degraded"
 	Version string `json:"version"` // daemon version
 	DBOK    bool   `json:"db_ok"`   // database reachable
+	// PID lets the native Windows tray identify the exact daemon answering the health endpoint.
+	// The tray still verifies its executable path before terminating it.
+	PID int `json:"pid"`
 	// Reason is populated when Status != "ok", per the error/verdict convention
 	// (spec-digest §3: every user-facing result carries a human-readable reason).
 	Reason string `json:"reason,omitempty"`
@@ -225,7 +240,7 @@ type HealthResult struct {
 // the P1.1 milestone; it establishes the pattern (context in, typed result out, no
 // transport concerns) that every later core method follows.
 func (s *Service) Health(ctx context.Context) HealthResult {
-	res := HealthResult{Status: "ok", Version: Version, DBOK: true}
+	res := HealthResult{Status: "ok", Version: Version, DBOK: true, PID: os.Getpid()}
 	if s.deps.DB == nil {
 		res.Status = "degraded"
 		res.DBOK = false
@@ -247,7 +262,19 @@ func (s *Service) Hardware(ctx context.Context) (hardware.Snapshot, error) {
 	if s.deps.Hardware == nil {
 		return hardware.Snapshot{}, fmt.Errorf("hardware probe not configured")
 	}
-	return s.deps.Hardware.Snapshot(ctx)
+	snap, err := s.deps.Hardware.Snapshot(ctx)
+	if err != nil {
+		return snap, err
+	}
+	// Populate the admission budget here rather than in the probe: the safety factor is a
+	// compat concern and internal/hardware must not depend on internal/compat. Doing it once on
+	// the way out means the dashboard, the SSE stream and any refusal reason all quote the same
+	// number instead of each re-deriving it (and drifting).
+	for i := range snap.GPUs {
+		snap.GPUs[i].UsableVRAMMiB = int(float64(snap.GPUs[i].VRAMFreeMiB) * compat.SafetyFactor)
+	}
+	snap.RAM.FloorMiB = s.deps.Cfg.Residency.MinFreeRAMMiB
+	return snap, nil
 }
 
 // HardwarePollInterval is the cadence for the SSE hardware stream and the metrics loop. It
